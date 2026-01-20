@@ -1,5 +1,5 @@
 variable "project_id" {
-    default = "padel-app"
+    default = "padel-levelup-2026"
 }
 
 variable "region" {

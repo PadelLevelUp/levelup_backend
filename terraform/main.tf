@@ -9,7 +9,7 @@ data "google_compute_network" "default" {
 }
 
 resource "google_compute_firewall" "http-https" {
-  name    = "padel-app-allow-http-https"
+  name    = "levelup-allow-http-https"
   network = data.google_compute_network.default.name
 
   allow {
@@ -21,7 +21,7 @@ resource "google_compute_firewall" "http-https" {
 }
 
 resource "google_compute_firewall" "allow-postgres" {
-  name    = "padel-app-allow-postgres"
+  name    = "levelup-allow-postgres"
   network = data.google_compute_network.default.name
 
   allow {
@@ -35,11 +35,11 @@ resource "google_compute_firewall" "allow-postgres" {
 }
 
 resource "google_compute_address" "static_ip" {
-  name = "padel-app-static-ip"
+  name = "levelup-static-ip"
 }
 
-resource "google_compute_instance" "padel-app" {
-  name         = "padel-app-instance"
+resource "google_compute_instance" "levelup" {
+  name         = "levelup-instance"
   machine_type = "e2-micro"
   zone         = var.zone
 
@@ -95,7 +95,7 @@ resource "google_compute_instance" "padel-app" {
 }
 
 resource "google_storage_bucket" "general" {
-  name     = "padel-app-storage"
+  name     = "padel-levelup-2026-storage"
   location = "europe-west1"
   storage_class = "NEARLINE"
 
@@ -104,7 +104,7 @@ resource "google_storage_bucket" "general" {
 }
 
 resource "google_service_account" "vm_sa" {
-  account_id   = "padel-app-vm-sa"
+  account_id   = "levelup-vm-sa"
   display_name = "Padel App VM SA"
 }
 

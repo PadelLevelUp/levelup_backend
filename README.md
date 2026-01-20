@@ -133,8 +133,8 @@ poetry run python app.py
 
 ### With Docker
 ```bash
-docker build -t padel-app .
-docker run --rm -p 80:80 --env-file .env padel-app
+docker build -t levelup_backend .
+docker run --rm -p 80:80 --env-file .env levelup_backend
 ```
 
 

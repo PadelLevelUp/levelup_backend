@@ -43,4 +43,4 @@ class DevConfigProdDB(Config):
 
 class ProdConfig(Config):
     DEBUG = False
-    POSTGRES_HOST = os.getenv("POSTGRES_HOST", "10.132.0.12")
+    POSTGRES_HOST = os.getenv("POSTGRES_HOST", "10.132.0.2")

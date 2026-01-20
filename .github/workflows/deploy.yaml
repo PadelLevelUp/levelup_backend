@@ -34,7 +34,7 @@ jobs:
       with:
         context: .
         push: true
-        tags: ${{ secrets.DOCKERHUB_USERNAME }}/padel-app:latest
+        tags: ${{ secrets.DOCKERHUB_USERNAME }}/levelup_backend:latest
         platforms: linux/amd64
 
     - name: Copy .env.prod to VM
@@ -54,15 +54,15 @@ jobs:
         username: ${{ secrets.GCE_USER }}
         key: ${{ secrets.GCE_SSH_PRIVATE_KEY }}
         script: |
-          sudo docker pull ${{ secrets.DOCKERHUB_USERNAME }}/padel-app:latest
-          sudo docker stop padelapp || true && sudo docker rm padelapp || true
-          sudo docker run -d --name padelapp -p 80:80 \
+          docker pull ${{ secrets.DOCKERHUB_USERNAME }}/levelup_backend:latest
+          docker stop padelapp || true && docker rm padelapp || true
+          docker run -d --name padelapp -p 80:80 \
             --env-file /home/${{ secrets.GCE_USER }}/.env.prod \
             -e POSTGRES_PW=${{ secrets.POSTGRES_PW }} \
             -e FLASK_SECRET_KEY=${{ secrets.FLASK_SECRET_KEY }} \
             -e MAIL_PASSWORD=${{ secrets.MAIL_PASSWORD }} \
             -e GCS_UPLOADS_BUCKET=${{ secrets.GCS_UPLOADS_BUCKET }} \
-            ${{ secrets.DOCKERHUB_USERNAME }}/padel-app:latest
+            ${{ secrets.DOCKERHUB_USERNAME }}/levelup_backend:latest
 
     - name: Copy backup script to VM
       uses: appleboy/scp-action@v0.1.4
