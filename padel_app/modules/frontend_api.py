@@ -6,24 +6,7 @@ from flask_jwt_extended import jwt_required, get_jwt_identity
 from sqlalchemy import func, or_
 
 from padel_app.sql_db import db
-from padel_app.models import (
-    Player,
-    Coach,
-    CoachLevel,
-    Club,
-    User,
-    Lesson,
-    LessonInstance,
-    Presence,
-    CalendarBlock,
-    Message, 
-    Conversation,
-    ConversationParticipant,
-    Association_CoachLesson,
-    Association_PlayerLesson,
-    Association_CoachPlayer
-)
-
+from padel_app.models import *
 from padel_app.tools.request_adapter import JsonRequestAdapter
 from padel_app.tools.calendar_tools import build_datetime
 
@@ -683,6 +666,43 @@ def add_class():
     lesson = create_lesson_helper(lesson_payload)
 
     return jsonify(serialize_calendar_event(lesson))
+
+@bp.post("/add_coach_level")
+@jwt_required()
+def add_coach_level():
+    data = request.get_json() or {}
+    coach = current_coach()
+    
+    def _edit_or_create(form, payload, element):
+        fake_request = JsonRequestAdapter(payload, form)
+        values = form.set_values(fake_request)
+        
+        coach_level.update_with_dict(values)
+        return element
+    
+    for entry in data:
+        level_payload = {
+            "code": entry.get("code"),
+            "label": entry.get("label"),
+            "coach": coach.id,
+            "display_order": entry.get("displayOrder"),
+        }
+        coach_level = (CoachLevel.query
+            .filter(CoachLevel.coach_id == coach.id)
+            .filter(CoachLevel.code == level_payload["code"])
+            .first()
+        )
+        if coach_level:
+            form = coach_level.get_edit_form()
+            coach_level = _edit_or_create(form, level_payload, coach_level)
+            coach_level.save()
+        else:
+            coach_level = CoachLevel()
+            form = coach_level.get_create_form()
+            coach_level = _edit_or_create(form, level_payload, coach_level)
+            coach_level.create()
+
+    return jsonify(data)
 
 # -------------------------------------------------------------------
 # EDIT / DOMAIN ACTIONS

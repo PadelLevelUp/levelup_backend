@@ -75,6 +75,7 @@ class CoachLevel(db.Model, model.Model):
                 ),
                 get_field("label", "Text", label="Level label"),
                 get_field("code", "Text", label="Level code"),
+                get_field("display_order", "Integer", label="Display order"),
             ],
         )
         form.add_block(info_block)

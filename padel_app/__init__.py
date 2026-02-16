@@ -16,7 +16,10 @@ def create_app(test_config=None):
     app = Flask(__name__, instance_relative_config=True)
     CORS(
         app,
-        resources={r"/api/*": {"origins": "http://localhost:8080"}},
+        resources={r"/api/*": {"origins": [
+            "http://localhost:8080",
+            "http://34.78.247.45",
+        ]}},
         supports_credentials=False,
         allow_headers=["Content-Type", "Authorization"],
     )
