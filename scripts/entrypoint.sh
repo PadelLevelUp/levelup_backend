@@ -2,7 +2,7 @@
 set -e
 
 echo "Running migrations..."
-flask db upgrade
+python -m flask --app app.py db upgrade
 
 echo "Starting app..."
 exec "$@"

@@ -1,19 +1,18 @@
 # ----------------------------
-# Stage 1: Build dependencies
+# Stage 1: Build/install deps
 # ----------------------------
 FROM python:3.10-slim AS builder
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential libpq-dev gcc \
+    build-essential gcc libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install poetry
+COPY pyproject.toml ./
+COPY padel_app ./padel_app
 
-COPY pyproject.toml poetry.lock ./
-
-RUN poetry config virtualenvs.in-project true \
-    && poetry install --no-root --without dev
+RUN pip install --upgrade pip setuptools wheel
+RUN pip install --prefix=/install .
 
 # ----------------------------
 # Stage 2: Runtime image
@@ -25,10 +24,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq5 \
     && rm -rf /var/lib/apt/lists/*
 
+COPY --from=builder /install /usr/local
+
 COPY . .
 
-COPY --from=builder /app/.venv /opt/venv
-ENV PATH="/opt/venv/bin:$PATH"
+ENV PYTHONUNBUFFERED=1
+ENV FLASK_APP=app.py
 
 EXPOSE 80
 
