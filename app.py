@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 import padel_app as app
 
 if os.getenv("FLASK_ENV") != "production":
-    load_dotenv(".env.dev")
+    load_dotenv(".env.local.dev")
     if os.path.exists(".secrets.env"):
         load_dotenv(".secrets.env")
 

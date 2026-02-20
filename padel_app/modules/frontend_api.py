@@ -372,6 +372,14 @@ def calendar_block():
         serialize_calendar_block(calendar_block)
         for calendar_block in CalendarBlock.query.all()
     ])
+    
+@bp.get("/evaluation_categories")
+@jwt_required()
+def evaluation_categories():
+    coach = current_coach()
+    return jsonify([
+        ec.frontend_dict() for ec in coach.evaluation_categories
+    ])
 
 @bp.get("/lesson_instances")
 @jwt_required()
@@ -446,6 +454,36 @@ def class_instance():
     current_class = event_types[model].query.get_or_404(id)
 
     return jsonify(serialize_class_instance(current_class))
+
+@bp.get("/player_profile/<int:player_id>")
+@jwt_required()
+def player_profile(player_id):
+    coach = current_coach()
+
+    coach_player = (Association_CoachPlayer.query
+        .filter_by(coach_id=coach.id, player_id=player_id)
+        .first_or_404()
+    )
+
+    evaluations = [
+        {
+            "categoryId": entry.category_id,
+            "categoryName": entry.category.name,
+            "score": entry.score,
+            "scaleMin": entry.category.scale_min,
+            "scaleMax": entry.category.scale_max,
+            "evaluatedAt": entry.evaluated_at.isoformat(),
+        }
+        for entry in coach_player.current_evaluations
+    ]
+    
+    return jsonify({
+        "playerId": str(player_id),
+        "evaluations": evaluations,
+        "strengths": [{"id": n.id, "text": n.text} for n in coach_player.strengths],
+        "weaknesses": [{"id": n.id, "text": n.text} for n in coach_player.weaknesses],
+    })
+
 # -------------------------------------------------------------------
 # CREATE
 # -------------------------------------------------------------------
@@ -677,11 +715,11 @@ def add_coach_level():
         fake_request = JsonRequestAdapter(payload, form)
         values = form.set_values(fake_request)
         
-        coach_level.update_with_dict(values)
+        element.update_with_dict(values)
         return element
     
     for entry in data:
-        level_payload = {
+        coach_level_payload = {
             "code": entry.get("code"),
             "label": entry.get("label"),
             "coach": coach.id,
@@ -689,20 +727,145 @@ def add_coach_level():
         }
         coach_level = (CoachLevel.query
             .filter(CoachLevel.coach_id == coach.id)
-            .filter(CoachLevel.code == level_payload["code"])
+            .filter(CoachLevel.code == coach_level_payload["code"])
             .first()
         )
         if coach_level:
             form = coach_level.get_edit_form()
-            coach_level = _edit_or_create(form, level_payload, coach_level)
+            coach_level = _edit_or_create(form, coach_level_payload, coach_level)
             coach_level.save()
         else:
             coach_level = CoachLevel()
             form = coach_level.get_create_form()
-            coach_level = _edit_or_create(form, level_payload, coach_level)
+            coach_level = _edit_or_create(form, coach_level_payload, coach_level)
             coach_level.create()
 
     return jsonify(data)
+
+@bp.post("/add_evaluation_categories")
+@jwt_required()
+def add_evaluation_categories():
+    data = request.get_json() or {}
+    coach = current_coach()
+    
+    def _edit_or_create(form, payload, element):
+        fake_request = JsonRequestAdapter(payload, form)
+        values = form.set_values(fake_request)
+        
+        element.update_with_dict(values)
+        return element
+    
+    for entry in data:
+        ev_payload = {
+            'name': entry.get("name"),
+            'scale_min': entry.get("scaleMin"),
+            'scale_max': entry.get("scaleMax"),
+            "coach": coach.id,
+        }
+
+        evaluation_category = (EvaluationCategory.query
+            .filter(EvaluationCategory.coach_id == coach.id)
+            .filter(EvaluationCategory.name == ev_payload["name"])
+            .first()
+        )
+        if evaluation_category:
+            form = evaluation_category.get_edit_form()
+            evaluation_category = _edit_or_create(form, ev_payload, evaluation_category)
+            evaluation_category.save()
+        else:
+            evaluation_category = EvaluationCategory()
+            form = evaluation_category.get_create_form()
+            evaluation_category = _edit_or_create(form, ev_payload, evaluation_category)
+            evaluation_category.create()
+
+    return jsonify(data)
+
+@bp.post("/add_coach_note")
+@jwt_required()
+def add_coach_note():
+    data = request.get_json() or {}
+    coach = current_coach()
+
+    player_id = data.get("playerId")
+    note_type = data.get("type")
+    text = data.get("text", "").strip()
+
+    if not text:
+        return jsonify({"error": "text is required"}), 400
+
+    if note_type not in ("strength", "weakness"):
+        return jsonify({"error": "type must be 'strength' or 'weakness'"}), 400
+
+    coach_player = (Association_CoachPlayer.query
+        .filter_by(coach_id=coach.id, player_id=player_id)
+        .first_or_404()
+    )
+
+    def _edit_or_create(form, payload, element):
+        fake_request = JsonRequestAdapter(payload, form)
+        values = form.set_values(fake_request)
+        element.update_with_dict(values)
+        return element
+
+    note = CoachPlayerNote()
+    form = note.get_create_form()
+    note = _edit_or_create(form, {
+        "coach_player": coach_player.id,
+        "type": note_type,
+        "text": text,
+    }, note)
+    note.create()
+
+    return jsonify({"status": "ok", "id": note.id, "type": note_type, "text": note.text})
+
+@bp.post("/add_evaluation_entry")
+@jwt_required()
+def add_evaluation_entry():
+    data = request.get_json() or {}
+    coach = current_coach()
+
+    player_id = data.get("playerId")
+    scores = data.get("scores", [])
+    strengths = data.get("strengths", [])
+    weaknesses = data.get("weaknesses", [])
+
+    coach_player = (Association_CoachPlayer.query
+        .filter_by(coach_id=coach.id, player_id=player_id)
+        .first_or_404()
+    )
+
+    def _edit_or_create(form, payload, element):
+        fake_request = JsonRequestAdapter(payload, form)
+        values = form.set_values(fake_request)
+        element.update_with_dict(values)
+        return element
+
+    for score in scores:
+        ev_payload = {
+            "coach_player": coach_player.id,
+            "category": score.get("categoryId"),
+            "score": score.get("value"),
+        }
+        entry = EvaluationEntry()
+        form = entry.get_create_form()
+        entry = _edit_or_create(form, ev_payload, entry)
+        entry.create()
+
+    for item in strengths:
+        text = item.get("text") if isinstance(item, dict) else item
+        note = CoachPlayerNote()
+        form = note.get_create_form()
+        note = _edit_or_create(form, {"coach_player": coach_player.id, "type": "strength", "text": text}, note)
+        note.create()
+
+    for item in weaknesses:
+        text = item.get("text") if isinstance(item, dict) else item
+        note = CoachPlayerNote()
+        form = note.get_create_form()
+        note = _edit_or_create(form, {"coach_player": coach_player.id, "type": "weakness", "text": text}, note)
+        note.create()
+
+    return jsonify({"status": "ok", "playerId": player_id})
 
 # -------------------------------------------------------------------
 # EDIT / DOMAIN ACTIONS
@@ -1124,3 +1287,33 @@ def remove_player():
         player.delete()
         user.delete()
         return jsonify({"status": "Delete inactive user"}), 200
+    
+@bp.post("/delete/coach_level")
+def delete_coach_level():
+    data = request.get_json() or {}
+    rel = CoachLevel.query.filter_by(
+        id=int(data['id']),
+    ).first_or_404()
+    rel.delete()
+    return jsonify({"status": "Removed coach levels"}), 200
+
+@bp.post("/delete/evaluation_category")
+def delete_evaluation_category():
+    data = request.get_json() or {}
+
+    rel = EvaluationCategory.query.filter_by(
+        id=int(data['id']),
+    ).first_or_404()
+    rel.delete()
+    
+    return jsonify({"status": "Removed evaluation categories"}), 200
+
+@bp.post("/delete/coach_note")
+def delete_coach_note():
+    data = request.get_json() or {}
+    rel = CoachPlayerNote.query.filter_by(
+        id=int(data['id']),
+    ).first_or_404()
+    rel.delete()
+    
+    return jsonify({"status": "Removed coach note"}), 200

@@ -23,6 +23,8 @@ class Coach(db.Model, model.Model):
         order_by="desc(Association_CoachClub.created_at)",
     )
     
+    evaluation_categories = relationship("EvaluationCategory", back_populates="coach", cascade="all, delete-orphan")
+    
     @property
     def name(self):
         return self.user.name

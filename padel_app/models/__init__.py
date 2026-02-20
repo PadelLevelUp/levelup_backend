@@ -12,6 +12,9 @@ from .presences import Presence
 from .calendar_blocks import CalendarBlock
 from .conversations import Conversation
 from .conversation_participants import ConversationParticipant
+from .coach_player_note import CoachPlayerNote
+from .evaluation_category import EvaluationCategory
+from .evaluation_entry import EvaluationEntry
 from .Association_CoachClub import Association_CoachClub
 from .Association_CoachLesson import Association_CoachLesson
 from .Association_CoachLessonInstance import Association_CoachLessonInstance
@@ -34,6 +37,9 @@ MODELS = {
     "presence": Presence,
     "calendarblock": CalendarBlock,
     "conversation": Conversation,
+    "coachplayernote": CoachPlayerNote,
+    "evaluationcategory": EvaluationCategory,
+    "evaluationentry": EvaluationEntry,
     "conversation_participant": ConversationParticipant,
     "association_coachclub": Association_CoachClub,
     "association_coachlesson": Association_CoachLesson,

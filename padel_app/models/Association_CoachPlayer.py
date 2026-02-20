@@ -27,6 +27,9 @@ class Association_CoachPlayer(db.Model, model.Model):
     
     side = Column(Enum("left", "right", name="player_side"), nullable=True)
     notes = Column(String(255), nullable=True)
+    
+    notes_list = relationship("CoachPlayerNote", back_populates="coach_player", cascade="all, delete-orphan")
+    evaluations = relationship("EvaluationEntry", back_populates="coach_player", cascade="all, delete-orphan")
 
     def __repr__(self):
         return f"<CoachPlayer {self.coach.name} - {self.player.name}>"
@@ -37,6 +40,22 @@ class Association_CoachPlayer(db.Model, model.Model):
     @property
     def name(self):
         return f"{self.coach.name} - {self.player.name}"
+    
+    @property
+    def strengths(self):
+        return [n for n in self.notes_list if n.type == "strength"]
+
+    @property
+    def weaknesses(self):
+        return [n for n in self.notes_list if n.type == "weakness"]
+
+    @property
+    def current_evaluations(self):
+        seen = {}
+        for entry in sorted(self.evaluations, key=lambda e: e.evaluated_at, reverse=True):
+            if entry.category_id not in seen:
+                seen[entry.category_id] = entry
+        return list(seen.values())
 
     @classmethod
     def display_all_info(cls):
