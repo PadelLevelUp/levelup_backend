@@ -11,8 +11,10 @@ per-row failures so that a bad row never aborts the entire batch.
 """
 from datetime import datetime
 
+from padel_app.sql_db import db
 from padel_app.models import (
     CoachLevel,
+    CoachPlayerNote,
     EvaluationCategory,
     EvaluationEntry,
     User,
@@ -82,6 +84,7 @@ def bulk_create_coach_levels(rows, coach):
             imported += 1
 
         except Exception as e:
+            db.session.rollback()
             errors.append({"row": i, "data": row, "error": str(e)})
 
     return _ok(imported, errors)
@@ -123,6 +126,7 @@ def bulk_create_evaluation_categories(rows, coach):
             imported += 1
 
         except Exception as e:
+            db.session.rollback()
             errors.append({"row": i, "data": row, "error": str(e)})
 
     return _ok(imported, errors)
@@ -202,6 +206,8 @@ def bulk_create_players(rows, coach, club):
 
             else:
                 # Full creation: User + Player + Association_CoachPlayer.
+                # Derive a username from the email prefix when not supplied.
+                username = email.split("@")[0]
                 payload = {
                     "coach": coach.id,
                     "level": level.id if level else None,
@@ -211,7 +217,7 @@ def bulk_create_players(rows, coach, club):
                         "name": row.get("name"),
                         "email": email,
                         "phone": row.get("phone"),
-                        "username": None,
+                        "username": username,
                     },
                 }
                 create_player_helper(payload)
@@ -219,6 +225,7 @@ def bulk_create_players(rows, coach, club):
             imported += 1
 
         except Exception as e:
+            db.session.rollback()
             errors.append({"row": i, "data": row, "error": str(e)})
 
     return _ok(imported, errors)
@@ -273,6 +280,7 @@ def bulk_create_lessons(rows, coach, club):
             imported += 1
 
         except Exception as e:
+            db.session.rollback()
             errors.append({"row": i, "data": row, "error": str(e)})
 
     return _ok(imported, errors)
@@ -331,6 +339,7 @@ def bulk_create_player_lesson_associations(rows, coach):
             imported += 1
 
         except Exception as e:
+            db.session.rollback()
             errors.append({"row": i, "data": row, "error": str(e)})
 
     return _ok(imported, errors)
@@ -413,6 +422,7 @@ def bulk_create_presences(rows, coach):
             imported += 1
 
         except Exception as e:
+            db.session.rollback()
             errors.append({"row": i, "data": row, "error": str(e)})
 
     return _ok(imported, errors)
@@ -426,9 +436,15 @@ def bulk_create_evaluation_entries(rows, coach):
     """
     Create evaluation entries for one or more categories per row.
 
-    Row format: player_name, date (YYYY-MM-DD), <category_name>: <score>, ...
+    Supports two formats:
+
+    *Wide format* (default): player_name, date (YYYY-MM-DD), <category_name>: <score>, ...
     Every key that is not ``player_name`` or ``date`` is treated as a category
     name whose value is the numeric score. Blank / None values are skipped.
+
+    *Normalized format* (AI output): player_name, date (YYYY-MM-DD), category_name, score
+    Detected automatically when rows contain ``category_name`` and ``score`` keys.
+    Each row produces exactly one entry.
 
     ``imported`` counts the number of rows that produced at least one new entry.
     """
@@ -441,6 +457,9 @@ def bulk_create_evaluation_entries(rows, coach):
         coach_players_by_name.setdefault(rel.player.user.name, rel)
 
     categories_by_name = {c.name: c for c in coach.evaluation_categories}
+
+    # Detect format from the first row.
+    is_normalized = bool(rows) and ("category_name" in rows[0] and "score" in rows[0])
 
     reserved_keys = {"player_name", "date"}
 
@@ -460,20 +479,24 @@ def bulk_create_evaluation_entries(rows, coach):
                 else datetime.utcnow()
             )
 
-            row_imported = 0
-            for key, value in row.items():
-                if key in reserved_keys or value is None or value == "":
+            if is_normalized:
+                # Each row = one (category_name, score) pair.
+                category_name = row.get("category_name")
+                value = row.get("score")
+
+                if not category_name or value is None or value == "":
+                    errors.append({"row": i, "error": "Missing category_name or score"})
                     continue
 
-                category = categories_by_name.get(key)
+                category = categories_by_name.get(category_name)
                 if not category:
-                    errors.append({"row": i, "error": f"Category not found: {key!r}"})
+                    errors.append({"row": i, "error": f"Category not found: {category_name!r}"})
                     continue
 
                 try:
                     score = float(value)
                 except (ValueError, TypeError):
-                    errors.append({"row": i, "error": f"Invalid score for {key!r}: {value!r}"})
+                    errors.append({"row": i, "error": f"Invalid score: {value!r}"})
                     continue
 
                 ev_payload = {
@@ -485,12 +508,110 @@ def bulk_create_evaluation_entries(rows, coach):
                 entry = EvaluationEntry()
                 _apply_form(entry.get_create_form(), ev_payload, entry)
                 entry.create()
+                imported += 1
+
+            else:
+                # Wide format: non-reserved keys are category names.
+                row_imported = 0
+                for key, value in row.items():
+                    if key in reserved_keys or value is None or value == "":
+                        continue
+
+                    category = categories_by_name.get(key)
+                    if not category:
+                        errors.append({"row": i, "error": f"Category not found: {key!r}"})
+                        continue
+
+                    try:
+                        score = float(value)
+                    except (ValueError, TypeError):
+                        errors.append({"row": i, "error": f"Invalid score for {key!r}: {value!r}"})
+                        continue
+
+                    ev_payload = {
+                        "coach_player": coach_player.id,
+                        "category": category.id,
+                        "score": score,
+                        "evaluated_at": evaluated_at,
+                    }
+                    entry = EvaluationEntry()
+                    _apply_form(entry.get_create_form(), ev_payload, entry)
+                    entry.create()
+                    row_imported += 1
+
+                if row_imported > 0:
+                    imported += 1
+
+        except Exception as e:
+            db.session.rollback()
+            errors.append({"row": i, "data": row, "error": str(e)})
+
+    return _ok(imported, errors)
+
+
+# ---------------------------------------------------------------------------
+# Coach player notes (strengths / weaknesses)
+# ---------------------------------------------------------------------------
+
+def bulk_create_coach_notes(rows, coach, note_type):
+    """
+    Find-or-create CoachPlayerNote records of a given type.
+
+    ``note_type`` must be ``"strength"`` or ``"weakness"``.
+
+    The AI returns one row per player with a comma-separated string in the
+    key matching ``note_type`` (e.g. ``{"player_name": "Ana", "strengths":
+    "Boa direita, boa mobilidade"}``). Each comma-separated item becomes one
+    note. Duplicates (same coach_player + type + text) are silently skipped.
+    """
+    imported = 0
+    errors = []
+
+    coach_players_by_name = {}
+    for rel in coach.players_relations:
+        coach_players_by_name.setdefault(rel.player.user.name, rel)
+
+    # The column name in the AI row (e.g. "strengths" / "weaknesses").
+    col = note_type + "s"
+
+    for i, row in enumerate(rows):
+        try:
+            player_name = row.get("player_name")
+            coach_player = coach_players_by_name.get(player_name)
+            if not coach_player:
+                errors.append({"row": i, "error": f"Player not found: {player_name!r}"})
+                continue
+
+            raw = row.get(col) or ""
+            texts = [t.strip() for t in str(raw).split(",") if t.strip()]
+            if not texts:
+                continue
+
+            existing_texts = {
+                n.text
+                for n in coach_player.notes_list
+                if n.type == note_type
+            }
+
+            row_imported = 0
+            for text in texts:
+                if text in existing_texts:
+                    continue
+                note = CoachPlayerNote()
+                _apply_form(note.get_create_form(), {
+                    "coach_player": coach_player.id,
+                    "type": note_type,
+                    "text": text,
+                }, note)
+                note.create()
+                existing_texts.add(text)
                 row_imported += 1
 
             if row_imported > 0:
                 imported += 1
 
         except Exception as e:
+            db.session.rollback()
             errors.append({"row": i, "data": row, "error": str(e)})
 
     return _ok(imported, errors)

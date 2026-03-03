@@ -74,6 +74,17 @@ from padel_app.services.calendar_service import (
     create_calendar_block_service,
     edit_calendar_block_service,
 )
+from padel_app.services.ai_service import stream_import_analysis
+from padel_app.services.import_service import (
+    bulk_create_coach_levels,
+    bulk_create_evaluation_categories,
+    bulk_create_players,
+    bulk_create_lessons,
+    bulk_create_player_lesson_associations,
+    bulk_create_presences,
+    bulk_create_evaluation_entries,
+    bulk_create_coach_notes,
+)
 
 bp = Blueprint("frontend_api", __name__, url_prefix="/api/app")
 
@@ -594,3 +605,76 @@ def delete_coach_note():
     rel = CoachPlayerNote.query.filter_by(id=int(data['id'])).first_or_404()
     rel.delete()
     return jsonify({"status": "Removed coach note"}), 200
+
+
+# -------------------------------------------------------------------
+# Import
+# -------------------------------------------------------------------
+# Maps AI table display names -> (bulk_fn, needs_club).
+# Order defines the dependency-safe import sequence.
+_TABLE_MAP = [
+    # Inferred reference data — must come before anything that depends on them.
+    ("Coach Levels",          bulk_create_coach_levels,                                          False),
+    ("Evaluation Categories", bulk_create_evaluation_categories,                                 False),
+    # Main data — in dependency order.
+    ("Players",               bulk_create_players,                                               True),
+    ("Classes",               bulk_create_lessons,                                               True),
+    ("Players in Classes",    bulk_create_player_lesson_associations,                            False),
+    ("Presences",             bulk_create_presences,                                             False),
+    ("Evaluations",           bulk_create_evaluation_entries,                                    False),
+    ("Strengths",             lambda rows, coach: bulk_create_coach_notes(rows, coach, "strength"), False),
+    ("Weaknesses",            lambda rows, coach: bulk_create_coach_notes(rows, coach, "weakness"), False),
+]
+_TABLE_NAMES = {entry[0] for entry in _TABLE_MAP}
+
+
+@bp.post("/import/analyze")
+@jwt_required()
+def import_analyze():
+    file = request.files.get("file")
+    if not file:
+        return jsonify({"error": "No file provided"}), 400
+
+    coach = current_coach()
+    if not coach:
+        return jsonify({"error": "Coach not found"}), 404
+
+    file_bytes = file.read()
+
+    # Optional: user can select which tables to import via query param or form field.
+    # e.g. ?tables=Players,Classes,Presences  or  form field "tables"
+    # If not provided, defaults to all tables.
+    tables_param = request.form.get("tables") or request.args.get("tables")
+    requested_tables = None
+    if tables_param:
+        requested_tables = [t.strip() for t in tables_param.split(",") if t.strip() in _TABLE_NAMES]
+        if not requested_tables:
+            requested_tables = None  # fall back to all
+
+    return Response(
+        stream_import_analysis(
+            file_bytes,
+            coach_id=coach.id,
+            requested_tables=requested_tables,
+        ),
+        mimetype="text/event-stream",
+        headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
+    )
+
+
+@bp.post("/import/confirm")
+@jwt_required()
+def import_confirm():
+    coach = current_coach()
+    club = current_club()
+    data = request.get_json() or {}
+    results = {}
+
+    for table_name, fn, needs_club in _TABLE_MAP:
+        rows = data.get(table_name)
+        if not rows:
+            continue
+        print(f"Importing {len(rows)} to {table_name}")
+        results[table_name] = fn(rows, coach, club) if needs_club else fn(rows, coach)
+
+    return jsonify(results)

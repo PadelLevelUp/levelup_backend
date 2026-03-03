@@ -167,3 +167,23 @@ def add_evaluation_entry_service(coach, data):
         note.create()
 
     return {"status": "ok", "playerId": player_id}
+
+
+def get_coach_levels(coach_id: int) -> list[dict]:
+    """Fetch the coach's existing levels from the database.
+
+    Returns a list of dicts, each with:
+        - code (str): unique level identifier, e.g. "INI", "INT", "ADV"
+        - label (str): display name, e.g. "Iniciacao", "Intermedio", "Avancado"
+        - display_order (int): sort order
+
+    Example return value:
+        [
+            {"code": "INI", "label": "Iniciacao", "display_order": 1},
+            {"code": "INT", "label": "Intermedio", "display_order": 2},
+            {"code": "ADV", "label": "Avancado", "display_order": 3},
+            {"code": "COMP", "label": "Competicao", "display_order": 4},
+        ]
+    """
+
+    return CoachLevel.query.filter_by(coach_id=coach_id).all()
