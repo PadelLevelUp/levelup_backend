@@ -9,7 +9,8 @@ same rows produces no duplicates. Each function returns::
 where ``imported`` counts newly created records and ``errors`` collects any
 per-row failures so that a bad row never aborts the entire batch.
 """
-from datetime import datetime
+from datetime import datetime, date
+import re
 
 from padel_app.sql_db import db
 from padel_app.models import (
@@ -46,6 +47,62 @@ def _apply_form(form, payload, element):
 
 def _ok(imported, errors):
     return {"imported": imported, "errors": errors}
+
+
+def _sanitize_email_part(value):
+    text = str(value or "").strip().lower()
+    cleaned = re.sub(r"[^a-z0-9]+", "", text)
+    return cleaned or "player"
+
+
+def _build_fake_email(name, row_idx):
+    tokens = [t for t in re.split(r"\s+", str(name or "").strip()) if t]
+    first = _sanitize_email_part(tokens[0]) if tokens else "player"
+    second = _sanitize_email_part(tokens[1]) if len(tokens) > 1 else f"player{row_idx + 1}"
+    return f"{first}_{second}@email.com"
+
+
+def _resolve_player_email(row, row_idx):
+    email = str(row.get("email") or "").strip().lower()
+    if email:
+        return email
+
+    base_email = _build_fake_email(row.get("name"), row_idx)
+    if not User.query.filter_by(email=base_email).first():
+        return base_email
+
+    local, domain = base_email.split("@", 1)
+    suffix = 2
+    while True:
+        candidate = f"{local}_{suffix}@{domain}"
+        if not User.query.filter_by(email=candidate).first():
+            return candidate
+        suffix += 1
+
+
+def _coerce_import_datetime(value):
+    if isinstance(value, datetime):
+        return value
+
+    if isinstance(value, date):
+        return datetime.combine(value, datetime.min.time())
+
+    if value is None:
+        return datetime.utcnow()
+
+    text = str(value).strip()
+    if not text:
+        return datetime.utcnow()
+
+    try:
+        return datetime.strptime(text, "%Y-%m-%d")
+    except ValueError:
+        pass
+
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return datetime.utcnow()
 
 
 # ---------------------------------------------------------------------------
@@ -142,6 +199,9 @@ def bulk_create_players(rows, coach, club):
 
     Uniqueness key: user email.
 
+    Missing emails are auto-generated as:
+        firstname_secondname@email.com
+
     - If no user with that email exists → create User + Player +
       Association_CoachPlayer via create_player_helper.
     - If a user with that email exists but has no Player record → create
@@ -160,10 +220,7 @@ def bulk_create_players(rows, coach, club):
 
     for i, row in enumerate(rows):
         try:
-            email = row.get("email")
-            if not email:
-                errors.append({"row": i, "error": "Missing required field: email"})
-                continue
+            email = _resolve_player_email(row, i)
 
             level_code = row.get("level_code")
             level = levels_by_code.get(level_code) if level_code else None
@@ -466,18 +523,12 @@ def bulk_create_evaluation_entries(rows, coach):
     for i, row in enumerate(rows):
         try:
             player_name = row.get("player_name")
-            date_str = row.get("date")
-
             coach_player = coach_players_by_name.get(player_name)
             if not coach_player:
                 errors.append({"row": i, "error": f"Player not found: {player_name!r}"})
                 continue
 
-            evaluated_at = (
-                datetime.strptime(date_str, "%Y-%m-%d")
-                if date_str
-                else datetime.utcnow()
-            )
+            evaluated_at = _coerce_import_datetime(row.get("date"))
 
             if is_normalized:
                 # Each row = one (category_name, score) pair.

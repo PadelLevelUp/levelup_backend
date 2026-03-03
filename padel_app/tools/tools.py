@@ -131,6 +131,11 @@ def str_to_bool(s):
 
 
 def str_to_date(s):
+    if isinstance(s, datetime):
+        return s
+    if isinstance(s, date):
+        return datetime.combine(s, datetime.min.time())
+
     string_formats = {
         "Date": [
             "%d/%m/%Y",  # 01/01/2023
@@ -145,15 +150,22 @@ def str_to_date(s):
         try:
             date_obj = datetime.strptime(s, format)
             return date_obj
-        except ValueError:
+        except (ValueError, TypeError):
             pass
     raise ValueError(f"Cannot convert {s} to Date")
 
 
 def str_to_datetime(s):
+    if isinstance(s, datetime):
+        return s
+    if isinstance(s, date):
+        return datetime.combine(s, datetime.min.time())
+
     string_formats = {
         "DateTime": [
             "%d/%m/%Y, %H:%M",  # 01/01/2023, 12:00
+            "%Y-%m-%d",  # 2023-01-01 date-only fallback
+            "%Y-%m-%d %H:%M:%S",  # 2023-01-01 12:00:00
             "%Y-%m-%dT%H:%M",  # 2023-01-01T12:00 ISO 8601 without seconds
             "%Y-%m-%dT%H:%M:%S",  # 2023-01-01T12:00:00 ISO 8601 with seconds
             "%Y-%m-%dT%H:%M:%S.%f",  # 2023-01-01T12:00:00.000000 ISO 8601 with microseconds
@@ -167,7 +179,7 @@ def str_to_datetime(s):
         try:
             date_obj = datetime.strptime(s, format)
             return date_obj
-        except ValueError:
+        except (ValueError, TypeError):
             pass
     raise ValueError(f"Cannot convert {s} to DateTime")
 
