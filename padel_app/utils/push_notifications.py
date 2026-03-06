@@ -28,8 +28,6 @@ def send_push_notification(user_id, title, body, url="/"):
     if not vapid_public_key or not vapid_private_key or not vapid_claims_email:
         logger.warning("VAPID env vars are not configured; skipping push notification")
         return False
-    vapid_private_key = vapid_private_key.strip('"').replace("\\n", "\n")
-
     payload = json.dumps({
         "title": title,
         "body": body,
