@@ -89,7 +89,7 @@ class Model:
         return new
 
     def flush(self):
-        db.session.flush(self)
+        db.session.flush([self])
         return True
 
     def get_table(self, model):

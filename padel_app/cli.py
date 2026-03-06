@@ -5,19 +5,88 @@ from padel_app.sql_db import db
 
 def register_cli(app):
     @app.cli.command("seed")
+    @click.option(
+        "--table",
+        "tables",
+        multiple=True,
+        help="Seed one table (or repeat --table). Example: --table users --table coaches",
+    )
+    @click.option(
+        "--all-mock-data",
+        "--all_mock_data",
+        "all_mock_data",
+        is_flag=True,
+        help="Seed all mock data tables.",
+    )
     @click.option("--admin-user", default="admin")
     @click.option("--admin-email", default="admin@example.com")
     @click.option(
         "--admin-password",
         envvar="ADMIN_PASSWORD",
-        prompt=True,
         hide_input=True,
-        confirmation_prompt=True,
+        default=None,
+        help="Admin password (used only when seeding admin user).",
     )
-    def seed(admin_user, admin_email, admin_password):
+    def seed(tables, all_mock_data, admin_user, admin_email, admin_password):
         from padel_app.models import Backend_App, User
+        from padel_app.seed import (
+            ALL_SEED_TABLES,
+            available_table_names,
+            normalize_table_name,
+            seed_mock_tables,
+        )
 
         with app.app_context():
+            if tables and all_mock_data:
+                click.echo("❌ Use either --table or --all_mock_data, not both.")
+                return
+
+            if tables or all_mock_data:
+                requested_tables = []
+                if all_mock_data:
+                    requested_tables = list(ALL_SEED_TABLES)
+                else:
+                    invalid_tables = []
+                    for table in tables:
+                        normalized = normalize_table_name(table)
+                        if normalized is None:
+                            invalid_tables.append(table)
+                        else:
+                            requested_tables.append(normalized)
+
+                    if invalid_tables:
+                        click.echo(
+                            "❌ Unknown table(s): "
+                            + ", ".join(sorted(set(invalid_tables)))
+                        )
+                        click.echo(
+                            "Available tables: "
+                            + ", ".join(available_table_names())
+                        )
+                        return
+
+                    requested_tables = list(dict.fromkeys(requested_tables))
+
+                try:
+                    results = seed_mock_tables(requested_tables)
+                    click.echo("✅ Mock data seeded:")
+                    for table_name, result in results.items():
+                        click.echo(
+                            f" - {table_name}: inserted={result.inserted}, updated={result.updated}"
+                        )
+                except Exception as exc:
+                    db.session.rollback()
+                    click.echo(f"❌ Mock seed failed: {exc}")
+                    raise
+                return
+
+            if not admin_password:
+                admin_password = click.prompt(
+                    "Admin password",
+                    hide_input=True,
+                    confirmation_prompt=True,
+                )
+
             admin = User.query.filter_by(username=admin_user).first()
             if not admin:
                 admin = User(

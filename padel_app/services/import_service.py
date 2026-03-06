@@ -12,6 +12,9 @@ per-row failures so that a bad row never aborts the entire batch.
 from datetime import datetime, date
 import re
 
+from psycopg2.errors import UniqueViolation
+from sqlalchemy.exc import IntegrityError
+
 from padel_app.sql_db import db
 from padel_app.models import (
     CoachLevel,
@@ -281,6 +284,13 @@ def bulk_create_players(rows, coach, club):
 
             imported += 1
 
+        except IntegrityError as e:
+            db.session.rollback()
+            if isinstance(e.orig, UniqueViolation) and "username" in str(e.orig):
+                name = row.get("name", "Unknown")
+                errors.append({"row": i, "error": f"Player '{name}' already exists with a different email — skipped."})
+            else:
+                errors.append({"row": i, "data": row, "error": str(e.orig)})
         except Exception as e:
             db.session.rollback()
             errors.append({"row": i, "data": row, "error": str(e)})
@@ -300,6 +310,9 @@ def bulk_create_lessons(rows, coach, club):
     lesson's anchor start date. ``start_time`` and ``end_time`` are HH:MM
     strings.
     """
+    if club is None:
+        return _ok(0, [{"error": "Coach has no associated club — cannot import classes"}])
+
     imported = 0
     errors = []
 
@@ -323,12 +336,13 @@ def bulk_create_lessons(rows, coach, club):
 
             payload = {
                 "title": title,
-                "type": row.get("type"),
+                "type": row.get("type") or "academy",
                 "status": "active",
                 "is_recurring": row.get("is_recurring", False),
                 "start_datetime": build_datetime(day, row.get("start_time")),
                 "end_datetime": build_datetime(day, row.get("end_time")),
-                "max_players": row.get("max_players"),
+                "max_players": row.get("max_players") or 5,
+                "color": row.get("color") or "#3B82F6",
                 "club": club.id,
                 "coach": coach.id,
             }
@@ -457,24 +471,25 @@ def bulk_create_presences(rows, coach):
                 player_id=player.id,
             ).first()
 
+            status = row.get("status") or None
+            justification = row.get("justification") or None
+
             if existing:
                 # Update status/justification on re-import.
-                existing.status = row.get("status")
-                existing.justification = row.get("justification")
+                existing.status = status
+                existing.justification = justification
                 existing.validated = True
                 existing.save()
             else:
-                data = {
-                    "status": row.get("status"),
-                    "justification": row.get("justification"),
-                    "invited": True,
-                    "confirmed": True,
-                    "validated": True,
-                }
-                p = Presence(player_id=player.id, lesson_instance_id=instance.id)
-                form = p.get_create_form()
-                _apply_form(form, data, p)
-                p.create()
+                Presence(
+                    player_id=player.id,
+                    lesson_instance_id=instance.id,
+                    status=status,
+                    justification=justification,
+                    invited=True,
+                    confirmed=True,
+                    validated=True,
+                ).create()
 
             imported += 1
 

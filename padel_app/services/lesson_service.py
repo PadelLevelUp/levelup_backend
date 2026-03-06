@@ -71,7 +71,6 @@ def get_or_materialize_instance(lesson: Lesson, date):
         end_datetime=datetime.combine(date, lesson.end_datetime.time()),
         status="scheduled",
         max_players=lesson.max_players,
-        club_id=lesson.club_id,
     )
 
     instance.add_to_session()

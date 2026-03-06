@@ -112,12 +112,6 @@ class Club(db.Model, model.Model):
                 get_field(
                     "lessons", "OneToMany", label="Lessons", related_model="Lesson"
                 ),
-                get_field(
-                    "lesson_instances",
-                    "OneToMany",
-                    label="Lesson Instances",
-                    related_model="LessonInstance",
-                ),
             ],
         )
         form.add_block(info_block)

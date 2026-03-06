@@ -61,7 +61,7 @@ _TABLE_FIELDS: dict[str, str] = {
     "Players": "name, email, phone, level_code, side",
     "Classes": "title, type (academy/private), is_recurring, day (YYYY-MM-DD), start_time (HH:MM), end_time (HH:MM), max_players. NOTE: if only one time/hour column exists, map it to start_time (end_time will be inferred).",
     "Players in Classes": "lesson_title, player_name",
-    "Presences": "lesson_title, date (YYYY-MM-DD), player_name, status (P/present/A/absent/FJ/FI), justification, start_time (HH:MM), end_time (HH:MM). NOTE: if only one time/hour column exists, map it to start_time.",
+    "Presences": "lesson_title, date (YYYY-MM-DD), player_name, status (P/present/A/absent/FJ/FI — empty cell means absent), justification (map from columns named 'justification', 'absences', 'absence type', 'tipo de falta', 'motivo', 'reason', or any column describing the type/reason of absence), start_time (HH:MM), end_time (HH:MM). NOTE: if only one time/hour column exists, map it to start_time.",
     "Evaluations": "player_name, date (YYYY-MM-DD), category_name, score",
     "Strengths": "player_name, strengths",
     "Weaknesses": "player_name, weaknesses",
@@ -483,10 +483,12 @@ def _validate_presences(rows, known_players):
             dropped += 1; continue
         raw_st = row.get("status")
         if is_empty(raw_st):
-            dropped += 1; continue
-        status, just = normalize_status(str(raw_st))
-        if status is None:
-            dropped += 1; continue
+            # Empty status = absent (class happened, no presence mark recorded).
+            status, just = "absent", None
+        else:
+            status, just = normalize_status(str(raw_st))
+            if status is None:
+                dropped += 1; continue
         row["status"] = status
         existing_just = row.get("justification")
         if just and is_empty(existing_just):
@@ -495,6 +497,11 @@ def _validate_presences(rows, known_players):
             jl = str(existing_just).strip().lower()
             if jl in ("justified", "unjustified", "justificada", "injustificada"):
                 row["justification"] = "justified" if "just" in jl and "in" not in jl else "unjustified"
+            elif has_meaningful_text(existing_just):
+                # Any descriptive reason (e.g. "doença", "viagem") implies justified.
+                row["justification"] = "justified"
+            else:
+                row["justification"] = None
         date = normalize_date(row.get("date"))
         if not date:
             dropped += 1; continue
