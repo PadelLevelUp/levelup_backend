@@ -4,6 +4,7 @@ from padel_app.models import (
     Association_CoachPlayer,
     PlayerLevelHistory,
 )
+from sqlalchemy.orm import joinedload
 from padel_app.tools.request_adapter import JsonRequestAdapter
 
 
@@ -110,6 +111,59 @@ def get_players_list(coach, club):
         return club.players
     else:
         return Player.query.all()
+
+
+def _serialize_coach_player_relation(rel):
+    player = rel.player
+    user = player.user if player else None
+    return {
+        "id": f"p-{rel.player_id}_c-{rel.coach_id}",
+        "coachId": rel.coach_id,
+        "playerId": rel.player_id,
+        "levelId": rel.level_id,
+        "notes": rel.notes,
+        "name": user.name if user else None,
+        "email": user.email if user else None,
+        "phone": user.phone if user else None,
+        "username": user.username if user else None,
+        "side": rel.side,
+        "userId": player.user_id if player else None,
+        "isActive": user.status == "active" if user else False,
+    }
+
+
+def get_coach_players_list(coach):
+    relations = (
+        Association_CoachPlayer.query.options(
+            joinedload(Association_CoachPlayer.player).joinedload(Player.user)
+        )
+        .filter_by(coach_id=coach.id)
+        .order_by(Association_CoachPlayer.id.desc())
+        .all()
+    )
+    return [_serialize_coach_player_relation(rel) for rel in relations]
+
+
+def get_coach_players_paginated(coach, page=1, per_page=25):
+    query = (
+        Association_CoachPlayer.query.options(
+            joinedload(Association_CoachPlayer.player).joinedload(Player.user)
+        )
+        .filter_by(coach_id=coach.id)
+        .order_by(Association_CoachPlayer.id.desc())
+    )
+    pagination = query.paginate(page=page, per_page=per_page, error_out=False)
+    return {
+        "items": [_serialize_coach_player_relation(rel) for rel in pagination.items],
+        "pagination": {
+            "page": pagination.page,
+            "perPage": pagination.per_page,
+            "total": pagination.total,
+            "pages": pagination.pages,
+            "hasNext": pagination.has_next,
+            "hasPrev": pagination.has_prev,
+        },
+    }
 
 
 def get_player_profile(coach, player_id):

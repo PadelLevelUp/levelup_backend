@@ -1,399 +1,143 @@
 """
-AI-powered Excel import analysis service.
+AI-powered Excel import analysis service for padel coaching.
 
-Pipeline (dependency-ordered):
-    1. parse_excel              -- parse workbook into sheet -> raw rows
-    2. pick_relevant_sheets     -- cheap LLM call to filter irrelevant sheets
-    3. detect_table_segments    -- find multiple tables within a single sheet
-    4. column-map all segments  -- LLM maps columns to target schemas (~4s each)
-    5. ordered extraction chain:
-        a. Coach Levels     -- map Excel levels to coach's existing DB levels via LLM
-        b. Players          -- validate level_code against mapped Coach Levels
-        c. Eval Categories  -- validate names are real categories (not numbers)
-        d. Classes          -- require date+times, auto-generate title if missing
-        e. Players in Classes -- require known Player + known Class
-        f. Presences        -- require known Player + status + date
-        g. Evaluations      -- require known Player + known Category
-        h. Strengths        -- require known Player
-        i. Weaknesses       -- require known Player
-    6. Cross-table validation   -- drop orphaned references, count drops
-    7. LLM cleanup pass         -- only for tables with anomalies
-    8. stream_import_analysis   -- orchestrate and yield SSE events
+Pipeline:
+    1. parse_excel              → sheet → raw rows
+    2. pick_relevant_sheets     → LLM filters irrelevant sheets
+    3. detect_table_segments    → find multiple tables within a sheet
+    4. column-map all segments  → LLM maps columns to target schemas
+    5. ordered validation chain → business rules enforced programmatically
+    6. stream_import_analysis   → orchestrate and yield SSE events
 
-Design principles:
-    - User selects which tables to import (default: all).
-      Coach Levels and Eval Categories are auto-included as dependencies.
-    - Column-mapping strategy for ALL sheets (fast, ~4s, reliable).
-    - Business rules enforced programmatically, not by LLM.
-    - LLM used only for: sheet relevance, column mapping, level mapping,
-      name validation, and anomaly correction.
-    - response_format=json_object on all LLM calls.
-    - No pandas dependency.
-
-All OpenAI calls use the openai >= 1.0 client API.
+Design: LLM handles ambiguous tasks (column mapping, level matching, name
+validation). Business rules are enforced deterministically in validators.
 """
 from __future__ import annotations
 
+import copy
 import json
-import logging
-import os
-import re
 import time
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 from typing import Generator
 
-from openai import OpenAI
-import openpyxl
+from padel_app.helpers.llm import call_llm, log_timing, logger, parse_json
+from padel_app.helpers.parsing import (
+    TableSegment,
+    detect_table_segments,
+    parse_excel,
+    pick_relevant_sheets,
+)
+from padel_app.helpers.text import (
+    clean_text_value,
+    deduplicate_rows,
+    deep_copy_rows,
+    fuzzy_match_category,
+    has_meaningful_text,
+    is_empty,
+    is_garbage_category,
+    is_numeric,
+    merge_table_rows,
+    normalize_date,
+    normalize_status,
+    normalize_text,
+    normalize_time,
+)
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Constants
 # ---------------------------------------------------------------------------
 
-_client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY", ""))
-
-_MODEL = "gpt-4o-mini"
-_logger = logging.getLogger(__name__)
-
-if not _logger.handlers:
-    _handler = logging.StreamHandler()
-    _handler.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
-    _logger.addHandler(_handler)
-    _logger.setLevel(logging.INFO)
-
-_MAX_RETRIES = 2
-_RETRY_DELAY_S = 1.0
-
-# All user-selectable tables
 ALL_IMPORTABLE_TABLES: list[str] = [
-    "Players",
-    "Classes",
-    "Players in Classes",
-    "Presences",
-    "Evaluations",
-    "Strengths",
-    "Weaknesses",
+    "Players", "Classes", "Players in Classes", "Presences",
+    "Evaluations", "Strengths", "Weaknesses",
 ]
+_AUTO_TABLES: frozenset[str] = frozenset({"Coach Levels", "Evaluation Categories"})
 
-# Tables that are always included as dependencies (never user-deselected)
-_AUTO_TABLES: set[str] = {"Coach Levels", "Evaluation Categories"}
-
-_DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-_TIME_PATTERN = re.compile(r"^\d{2}:\d{2}$")
-
-
-def _elapsed_ms(start: float) -> float:
-    return (time.perf_counter() - start) * 1000
-
-
-def _log_timing(step: str, start: float, **meta) -> float:
-    elapsed_ms = _elapsed_ms(start)
-    if meta:
-        meta_str = ", ".join(f"{k}={v}" for k, v in meta.items())
-        _logger.info("[AI TIMER] %s took %.2fms (%s)", step, elapsed_ms, meta_str)
-    else:
-        _logger.info("[AI TIMER] %s took %.2fms", step, elapsed_ms)
-    return elapsed_ms
+_TABLE_FIELDS: dict[str, str] = {
+    "Coach Levels": "code, label, display_order",
+    "Evaluation Categories": "name, scale_min, scale_max",
+    "Players": "name, email, phone, level_code, side",
+    "Classes": "title, type (academy/private), is_recurring, day (YYYY-MM-DD), start_time (HH:MM), end_time (HH:MM), max_players. NOTE: if only one time/hour column exists, map it to start_time (end_time will be inferred).",
+    "Players in Classes": "lesson_title, player_name",
+    "Presences": "lesson_title, date (YYYY-MM-DD), player_name, status (P/present/A/absent/FJ/FI), justification, start_time (HH:MM), end_time (HH:MM). NOTE: if only one time/hour column exists, map it to start_time.",
+    "Evaluations": "player_name, date (YYYY-MM-DD), category_name, score",
+    "Strengths": "player_name, strengths",
+    "Weaknesses": "player_name, weaknesses",
+}
 
 
 # ---------------------------------------------------------------------------
-# LLM helper
+# Category registry
 # ---------------------------------------------------------------------------
 
-def _call_openai(
-    *,
-    messages: list[dict],
-    max_tokens: int = 4096,
-    temperature: float = 0,
-    use_json_mode: bool = False,
-    step_label: str = "openai_call",
-    **extra_meta,
-) -> str:
-    """Call OpenAI with retry. json_mode guarantees valid JSON output."""
-    kwargs: dict = {
-        "model": _MODEL,
-        "messages": messages,
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-    }
-    if use_json_mode:
-        kwargs["response_format"] = {"type": "json_object"}
 
-    last_exc: Exception | None = None
-    for attempt in range(_MAX_RETRIES + 1):
-        try:
-            llm_start = time.perf_counter()
-            response = _client.chat.completions.create(**kwargs)
-            _log_timing(
-                f"{step_label}.openai_call", llm_start,
-                model=_MODEL, attempt=attempt, **extra_meta,
-            )
-            return response.choices[0].message.content.strip()
-        except Exception as exc:
-            last_exc = exc
-            _logger.warning("[AI] %s attempt %d failed: %s", step_label, attempt, exc)
-            if attempt < _MAX_RETRIES:
-                time.sleep(_RETRY_DELAY_S * (attempt + 1))
-    raise last_exc  # type: ignore[misc]
+class CategoryRegistry:
+    """Single source of truth for evaluation category tracking."""
 
-
-# ---------------------------------------------------------------------------
-# Utility
-# ---------------------------------------------------------------------------
-
-def _is_empty(val) -> bool:
-    return val is None or (isinstance(val, str) and val.strip() == "")
-
-
-def _is_numeric(val) -> bool:
-    if isinstance(val, (int, float)):
-        return True
-    if val is None:
-        return False
-    try:
-        float(str(val))
-        return True
-    except (ValueError, TypeError):
-        return False
-
-
-def _deduplicate_rows(existing: list[dict], new_rows: list[dict]) -> list[dict]:
-    seen: dict[str, dict] = {}
-    for row in existing + new_rows:
-        key = json.dumps(row, default=str, sort_keys=True)
-        seen[key] = row
-    return list(seen.values())
-
-
-def _merge_into(analysis: dict[str, list], new_tables: dict[str, list]) -> None:
-    for table_name, table_rows in new_tables.items():
-        if isinstance(table_rows, list) and table_rows:
-            analysis[table_name] = _deduplicate_rows(
-                analysis.get(table_name, []), table_rows
-            )
-
-
-# ---------------------------------------------------------------------------
-# Step 1 -- Excel parsing
-# ---------------------------------------------------------------------------
-
-def parse_excel(file_bytes: bytes) -> dict[str, list[list]]:
-    """Parse workbook into {sheet_name: raw_rows} (lists of cell values).
-    Keeps raw rows so segment detection can find embedded headers."""
-    from io import BytesIO
-
-    total_start = time.perf_counter()
-    wb = openpyxl.load_workbook(BytesIO(file_bytes), data_only=True, read_only=True)
-    _log_timing("parse_excel.load_workbook", total_start, sheets=len(wb.sheetnames))
-    sheets: dict[str, list[list]] = {}
-
-    for sheet_name in wb.sheetnames:
-        sheet_start = time.perf_counter()
-        ws = wb[sheet_name]
-        rows = [list(r) for r in ws.iter_rows(values_only=True)]
-        if len(rows) < 2:
-            _log_timing("parse_excel.sheet", sheet_start,
-                        sheet=sheet_name, status="skipped_short", rows=len(rows))
-            continue
-        has_data = any(
-            any(c is not None and c != "" for c in row)
-            for row in rows[1:]
-        )
-        if has_data:
-            sheets[sheet_name] = rows
-            _log_timing("parse_excel.sheet", sheet_start,
-                        sheet=sheet_name, status="included", rows=len(rows))
-        else:
-            _log_timing("parse_excel.sheet", sheet_start,
-                        sheet=sheet_name, status="empty", rows=0)
-
-    wb.close()
-    _log_timing("parse_excel.total", total_start, selected_sheets=len(sheets))
-    return sheets
-
-
-# ---------------------------------------------------------------------------
-# Step 2 -- Sheet relevance filter
-# ---------------------------------------------------------------------------
-
-def pick_relevant_sheets(
-    sheets_data: dict[str, list[list]],
-    requested_tables: set[str],
-) -> list[str]:
-    """Use a cheap LLM call to decide which sheets are relevant,
-    scoped to only the tables the user wants to import."""
-    total_start = time.perf_counter()
-    if not sheets_data:
-        return []
-
-    tables_desc = ", ".join(sorted(requested_tables | _AUTO_TABLES))
-
-    summaries = []
-    for name, rows in sheets_data.items():
-        header = [str(h)[:60] if h is not None else "" for h in rows[0]]
-        sample = [
-            [str(c)[:60] if c is not None else None for c in row]
-            for row in rows[1:3]
-        ]
-        summaries.append({"sheet": name, "headers": header, "sample_rows": sample})
-
-    prompt = (
-        "You are a data import assistant for a padel coaching app.\n\n"
-        f"The user wants to import ONLY these tables: {tables_desc}.\n\n"
-        "Sheet names may be in ANY language. "
-        "Judge by column headers and data content, NOT by name.\n\n"
-        'Return a JSON object: {"sheets": ["name1", "name2", ...]} '
-        "with sheet names that contain data relevant to the requested tables. "
-        "When in doubt, include the sheet.\n\n"
-        f"Sheets:\n{json.dumps(summaries, default=str, indent=2)}"
-    )
-
-    try:
-        content = _call_openai(
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=256, use_json_mode=True,
-            step_label="pick_relevant_sheets",
-        )
-        result = json.loads(content)
-        selected = result.get("sheets", result) if isinstance(result, dict) else result
-        _log_timing("pick_relevant_sheets.total", total_start,
-                    selected=len(selected), total=len(sheets_data))
-        return selected
-    except Exception:
-        _logger.exception("[AI] pick_relevant_sheets failed, returning all")
-        return list(sheets_data.keys())
-
-
-# ---------------------------------------------------------------------------
-# Step 3 -- Table segment detection
-# ---------------------------------------------------------------------------
-
-class TableSegment:
-    """A contiguous block of rows within a sheet that forms one logical table."""
-    __slots__ = ("sheet_name", "segment_index", "headers", "data_rows", "start_row")
-
-    def __init__(self, sheet_name: str, segment_index: int,
-                 headers: list[str], data_rows: list[dict], start_row: int):
-        self.sheet_name = sheet_name
-        self.segment_index = segment_index
-        self.headers = headers
-        self.data_rows = data_rows
-        self.start_row = start_row
+    def __init__(self) -> None:
+        self._by_norm: dict[str, str] = {}
+        self._rows: list[dict] = []
 
     @property
-    def label(self) -> str:
-        if self.segment_index == 0:
-            return self.sheet_name
-        return f"{self.sheet_name} (segment {self.segment_index + 1})"
+    def known(self) -> dict[str, str]:
+        return dict(self._by_norm)
 
-    def __repr__(self) -> str:
-        return f"<Segment {self.label}: {len(self.data_rows)} rows, {len(self.headers)} cols>"
+    @property
+    def rows(self) -> list[dict]:
+        return list(self._rows)
 
+    def register(self, name: str, scale_min: float = 0, scale_max: float = 10) -> bool:
+        norm = normalize_text(name)
+        if norm in self._by_norm or fuzzy_match_category(name, self._by_norm):
+            return False
+        self._by_norm[norm] = name
+        self._rows.append({"name": name, "scale_min": scale_min, "scale_max": scale_max})
+        return True
 
-def _is_likely_header(row: list, prev_row_types: list[type] | None) -> bool:
-    if not row:
-        return False
-    non_null = [c for c in row if c is not None and c != ""]
-    if len(non_null) < 2:
-        return False
-    all_str = all(isinstance(c, str) for c in non_null)
-    if not all_str:
-        return False
-    if prev_row_types:
-        numeric_before = sum(1 for t in prev_row_types if t in (int, float))
-        if numeric_before >= len(prev_row_types) * 0.3:
-            return True
-    return False
+    def bulk_register(self, cat_rows: list[dict]) -> None:
+        for row in cat_rows:
+            name = row.get("name")
+            if not is_empty(name):
+                self.register(str(name).strip(), row.get("scale_min", 0), row.get("scale_max", 10))
 
-
-def detect_table_segments(sheet_name: str, raw_rows: list[list]) -> list[TableSegment]:
-    """Find one or more logical tables within a sheet."""
-    total_start = time.perf_counter()
-    if not raw_rows:
-        return []
-
-    header_idx = 0
-    for i, row in enumerate(raw_rows):
-        if any(c is not None and c != "" for c in row):
-            header_idx = i
-            break
-
-    segments: list[TableSegment] = []
-    current_header_idx = header_idx
-    current_data_start = header_idx + 1
-    consecutive_blank = 0
-    prev_types: list[type] | None = None
-
-    def _finalise_segment(data_end: int) -> None:
-        nonlocal current_header_idx
-        header_row = raw_rows[current_header_idx]
-        headers = [
-            str(h).strip() if h is not None else f"col_{j}"
-            for j, h in enumerate(header_row)
-        ]
-        data_rows = []
-        for r in raw_rows[current_data_start:data_end]:
-            row_dict = {
-                headers[j]: (r[j] if j < len(r) else None)
-                for j in range(len(headers))
-            }
-            if not all(v is None or v == "" for v in row_dict.values()):
-                data_rows.append(row_dict)
-        if data_rows:
-            segments.append(TableSegment(
-                sheet_name=sheet_name,
-                segment_index=len(segments),
-                headers=headers,
-                data_rows=data_rows,
-                start_row=current_header_idx,
-            ))
-
-    i = current_data_start
-    while i < len(raw_rows):
-        row = raw_rows[i]
-        is_blank = all(c is None or c == "" for c in row)
-
-        if is_blank:
-            consecutive_blank += 1
-            if consecutive_blank >= 2:
-                _finalise_segment(i - consecutive_blank + 1)
-                for j in range(i + 1, len(raw_rows)):
-                    if any(c is not None and c != "" for c in raw_rows[j]):
-                        current_header_idx = j
-                        current_data_start = j + 1
-                        i = j + 1
-                        consecutive_blank = 0
-                        prev_types = None
-                        break
-                else:
-                    i = len(raw_rows)
+    def discover_from_evaluations(self, raw_evals: list[dict]) -> int:
+        added = 0
+        for ev in raw_evals:
+            cat = ev.get("category_name")
+            if is_empty(cat):
                 continue
-            i += 1
-            continue
+            cat_str = str(cat).strip()
+            if not is_garbage_category(cat_str) and self.register(cat_str):
+                added += 1
+        return added
 
-        consecutive_blank = 0
-        if prev_types and _is_likely_header(row, prev_types):
-            _finalise_segment(i)
-            current_header_idx = i
-            current_data_start = i + 1
-            prev_types = None
-            i += 1
-            continue
+    def merge_discovered(self, updated: dict[str, str]) -> None:
+        for norm, canonical in updated.items():
+            if norm not in self._by_norm and not is_garbage_category(canonical):
+                self._by_norm[norm] = canonical
+                self._rows.append({"name": canonical, "scale_min": 0, "scale_max": 10})
 
-        prev_types = [type(c) for c in row]
-        i += 1
-
-    _finalise_segment(len(raw_rows))
-    _log_timing("detect_table_segments", total_start,
-                sheet=sheet_name, segments=len(segments),
-                total_rows=sum(len(s.data_rows) for s in segments))
-    return segments
+    def deduplicate(self) -> None:
+        seen: dict[str, str] = {}
+        deduped: list[dict] = []
+        for row in self._rows:
+            name = row.get("name", "")
+            if fuzzy_match_category(name, seen):
+                continue
+            seen[normalize_text(name)] = name
+            deduped.append(row)
+        self._rows = deduped
+        self._by_norm = {normalize_text(r["name"]): r["name"] for r in deduped}
 
 
 # ---------------------------------------------------------------------------
-# Step 4 -- Column-mapping (LLM)
+# Step 4 — Column mapping (LLM)
 # ---------------------------------------------------------------------------
+
 
 def _column_profile(rows: list[dict]) -> dict[str, list]:
-    """Build {column: [up to 15 unique non-null sample values]}."""
     result: dict[str, list] = {}
     for header in (rows[0].keys() if rows else []):
         seen: list[str] = []
@@ -407,33 +151,12 @@ def _column_profile(rows: list[dict]) -> dict[str, list]:
     return result
 
 
-def _infer_column_mapping(
-    segment: TableSegment,
-    requested_tables: set[str],
-) -> dict:
-    """Ask the LLM to map source columns to target schema fields.
-    Only maps to tables the user actually wants."""
-    total_start = time.perf_counter()
+def _infer_column_mapping(segment: TableSegment, active_tables: set[str]) -> dict:
+    t = time.perf_counter()
     profile = _column_profile(segment.data_rows)
-
-    # Build the table descriptions only for requested + auto tables
-    active_tables = requested_tables | _AUTO_TABLES
-    table_fields = {
-        "Coach Levels": "code, label, display_order",
-        "Evaluation Categories": "name, scale_min, scale_max",
-        "Players": "name, email, phone, level_code, side",
-        "Classes": "title, type (academy/private), is_recurring, day (YYYY-MM-DD), start_time (HH:MM), end_time (HH:MM), max_players",
-        "Players in Classes": "lesson_title, player_name",
-        "Presences": "lesson_title, date (YYYY-MM-DD), player_name, status (present/absent), justification (justified/unjustified)",
-        "Evaluations": "player_name, date (YYYY-MM-DD), category_name, score",
-        "Strengths": "player_name, strengths",
-        "Weaknesses": "player_name, weaknesses",
-    }
     tables_section = "\n".join(
-        f'- "{t}": {table_fields[t]}'
-        for t in table_fields if t in active_tables
+        f'- "{t_}": {_TABLE_FIELDS[t_]}' for t_ in _TABLE_FIELDS if t_ in active_tables
     )
-
     prompt = f"""You are a data import assistant for a padel coaching app.
 
 I have a table segment from Excel sheet "{segment.sheet_name}" with {len(segment.data_rows)} rows.
@@ -450,18 +173,13 @@ STANDARD mapping (for flat tables):
 - "value_mappings": object mapping target_field to {{original_value: normalised_value}}
 
 PIVOT mapping (for evaluation/scoring sheets where columns ARE categories):
-If this sheet has player names in one column and multiple columns that are
-evaluation categories (e.g. "Technique", "Tactics", "Physical", etc.) with
-numeric scores in the cells, use a PIVOT mapping:
 - "table_name": "Evaluations"
 - "pivot": true
 - "player_column": "<column containing player names>"
 - "date_column": "<column containing dates, or null>"
-- "category_columns": ["<col1>", "<col2>", ...] — ONLY columns that are real
-  evaluation category names with numeric score values. Do NOT include columns
-  that contain player names, dates, levels, emails, or other non-score data.
+- "category_columns": ["<col1>", ...] — ONLY columns with numeric scores
 
-Also when using pivot mapping, include a SEPARATE mapping for Evaluation Categories:
+Also include a SEPARATE mapping for Evaluation Categories with pivot:
 - "table_name": "Evaluation Categories"
 - "extract_from_pivot": true
 - "category_names": ["<same category column names>"]
@@ -470,81 +188,55 @@ ONLY map to these tables:
 {tables_section}
 
 If this segment contains level or category data, include mappings with
-"extract_unique_from" naming the source column to extract unique values from.
+"extract_unique_from" naming the source column.
 
-Example for standard mapping:
-{{"mappings": [
-  {{"table_name": "Players", "columns": {{"name": "Nome", "email": "Email"}}, "value_mappings": {{}}}},
-  {{"table_name": "Coach Levels", "extract_unique_from": "Nivel", "columns": {{"code": "Nivel", "label": "Nivel"}}, "value_mappings": {{}}}}
-]}}
+Example standard: {{"mappings": [{{"table_name": "Players", "columns": {{"name": "Nome"}}, "value_mappings": {{}}}}]}}
+Example pivot: {{"mappings": [{{"table_name": "Evaluations", "pivot": true, "player_column": "Aluno", "date_column": null, "category_columns": ["Tecnica", "Tatica"]}}]}}"""
 
-Example for pivot evaluation sheet:
-{{"mappings": [
-  {{"table_name": "Evaluations", "pivot": true, "player_column": "Aluno", "date_column": null, "category_columns": ["Tecnica", "Tatica", "Fisico", "Mental"]}},
-  {{"table_name": "Evaluation Categories", "extract_from_pivot": true, "category_names": ["Tecnica", "Tatica", "Fisico", "Mental"]}}
-]}}"""
-
-    content = _call_openai(
+    content = call_llm(
         messages=[{"role": "user", "content": prompt}],
-        max_tokens=1024, use_json_mode=True,
-        step_label="_infer_column_mapping",
+        max_tokens=1024, json_mode=True, label="column_map",
         segment=segment.label, rows=len(segment.data_rows),
     )
-    result = json.loads(content)
-    _log_timing("_infer_column_mapping.total", total_start,
-                segment=segment.label,
-                tables=len(result.get("mappings", [])))
+    result = parse_json(content, f"column_map({segment.label})")
+    log_timing("column_map", t, segment=segment.label, tables=len(result.get("mappings", [])))
     return result
 
 
-def _apply_column_mapping(rows: list[dict], mapping: dict) -> tuple[str, list[dict]]:
-    """Apply a single mapping dict to rows. Returns (table_name, processed_rows)."""
+def _apply_standard_mapping(rows: list[dict], mapping: dict) -> tuple[str, list[dict]]:
     table_name: str = mapping.get("table_name", "")
     columns: dict = mapping.get("columns", {})
     value_mappings: dict = mapping.get("value_mappings", {})
 
-    extract_col = mapping.get("extract_unique_from")
-    extract_pivot = mapping.get("extract_from_pivot")
+    if mapping.get("extract_from_pivot"):
+        return table_name, [
+            {"name": str(n).strip(), "scale_min": 0, "scale_max": 10}
+            for n in mapping.get("category_names", [])
+            if str(n).strip() and not is_numeric(str(n)) and len(str(n).strip()) >= 2
+        ]
 
-    # Handle "extract_from_pivot" for Evaluation Categories from pivot sheets
-    if extract_pivot:
-        cat_names = mapping.get("category_names", [])
-        processed = []
-        for name in cat_names:
-            name_str = str(name).strip()
-            if name_str and not _is_numeric(name_str) and len(name_str) >= 2:
-                processed.append({
-                    "name": name_str,
-                    "scale_min": 0,
-                    "scale_max": 10,
-                })
-        return table_name, processed
-
-    if extract_col:
-        seen_values: set[str] = set()
-        processed = []
+    if extract_col := mapping.get("extract_unique_from"):
+        seen: set[str] = set()
+        out = []
         for row in rows:
             val = row.get(extract_col)
             if val is not None:
-                val_str = str(val).strip()
-                if val_str and val_str not in seen_values:
-                    seen_values.add(val_str)
-                    record: dict = {}
-                    for field, source_col in columns.items():
-                        if source_col:
-                            record[field] = val_str
+                vs = str(val).strip()
+                if vs and vs not in seen:
+                    seen.add(vs)
+                    rec = {f: vs for f, sc in columns.items() if sc}
                     if table_name == "Coach Levels":
-                        record.setdefault("display_order", len(processed) + 1)
-                    processed.append(record)
-        return table_name, processed
+                        rec.setdefault("display_order", len(out) + 1)
+                    out.append(rec)
+        return table_name, out
 
-    processed = []
+    out = []
     for row in rows:
-        record: dict = {}
-        for field, source_col in columns.items():
-            if not source_col:
+        rec: dict = {}
+        for field, src in columns.items():
+            if not src:
                 continue
-            val = row.get(source_col)
+            val = row.get(src)
             if hasattr(val, "strftime"):
                 val = val.strftime("%Y-%m-%d")
             elif hasattr(val, "isoformat"):
@@ -553,914 +245,663 @@ def _apply_column_mapping(rows: list[dict], mapping: dict) -> tuple[str, list[di
                 val = str(val)
             if field in value_mappings and val is not None:
                 val = value_mappings[field].get(str(val), val)
-            record[field] = val
-        processed.append(record)
+            rec[field] = val
+        out.append(rec)
+    return table_name, out
 
-    return table_name, processed
+
+def _apply_pivot_mapping(rows: list[dict], mapping: dict) -> tuple[str, list[dict]]:
+    player_col = mapping.get("player_column", "")
+    date_col = mapping.get("date_column")
+    cat_cols = mapping.get("category_columns", [])
+    if not player_col or not cat_cols:
+        return mapping.get("table_name", "Evaluations"), []
+
+    out = []
+    for row in rows:
+        player = row.get(player_col)
+        if is_empty(player):
+            continue
+        name = str(player).strip()
+        date_val = normalize_date(row.get(date_col)) if date_col else None
+        for cc in cat_cols:
+            score = row.get(cc)
+            if is_empty(score) or not is_numeric(score):
+                continue
+            out.append({"player_name": name, "date": date_val, "category_name": str(cc).strip(), "score": float(score)})
+    return mapping.get("table_name", "Evaluations"), out
 
 
-def _process_segment(
-    segment: TableSegment,
-    requested_tables: set[str],
-) -> dict[str, list[dict]]:
-    """Map a segment via LLM then apply locally.
+def _process_segment(segment: TableSegment, active_tables: set[str]) -> dict[str, list[dict]]:
+    t = time.perf_counter()
+    try:
+        resp = _infer_column_mapping(segment, active_tables)
+    except ValueError:
+        logger.exception("[AI] Column mapping failed: '%s'", segment.label)
+        return {}
 
-    Special handling: if the LLM identifies this as a pivot-style evaluation
-    sheet (player rows x category columns with scores in cells), it returns
-    a "pivot" mapping that we unpivot locally.
-    """
-    total_start = time.perf_counter()
-    mapping_response = _infer_column_mapping(segment, requested_tables)
-    mappings = mapping_response.get("mappings", [])
-    if not mappings and "table_name" in mapping_response:
-        mappings = [mapping_response]
+    mappings = resp.get("mappings", [])
+    if not mappings and "table_name" in resp:
+        mappings = [resp]
 
     result: dict[str, list[dict]] = {}
-    for mapping in mappings:
-        # Handle pivot-style evaluation mapping
-        if mapping.get("pivot"):
-            tbl_name, processed = _apply_pivot_mapping(segment.data_rows, mapping)
-        else:
-            tbl_name, processed = _apply_column_mapping(segment.data_rows, mapping)
-        if tbl_name and processed:
-            result.setdefault(tbl_name, []).extend(processed)
+    for m in mappings:
+        tbl, rows = (_apply_pivot_mapping(segment.data_rows, m) if m.get("pivot")
+                     else _apply_standard_mapping(segment.data_rows, m))
+        if tbl and rows:
+            result.setdefault(tbl, []).extend(rows)
 
-    _log_timing("_process_segment.total", total_start,
-                segment=segment.label, rows=len(segment.data_rows),
-                tables=len(result),
-                records=sum(len(v) for v in result.values()))
+    log_timing("process_segment", t, segment=segment.label, records=sum(len(v) for v in result.values()))
     return result
 
 
-def _apply_pivot_mapping(
-    rows: list[dict],
-    mapping: dict,
-) -> tuple[str, list[dict]]:
-    """Unpivot a player-x-category evaluation sheet.
-
-    The mapping should contain:
-        - table_name: "Evaluations"
-        - pivot: true
-        - player_column: name of the column containing player names
-        - date_column: name of the column containing dates (or null)
-        - category_columns: list of column names that are evaluation categories
-    """
-    table_name = mapping.get("table_name", "Evaluations")
-    player_col = mapping.get("player_column", "")
-    date_col = mapping.get("date_column")
-    category_cols = mapping.get("category_columns", [])
-
-    if not player_col or not category_cols:
-        return table_name, []
-
-    processed = []
-    for row in rows:
-        player = row.get(player_col)
-        if _is_empty(player):
-            continue
-        player_name = str(player).strip()
-
-        date_val = None
-        if date_col:
-            d = row.get(date_col)
-            if not _is_empty(d):
-                if hasattr(d, "strftime"):
-                    date_val = d.strftime("%Y-%m-%d")
-                else:
-                    date_str = str(d).strip()
-                    m = re.match(r"(\d{4}-\d{2}-\d{2})", date_str)
-                    date_val = m.group(1) if m else date_str
-
-        for cat_col in category_cols:
-            score = row.get(cat_col)
-            if _is_empty(score) or not _is_numeric(score):
-                continue
-            processed.append({
-                "player_name": player_name,
-                "date": date_val,
-                "category_name": str(cat_col).strip(),
-                "score": float(score),
-            })
-
-    return table_name, processed
-
-
 # ---------------------------------------------------------------------------
-# Step 5 -- Ordered extraction & business validation
+# Step 5 — Validators
 # ---------------------------------------------------------------------------
 
-def _map_coach_levels(
-    raw_levels: list[dict],
-    raw_players: list[dict],
-    existing_levels: list[dict],
-) -> tuple[list[dict], dict[str, str]]:
-    """Map raw Excel level values to coach's existing DB levels via LLM.
 
-    Collects level values from both the raw Coach Levels table AND the
-    level_code field in raw Players, since those are the actual values
-    that need mapping.
-
-    existing_levels: [{code, label, display_order}, ...] from coach_service.
-
-    Returns:
-        - mapped_levels: the existing DB levels that got matched (unchanged)
-        - level_mapping: dict mapping raw Excel level string -> DB level code
-          Only contains entries that map to a real DB level.
-    """
-    total_start = time.perf_counter()
-
-    # Collect ALL unique raw level values from multiple sources
+def _map_coach_levels(raw_levels, raw_players, existing_levels):
+    t = time.perf_counter()
     raw_values: set[str] = set()
     for r in raw_levels:
-        code = r.get("code")
-        if not _is_empty(code):
-            raw_values.add(str(code).strip())
-        label = r.get("label")
-        if not _is_empty(label):
-            raw_values.add(str(label).strip())
+        for f in ("code", "label"):
+            v = r.get(f)
+            if not is_empty(v):
+                raw_values.add(str(v).strip())
     for p in raw_players:
         lc = p.get("level_code")
-        if not _is_empty(lc):
+        if not is_empty(lc):
             raw_values.add(str(lc).strip())
 
-    if not raw_values:
-        _log_timing("_map_coach_levels", total_start, status="no_raw_values")
+    if not raw_values or not existing_levels:
+        log_timing("map_levels", t, status="empty")
         return [], {}
 
-    if not existing_levels:
-        # No existing levels in DB — cannot map, return empty
-        # (we don't create new levels, we only map to existing ones)
-        _logger.warning("[AI] No existing coach levels in DB — cannot map %d raw values", len(raw_values))
-        _log_timing("_map_coach_levels", total_start, status="no_existing", raw=len(raw_values))
-        return [], {}
-
-    existing_info = [
-        {"code": l.get("code"), "label": l.get("label")}
-        for l in existing_levels
-    ]
-    existing_code_set = {l.get("code") for l in existing_levels}
+    existing_info = [{"code": l.get("code"), "label": l.get("label")} for l in existing_levels]
+    existing_codes = {l.get("code") for l in existing_levels}
 
     prompt = f"""You are a data import assistant for a padel coaching app.
 
-I need to map level/grade/tier values found in an Excel file to the coach's
-EXISTING levels in the database. The Excel values may be in any language and
-may be abbreviations, full names, or codes.
+Map level values from Excel to existing DB levels.
 
-Excel level values found: {json.dumps(sorted(raw_values))}
-
-Coach's existing levels in the database (these are the ONLY valid targets):
-{json.dumps(existing_info, indent=2)}
+Excel values: {json.dumps(sorted(raw_values))}
+DB levels: {json.dumps(existing_info, indent=2)}
 
 RULES:
-- Each Excel value must map to EXACTLY ONE existing DB level code, or null.
-- Map by meaning/similarity, not exact string match. E.g. "Iniciacao" -> "INI",
-  "Avancado" -> "ADV", "Intermediate" -> "INT", etc.
-- If an Excel value clearly doesn't correspond to any existing level, map it to null.
-- Multiple Excel values CAN map to the same DB level code.
-- You MUST only use level codes from the existing DB list above.
+- Map by meaning/similarity (e.g. "Iniciacao" -> "INI").
+- Map to null if no match. Multiple values CAN map to the same code.
+- ONLY use codes from the DB list.
 
-Return a JSON object:
-{{"mapping": {{"<excel_value>": "<db_level_code or null>"}}}}"""
+Return: {{"mapping": {{"<excel_value>": "<db_code or null>"}}}}"""
 
-    content = _call_openai(
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=1024, use_json_mode=True,
-        step_label="_map_coach_levels",
-    )
-    result = json.loads(content)
-    raw_mapping: dict[str, str | None] = result.get("mapping", {})
-
-    # Strictly filter: only keep mappings to actual existing DB codes
-    level_mapping: dict[str, str] = {}
-    for raw_val, db_code in raw_mapping.items():
-        if db_code and db_code in existing_code_set:
-            level_mapping[raw_val] = db_code
-
-    # Build the output levels list: only existing levels that got matched
-    matched_codes = set(level_mapping.values())
-    mapped_levels = [l for l in existing_levels if l.get("code") in matched_codes]
-
-    _log_timing("_map_coach_levels", total_start,
-                raw=len(raw_values), existing=len(existing_info),
-                mapped=len(level_mapping), matched_levels=len(mapped_levels))
-    return mapped_levels, level_mapping
+    content = call_llm(messages=[{"role": "user", "content": prompt}], max_tokens=1024, json_mode=True, label="map_levels")
+    raw_map = parse_json(content, "map_levels").get("mapping", {})
+    level_map = {k: v for k, v in raw_map.items() if v and v in existing_codes}
+    matched = [l for l in existing_levels if l.get("code") in set(level_map.values())]
+    log_timing("map_levels", t, raw=len(raw_values), mapped=len(level_map))
+    return matched, level_map
 
 
-def _validate_players(
-    rows: list[dict],
-    level_mapping: dict[str, str],
-) -> list[dict]:
-    """Validate and clean Player rows.
-    - Apply level_mapping to level_code
-    - Keep rows that have at least a name or email
-    """
+_VALID_SIDES = frozenset({"left", "right", "both", "esquerda", "direita", "ambos"})
+_SIDE_NORMALIZE = {
+    "left": "left", "esquerda": "left", "esq": "left", "l": "left",
+    "right": "right", "direita": "right", "dir": "right", "r": "right",
+    "both": "both", "ambos": "both", "ambas": "both",
+}
+
+
+def _validate_players(rows, level_mapping):
+    rows = deep_copy_rows(rows)
     clean = []
     for row in rows:
-        # Must have at least name or email
-        if _is_empty(row.get("name")) and _is_empty(row.get("email")):
+        if is_empty(row.get("name")) and is_empty(row.get("email")):
             continue
-        # Map level_code through the coach level mapping
-        raw_level = row.get("level_code")
-        if raw_level and level_mapping:
-            mapped = level_mapping.get(str(raw_level))
-            row["level_code"] = mapped  # may be None if no match
+        raw_lv = row.get("level_code")
+        if raw_lv and level_mapping:
+            row["level_code"] = level_mapping.get(str(raw_lv))
+        # Validate side: must be a known enum value, otherwise null it out.
+        raw_side = row.get("side")
+        if not is_empty(raw_side):
+            side_lower = str(raw_side).strip().lower()
+            row["side"] = _SIDE_NORMALIZE.get(side_lower)
+        else:
+            row["side"] = None
         clean.append(row)
-    return clean
+
+    if len(clean) < 2:
+        return clean
+
+    by_name: dict[str, dict] = {}
+    unnamed: list[dict] = []
+    for row in clean:
+        name = row.get("name")
+        if is_empty(name):
+            unnamed.append(row)
+            continue
+        key = normalize_text(str(name))
+        if key not in by_name:
+            by_name[key] = row
+        else:
+            for col, val in row.items():
+                if val is not None and (not isinstance(val, str) or val.strip()):
+                    if is_empty(by_name[key].get(col)):
+                        by_name[key][col] = val
+
+    result = list(by_name.values()) + unnamed
+    if len(result) < len(clean):
+        logger.info("[AI] Player dedup: %d -> %d", len(clean), len(result))
+    return result
 
 
-def _validate_eval_categories(
-    rows: list[dict],
-    raw_evaluations: list[dict],
-) -> list[dict]:
-    """Validate Evaluation Categories.
-    - Uses a quick LLM call to filter col_N / numeric / garbage names
-    - Computes scale_min and scale_max from actual scores in raw_evaluations
-    """
-    # Collect candidate names
-    candidates: list[str] = []
+def _validate_eval_categories(rows, raw_evaluations):
+    rows = deep_copy_rows(rows)
+    candidates = []
     for row in rows:
         name = row.get("name")
-        if _is_empty(name):
+        if is_empty(name):
             continue
-        name_str = str(name).strip()
-        if _is_numeric(name_str) or len(name_str) < 2:
-            continue
-        if name_str not in candidates:
-            candidates.append(name_str)
+        ns = str(name).strip()
+        if not is_garbage_category(ns) and ns not in candidates:
+            candidates.append(ns)
 
     if not candidates:
         return []
 
-    # Quick LLM call to filter real category names
-    total_start = time.perf_counter()
-    prompt = f"""I have a list of candidate evaluation category names extracted from a padel coaching spreadsheet.
-Some are real categories (e.g. "Technique", "Tactics", "Physical", "Mental", "Serve", "Volley").
-Others are data errors like "col_7", "col_11", "None", random codes, or non-category text.
-
-Return a JSON object: {{"valid": ["name1", "name2", ...]}}
-containing ONLY the names that are real evaluation/skill categories.
-
-Candidates: {json.dumps(candidates)}"""
-
-    try:
-        content = _call_openai(
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=256, use_json_mode=True,
-            step_label="_validate_eval_categories",
-            count=len(candidates),
-        )
-        result = json.loads(content)
-        valid_names: set[str] = set(result.get("valid", []))
-        _log_timing("_validate_eval_categories.llm", total_start,
-                    candidates=len(candidates), valid=len(valid_names))
-    except Exception:
-        _logger.exception("[AI] eval category LLM validation failed, using heuristic")
-        # Fallback: filter out col_N patterns
-        valid_names = {
-            n for n in candidates
-            if not re.match(r"^col_\d+$", n, re.IGNORECASE)
-        }
-
-    if not valid_names:
-        return []
-
-    # Compute scale_min and scale_max from actual evaluation scores per category
     score_ranges: dict[str, tuple[float, float]] = {}
     for ev in raw_evaluations:
-        cat = ev.get("category_name")
-        score = ev.get("score")
-        if _is_empty(cat) or not _is_numeric(score):
+        cat, score = ev.get("category_name"), ev.get("score")
+        if is_empty(cat) or not is_numeric(score):
             continue
-        cat_str = str(cat).strip()
+        cn = normalize_text(str(cat))
         s = float(score)
-        if cat_str in score_ranges:
-            lo, hi = score_ranges[cat_str]
-            score_ranges[cat_str] = (min(lo, s), max(hi, s))
-        else:
-            score_ranges[cat_str] = (s, s)
+        lo, hi = score_ranges.get(cn, (s, s))
+        score_ranges[cn] = (min(lo, s), max(hi, s))
 
-    clean = []
-    for name in valid_names:
-        lo, hi = score_ranges.get(name, (0, 10))
-        clean.append({
-            "name": name,
-            "scale_min": lo,
-            "scale_max": hi,
-        })
-    return clean
+    return [
+        {"name": n, "scale_min": score_ranges.get(normalize_text(n), (0, 10))[0],
+         "scale_max": score_ranges.get(normalize_text(n), (0, 10))[1]}
+        for n in candidates
+    ]
 
 
-def _validate_classes(rows: list[dict]) -> list[dict]:
-    """Validate Classes.
-    - day (date) is REQUIRED and must be valid format
-    - start_time and end_time are REQUIRED and must be valid format
-    - title is auto-generated from date if missing
-    """
+_VALID_CLASS_TYPES = frozenset({"academy", "private"})
+_DEFAULT_START = "10:00"
+_DEFAULT_END = "11:30"
+_DEFAULT_DURATION_MINUTES = 90
+
+
+def _infer_end_time(start: str) -> str:
+    """Given a start time HH:MM, add 1h30 to get end time."""
+    try:
+        h, m = int(start[:2]), int(start[3:5])
+        total = h * 60 + m + _DEFAULT_DURATION_MINUTES
+        return f"{(total // 60) % 24:02d}:{total % 60:02d}"
+    except (ValueError, IndexError):
+        return _DEFAULT_END
+
+
+def _validate_classes(rows):
+    rows = deep_copy_rows(rows)
     clean = []
     for row in rows:
-        day = row.get("day")
-        start = row.get("start_time")
-        end = row.get("end_time")
-
-        # Date is required
-        if _is_empty(day):
+        day = normalize_date(row.get("day"))
+        if not day:
             continue
-        day_str = str(day).strip()
-        # Try to handle datetime objects
-        if hasattr(day, "strftime"):
-            day_str = day.strftime("%Y-%m-%d")
-        # Must match YYYY-MM-DD
-        if not _DATE_PATTERN.match(day_str):
-            # Try to extract date from datetime string like "2025-03-15 00:00:00"
-            match = re.match(r"(\d{4}-\d{2}-\d{2})", day_str)
-            if match:
-                day_str = match.group(1)
-            else:
-                continue
-        row["day"] = day_str
-
-        # Times are required
-        if _is_empty(start) or _is_empty(end):
+        start = normalize_time(row.get("start_time"))
+        end = normalize_time(row.get("end_time"))
+        # If only start_time, infer end as +1h30.
+        if start and not end:
+            end = _infer_end_time(start)
+        # If no times at all, use defaults.
+        if not start:
+            start = _DEFAULT_START
+            end = _DEFAULT_END
+        # Sanity: times must look like HH:MM, not dates that slipped through.
+        if len(start) > 5 or len(end) > 5:
             continue
-        start_str = str(start).strip()
-        end_str = str(end).strip()
-        # Handle time objects
-        if hasattr(start, "strftime"):
-            start_str = start.strftime("%H:%M")
-        if hasattr(end, "strftime"):
-            end_str = end.strftime("%H:%M")
-        # Extract HH:MM from longer strings
-        for time_str, field in [(start_str, "start_time"), (end_str, "end_time")]:
-            m = re.match(r"(\d{1,2}:\d{2})", time_str)
-            if m:
-                row[field] = m.group(1).zfill(5)  # ensure HH:MM
-            else:
-                row[field] = None
-
-        if not row.get("start_time") or not row.get("end_time"):
-            continue
-
-        # Auto-generate title if missing
-        if _is_empty(row.get("title")):
-            row["title"] = f"Class {day_str} {row['start_time']}-{row['end_time']}"
-
+        row["day"], row["start_time"], row["end_time"] = day, start, end
+        # Validate class type — always ensure a valid value.
+        raw_type = row.get("type")
+        if not is_empty(raw_type) and str(raw_type).strip().lower() in _VALID_CLASS_TYPES:
+            row["type"] = str(raw_type).strip().lower()
+        else:
+            row["type"] = "academy"
+        if is_empty(row.get("title")):
+            row["title"] = f"Class {day} {start}-{end}"
+        else:
+            row["title"] = str(row["title"]).strip()
         clean.append(row)
     return clean
 
 
-def _validate_presences(
-    rows: list[dict],
-    known_players: set[str],
-) -> tuple[list[dict], int]:
-    """Validate Presences.
-    - Must have player_name in known_players
-    - Must have status (present/absent)
-    - Must have date
-    Returns (clean_rows, dropped_count).
-    """
-    clean = []
-    dropped = 0
+def _validate_presences(rows, known_players):
+    rows = deep_copy_rows(rows)
+    clean, dropped = [], 0
     for row in rows:
         player = row.get("player_name")
-        if _is_empty(player) or str(player).strip().lower() not in known_players:
-            dropped += 1
-            continue
-        # Must have status
-        status = row.get("status")
-        if _is_empty(status):
-            dropped += 1
-            continue
-        status_lower = str(status).strip().lower()
-        if status_lower not in ("present", "absent"):
-            dropped += 1
-            continue
-        row["status"] = status_lower
-        # Must have date
-        date_val = row.get("date")
-        if _is_empty(date_val):
-            dropped += 1
-            continue
-        date_str = str(date_val).strip()
-        if hasattr(date_val, "strftime"):
-            date_str = date_val.strftime("%Y-%m-%d")
-        match = re.match(r"(\d{4}-\d{2}-\d{2})", date_str)
-        if not match:
-            dropped += 1
-            continue
-        row["date"] = match.group(1)
-        # Normalise justification if present
-        just = row.get("justification")
-        if not _is_empty(just):
-            just_lower = str(just).strip().lower()
-            if just_lower in ("justified", "unjustified"):
-                row["justification"] = just_lower
+        if is_empty(player) or str(player).strip().lower() not in known_players:
+            dropped += 1; continue
+        raw_st = row.get("status")
+        if is_empty(raw_st):
+            dropped += 1; continue
+        status, just = normalize_status(str(raw_st))
+        if status is None:
+            dropped += 1; continue
+        row["status"] = status
+        existing_just = row.get("justification")
+        if just and is_empty(existing_just):
+            row["justification"] = just
+        elif not is_empty(existing_just):
+            jl = str(existing_just).strip().lower()
+            if jl in ("justified", "unjustified", "justificada", "injustificada"):
+                row["justification"] = "justified" if "just" in jl and "in" not in jl else "unjustified"
+        date = normalize_date(row.get("date"))
+        if not date:
+            dropped += 1; continue
+        row["date"] = date
+        for tf in ("start_time", "end_time"):
+            row[tf] = normalize_time(row.get(tf))
+        # Infer missing times: start only → end = +1h30. Neither → defaults.
+        if row["start_time"] and not row["end_time"]:
+            row["end_time"] = _infer_end_time(row["start_time"])
+        if not row["start_time"]:
+            row["start_time"] = _DEFAULT_START
+            row["end_time"] = _DEFAULT_END
         clean.append(row)
     return clean, dropped
 
 
-def _validate_evaluations(
-    rows: list[dict],
-    known_players: set[str],
-    known_categories: set[str],
-) -> tuple[list[dict], int]:
-    """Validate Evaluations.
-    - Must reference known player and known category
-    - Score must be numeric
-    """
-    clean = []
-    dropped = 0
+def _validate_evaluations(rows, known_players, known_categories):
+    rows = deep_copy_rows(rows)
+    cats = dict(known_categories)
+    clean, dropped = [], 0
     for row in rows:
         player = row.get("player_name")
-        if _is_empty(player) or str(player).strip().lower() not in known_players:
-            dropped += 1
-            continue
+        if is_empty(player) or str(player).strip().lower() not in known_players:
+            dropped += 1; continue
         cat = row.get("category_name")
-        if _is_empty(cat) or str(cat).strip().lower() not in known_categories:
-            dropped += 1
-            continue
+        if is_empty(cat):
+            dropped += 1; continue
+        cs = str(cat).strip()
+        if is_garbage_category(cs):
+            dropped += 1; continue
+        canonical = fuzzy_match_category(cs, cats)
+        if canonical:
+            row["category_name"] = canonical
+        else:
+            cats[normalize_text(cs)] = cs
         score = row.get("score")
-        if not _is_numeric(score):
-            dropped += 1
-            continue
+        if not is_numeric(score):
+            dropped += 1; continue
         row["score"] = float(score)
         clean.append(row)
-    return clean, dropped
+    return clean, dropped, cats
 
 
-def _validate_players_in_classes(
-    rows: list[dict],
-    known_players: set[str],
-    known_class_titles: set[str],
-) -> tuple[list[dict], int]:
-    """Validate Players in Classes.
-    - Must reference known player and known class title
-    """
-    clean = []
-    dropped = 0
+def _validate_players_in_classes(rows, known_players, known_titles):
+    rows = deep_copy_rows(rows)
+    clean, dropped = [], 0
     for row in rows:
-        player = row.get("player_name")
-        title = row.get("lesson_title")
-        if _is_empty(player) or str(player).strip().lower() not in known_players:
-            dropped += 1
-            continue
-        if _is_empty(title) or str(title).strip().lower() not in known_class_titles:
-            dropped += 1
-            continue
+        p = row.get("player_name")
+        t = row.get("lesson_title")
+        if is_empty(p) or str(p).strip().lower() not in known_players:
+            dropped += 1; continue
+        if is_empty(t) or str(t).strip().lower() not in known_titles:
+            dropped += 1; continue
         clean.append(row)
     return clean, dropped
 
 
-def _has_meaningful_text(val) -> bool:
-    """Check if a value contains actual meaningful text (not just symbols,
-    dashes, whitespace, or empty strings)."""
-    if _is_empty(val):
-        return False
-    text = str(val).strip()
-    # Strip common placeholder characters
-    cleaned = re.sub(r"[\s\-—–_.,;:!?/\\|*#@()[\]{}\"']+", "", text)
-    # Must have at least 2 alphanumeric characters remaining
-    return len(cleaned) >= 2
-
-
-def _clean_text_value(val: str) -> str:
-    """Clean up text values: strip leading bullet markers like '- ', '* ', '• '."""
-    text = val.strip()
-    # Strip leading list markers
-    text = re.sub(r"^[-*•·>]\s+", "", text)
-    # Strip trailing dangling separators
-    text = text.strip(" ;,")
-    return text
-
-
-def _validate_player_linked(
-    rows: list[dict],
-    known_players: set[str],
-    name_field: str = "player_name",
-    text_field: str | None = None,
-) -> tuple[list[dict], int]:
-    """Validate tables that need a known player reference (Strengths, Weaknesses).
-    If text_field is specified, also requires that field to contain meaningful text
-    (not empty, not just symbols/dashes), and cleans up common formatting issues."""
-    clean = []
-    dropped = 0
+def _validate_player_linked(rows, known_players, text_field=None):
+    rows = deep_copy_rows(rows)
+    clean, dropped = [], 0
     for row in rows:
-        player = row.get(name_field)
-        if _is_empty(player) or str(player).strip().lower() not in known_players:
-            dropped += 1
-            continue
-        # If a text field is specified, require meaningful content
+        p = row.get("player_name")
+        if is_empty(p) or str(p).strip().lower() not in known_players:
+            dropped += 1; continue
         if text_field:
-            if not _has_meaningful_text(row.get(text_field)):
-                dropped += 1
-                continue
-            # Clean up the text value
-            row[text_field] = _clean_text_value(str(row[text_field]))
+            if not has_meaningful_text(row.get(text_field)):
+                dropped += 1; continue
+            row[text_field] = clean_text_value(str(row[text_field]))
         clean.append(row)
     return clean, dropped
 
 
-# ---------------------------------------------------------------------------
-# Step 5b -- LLM name validation
-# ---------------------------------------------------------------------------
-
-def _validate_names_with_llm(
-    names: set[str],
-    context: str = "padel players",
-) -> set[str]:
-    """Ask LLM to filter a set of strings to only real person names.
-    Returns the subset that are actual names."""
+def _validate_names_with_llm(names):
     if not names:
         return set()
-
-    total_start = time.perf_counter()
-    names_list = sorted(names)
-
-    prompt = f"""I have a list of values that should be {context} names.
-Some may be data errors (numbers, codes, random text).
-
-Return a JSON object: {{"valid_names": ["name1", "name2", ...]}}
-containing ONLY the values that are real person names.
-
-Values to check:
-{json.dumps(names_list)}"""
-
-    content = _call_openai(
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=2048, use_json_mode=True,
-        step_label="_validate_names_with_llm",
-        count=len(names_list),
-    )
-    result = json.loads(content)
-    valid = set(result.get("valid_names", []))
-    _log_timing("_validate_names_with_llm", total_start,
-                input=len(names_list), valid=len(valid))
+    t = time.perf_counter()
+    prompt = f"""I have a list of values that should be padel player names.
+Some may be data errors. Return: {{"valid_names": ["name1", ...]}}
+Values: {json.dumps(sorted(names))}"""
+    content = call_llm(messages=[{"role": "user", "content": prompt}], max_tokens=2048, json_mode=True, label="validate_names")
+    valid = set(parse_json(content, "validate_names").get("valid_names", []))
+    log_timing("validate_names", t, input=len(names), valid=len(valid))
     return valid
 
 
-# ---------------------------------------------------------------------------
-# Step 6 -- Cross-table player discovery
-# ---------------------------------------------------------------------------
-
-def _discover_players_from_tables(
-    raw_analysis: dict[str, list[dict]],
-    known_player_names: set[str],
-) -> list[dict]:
-    """Find player names referenced in dependent tables (Presences, Evaluations,
-    Strengths, Weaknesses) that are NOT in the Players table. Ask LLM to verify
-    they're real names, then create minimal Player entries for them.
-
-    Returns new Player rows to add."""
-    total_start = time.perf_counter()
-
-    # Collect all player names from dependent tables
-    referenced_names: set[str] = set()
-    for table_name in ("Presences", "Evaluations", "Strengths", "Weaknesses",
-                       "Players in Classes"):
-        for row in raw_analysis.get(table_name, []):
-            name = row.get("player_name")
-            if not _is_empty(name):
-                referenced_names.add(str(name).strip())
-
-    # Find names not in known players
-    unknown_names = {
-        n for n in referenced_names
-        if n.lower() not in known_player_names
-    }
-
-    if not unknown_names:
-        _log_timing("_discover_players", total_start, unknown=0)
+def _discover_players(raw_analysis, known_names):
+    refs: set[str] = set()
+    for tbl in ("Presences", "Evaluations", "Strengths", "Weaknesses", "Players in Classes"):
+        for row in raw_analysis.get(tbl, []):
+            n = row.get("player_name")
+            if not is_empty(n):
+                refs.add(str(n).strip())
+    unknown = {n for n in refs if n.lower() not in known_names}
+    if not unknown:
         return []
+    valid = _validate_names_with_llm(unknown)
+    return [{"name": n, "email": None, "phone": None, "level_code": None, "side": None} for n in valid]
 
-    # Ask LLM to verify these are real names
-    valid_names = _validate_names_with_llm(unknown_names)
 
-    new_players = []
-    for name in valid_names:
-        new_players.append({
-            "name": name,
-            "email": None,
-            "phone": None,
-            "level_code": None,
-            "side": None,
-        })
+def _build_lesson_instances(presences, existing_classes, known_players):
+    t = time.perf_counter()
+    groups: dict[str, list[dict]] = defaultdict(list)
+    for p in presences:
+        d, s = p.get("date", ""), p.get("start_time", "")
+        groups[f"{d}_{s}" if s else d].append(p)
 
-    _log_timing("_discover_players", total_start,
-                unknown=len(unknown_names), valid=len(valid_names))
-    return new_players
+    existing_by_key = {}
+    for c in existing_classes:
+        day, start, title = c.get("day", ""), c.get("start_time", ""), c.get("title", "")
+        if day:
+            existing_by_key[f"{day}_{start}" if start else day] = title
+
+    mapping, unmatched = {}, []
+    for key in groups:
+        if key in existing_by_key:
+            mapping[key] = existing_by_key[key]
+        else:
+            unmatched.append(key)
+
+    if not unmatched:
+        return [], mapping
+
+    summaries = []
+    for key in unmatched:
+        pl = groups[key]
+        d = pl[0].get("date", "")
+        players = {str(p["player_name"]).strip() for p in pl if not is_empty(p.get("player_name"))}
+        dow = ""
+        try: dow = datetime.strptime(d, "%Y-%m-%d").strftime("%A")
+        except (ValueError, TypeError): pass
+        summaries.append({"key": key, "date": d, "day_of_week": dow,
+                         "start_time": pl[0].get("start_time"), "end_time": pl[0].get("end_time"),
+                         "player_count": len(players), "player_names": sorted(players)[:5]})
+
+    prompt = f"""You are a data import assistant for a padel coaching app.
+Generate lesson titles for {len(summaries)} groups.
+RULES: 1-2 players → "Private Lesson", 3-4 → "Small Group", 5+ → "Academy Class"
++ date (YYYY-MM-DD) + time if available (e.g. "09:00-10:00").
+Each title MUST be unique — always include the date.
+Example: "Academy Class 2025-03-15 09:00-10:00", "Private Lesson 2025-03-16"
+Groups: {json.dumps(summaries, indent=2)}
+Return: {{"lessons": [{{"key": "<key>", "title": "<title>", "type": "academy"|"private"}}]}}"""
+
+    try:
+        content = call_llm(messages=[{"role": "user", "content": prompt}], max_tokens=1024, json_mode=True, label="lesson_names")
+        llm_data = {ld["key"]: ld for ld in parse_json(content, "lesson_names").get("lessons", []) if ld.get("key")}
+    except Exception:
+        logger.exception("[AI] Lesson naming failed"); llm_data = {}
+
+    new_classes = []
+    for gs in summaries:
+        key = gs["key"]
+        llm = llm_data.get(key, {})
+        title = llm.get("title") or _fallback_title(gs)
+        # Safety: title MUST contain the date for uniqueness.
+        if gs["date"] not in title:
+            title = f"{title} {gs['date']}"
+        ltype = llm.get("type", "private" if gs["player_count"] <= 2 else "academy")
+        mapping[key] = title
+        gs_start = gs.get("start_time") or _DEFAULT_START
+        gs_end = gs.get("end_time") or (
+            _infer_end_time(gs_start) if gs.get("start_time") else _DEFAULT_END
+        )
+        new_classes.append({"title": title, "type": ltype, "day": gs["date"],
+                           "start_time": gs_start, "end_time": gs_end,
+                           "is_recurring": False, "max_players": None})
+
+    log_timing("build_lessons", t, matched=len(mapping) - len(unmatched), created=len(new_classes))
+    return new_classes, mapping
+
+
+def _fallback_title(gs):
+    pc = gs["player_count"]
+    date = gs.get("date", "")
+    start = gs.get("start_time")
+    end = gs.get("end_time")
+    # Build suffix: always include date, add times if available.
+    time_part = f" {start}-{end}" if start and end else (f" {start}" if start else "")
+    suffix = f"{date}{time_part}"
+    if pc <= 2: return f"Private Lesson {suffix}"
+    if pc <= 4: return f"Small Group {suffix}"
+    return f"Academy Class {suffix}"
 
 
 # ---------------------------------------------------------------------------
-# Step 7 -- Main orchestration
+# Pipeline
 # ---------------------------------------------------------------------------
+
+
+class ImportPipeline:
+    """Holds pipeline state explicitly. Each validation step is a method."""
+
+    def __init__(self, file_bytes: bytes, coach_id: int, active_tables: set[str]):
+        self.file_bytes = file_bytes
+        self.coach_id = coach_id
+        self.active_tables = active_tables
+        self.analysis: dict[str, list] = {}
+        self.drop_counts: dict[str, int] = {}
+        self.level_mapping: dict[str, str] = {}
+        self.known_players: set[str] = set()
+        self.known_classes: set[str] = set()
+        self.categories = CategoryRegistry()
+
+    def _drops(self, table: str, n: int):
+        if n: self.drop_counts[table] = self.drop_counts.get(table, 0) + n
+
+    def _rebuild_players(self, source=None):
+        src = source or self.analysis.get("Players", [])
+        self.known_players = {str(p["name"]).strip().lower() for p in src if not is_empty(p.get("name"))}
+
+    def _rebuild_classes(self):
+        self.known_classes = {str(c["title"]).strip().lower() for c in self.analysis.get("Classes", []) if not is_empty(c.get("title"))}
+
+    def parse(self):
+        return parse_excel(self.file_bytes)
+
+    def filter_sheets(self, sheets):
+        desc = ", ".join(sorted(self.active_tables | _AUTO_TABLES))
+        relevant = pick_relevant_sheets(sheets, desc)
+        return {k: v for k, v in sheets.items() if k in relevant} or sheets
+
+    def detect_segments(self, selected):
+        segs = []
+        for name, rows in selected.items():
+            segs.extend(detect_table_segments(name, rows))
+        return segs
+
+    def map_segments(self, segments):
+        raw: dict[str, list[dict]] = {}
+        with ThreadPoolExecutor(max_workers=min(len(segments), 4)) as pool:
+            futs = {pool.submit(_process_segment, s, self.active_tables): s for s in segments}
+            for f in as_completed(futs):
+                try: merge_table_rows(raw, f.result())
+                except Exception: logger.exception("[AI] Segment failed: '%s'", futs[f].label)
+        return raw
+
+    def validate_coach_levels(self, raw):
+        try:
+            from .coach_service import get_coach_levels
+            existing = get_coach_levels(self.coach_id)
+        except (ImportError, Exception) as e:
+            logger.warning("[AI] Could not fetch coach levels: %s", e); existing = []
+        levels, self.level_mapping = _map_coach_levels(raw.get("Coach Levels", []), raw.get("Players", []), existing)
+        if levels: self.analysis["Coach Levels"] = levels
+
+    def validate_players(self, raw):
+        if "Players" not in self.active_tables: return
+        clean = _validate_players(raw.get("Players", []), self.level_mapping)
+        self._rebuild_players(clean)
+        new = _discover_players(raw, self.known_players)
+        if new: clean = deduplicate_rows(clean, new)
+        self.analysis["Players"] = clean
+        self._rebuild_players()
+
+    def validate_eval_categories(self, raw):
+        if "Evaluation Categories" not in self.active_tables: return
+        raw_cats = raw.get("Evaluation Categories", [])
+        raw_evals = raw.get("Evaluations", [])
+        clean = _validate_eval_categories(raw_cats, raw_evals)
+        if clean: self.analysis["Evaluation Categories"] = clean
+        self._drops("Evaluation Categories", len(raw_cats) - len(clean))
+        self.categories.bulk_register(clean)
+        added = self.categories.discover_from_evaluations(raw_evals)
+        if added: logger.info("[AI] Discovered %d categories from raw evaluations", added)
+        self.analysis["Evaluation Categories"] = self.categories.rows
+
+    def validate_classes(self, raw):
+        if "Classes" not in self.active_tables: return
+        raw_cls = raw.get("Classes", [])
+        clean = _validate_classes(raw_cls)
+        if clean: self.analysis["Classes"] = clean
+        self._drops("Classes", len(raw_cls) - len(clean))
+        self._rebuild_classes()
+
+    def validate_players_in_classes(self, raw):
+        if "Players in Classes" not in self.active_tables: return
+        clean, dropped = _validate_players_in_classes(raw.get("Players in Classes", []), self.known_players, self.known_classes)
+        if clean: self.analysis["Players in Classes"] = clean
+        self._drops("Players in Classes", dropped)
+
+    def validate_presences(self, raw):
+        if "Presences" not in self.active_tables: return
+        clean, dropped = _validate_presences(raw.get("Presences", []), self.known_players)
+        self._drops("Presences", dropped)
+        if not clean: return
+
+        new_cls, mapping = _build_lesson_instances(clean, self.analysis.get("Classes", []), self.known_players)
+        if new_cls:
+            self.analysis["Classes"] = deduplicate_rows(self.analysis.get("Classes", []), new_cls)
+            self._rebuild_classes()
+        if mapping:
+            for p in clean:
+                d, s = p.get("date", ""), p.get("start_time", "")
+                key = f"{d}_{s}" if s else d
+                if key in mapping: p["lesson_title"] = mapping[key]
+        self.analysis["Presences"] = clean
+
+    def revalidate_players_in_classes(self, raw):
+        if "Players in Classes" not in self.active_tables: return
+        raw_pic = raw.get("Players in Classes", [])
+        if not raw_pic: return
+        self._rebuild_classes()
+        clean, dropped = _validate_players_in_classes(raw_pic, self.known_players, self.known_classes)
+        if clean: self.analysis["Players in Classes"] = clean
+        if dropped: self.drop_counts["Players in Classes"] = dropped
+
+    def validate_evaluations(self, raw):
+        if "Evaluations" not in self.active_tables: return
+        clean, dropped, updated = _validate_evaluations(raw.get("Evaluations", []), self.known_players, self.categories.known)
+        if clean: self.analysis["Evaluations"] = clean
+        self._drops("Evaluations", dropped)
+        self.categories.merge_discovered(updated)
+        self.categories.deduplicate()
+        if self.categories.rows: self.analysis["Evaluation Categories"] = self.categories.rows
+
+    def validate_strengths(self, raw):
+        if "Strengths" not in self.active_tables: return
+        clean, dropped = _validate_player_linked(raw.get("Strengths", []), self.known_players, text_field="strengths")
+        if clean: self.analysis["Strengths"] = clean
+        self._drops("Strengths", dropped)
+
+    def validate_weaknesses(self, raw):
+        if "Weaknesses" not in self.active_tables: return
+        clean, dropped = _validate_player_linked(raw.get("Weaknesses", []), self.known_players, text_field="weaknesses")
+        if clean: self.analysis["Weaknesses"] = clean
+        self._drops("Weaknesses", dropped)
+
+    def results(self) -> dict[str, list]:
+        return {k: v for k, v in self.analysis.items() if v}
+
+
+# ---------------------------------------------------------------------------
+# SSE entry point
+# ---------------------------------------------------------------------------
+
 
 def stream_import_analysis(
     file_bytes: bytes,
     coach_id: int,
     requested_tables: list[str] | None = None,
 ) -> Generator[str, None, None]:
-    """Main entry point. Orchestrates the full import pipeline.
+    def _ev(payload): return f"data: {json.dumps(payload)}\n\n"
 
-    Args:
-        file_bytes: Raw Excel file content.
-        coach_id: Coach ID for fetching existing levels from DB.
-        requested_tables: List of table names to import, or None for all.
-            Valid values: Players, Classes, Players in Classes, Presences,
-            Evaluations, Strengths, Weaknesses.
-            Coach Levels and Evaluation Categories are always auto-included.
-    """
-    def _event(payload: dict) -> str:
-        return f"data: {json.dumps(payload)}\n\n"
-
-    # Resolve requested tables
-    if requested_tables is None:
-        active_tables = set(ALL_IMPORTABLE_TABLES)
-    else:
-        active_tables = set(requested_tables) & set(ALL_IMPORTABLE_TABLES)
-    # Always include dependency tables
-    active_tables |= _AUTO_TABLES
+    active = (set(requested_tables) & set(ALL_IMPORTABLE_TABLES) if requested_tables
+              else set(ALL_IMPORTABLE_TABLES)) | _AUTO_TABLES
+    pipe = ImportPipeline(file_bytes, coach_id, active)
 
     try:
-        total_start = time.perf_counter()
-        yield _event({"type": "phase", "phase": "uploading"})
-        yield _event({"type": "thinking",
-                       "text": f"Importing: {', '.join(sorted(active_tables - _AUTO_TABLES))}"})
+        t0 = time.perf_counter()
+        yield _ev({"type": "phase", "phase": "uploading"})
+        yield _ev({"type": "thinking", "text": f"Importing: {', '.join(sorted(active - _AUTO_TABLES))}"})
 
-        # ---- Step 1: Parse ----
-        yield _event({"type": "thinking", "text": "Parsing Excel file..."})
-        parse_start = time.perf_counter()
-        sheets_data = parse_excel(file_bytes)
-        parse_ms = _log_timing("stream.parse", parse_start, sheets=len(sheets_data))
-        yield _event({"type": "thinking",
-                       "text": f"Parsed in {parse_ms:.0f}ms - {len(sheets_data)} sheet(s)."})
-        if not sheets_data:
-            yield _event({"type": "error", "message": "No usable sheets found."})
-            return
+        yield _ev({"type": "thinking", "text": "Parsing Excel..."})
+        t = time.perf_counter()
+        sheets = pipe.parse()
+        ms = log_timing("stream.parse", t, sheets=len(sheets))
+        yield _ev({"type": "thinking", "text": f"Parsed {len(sheets)} sheet(s) in {ms:.0f}ms."})
+        if not sheets:
+            yield _ev({"type": "error", "message": "No usable sheets found."}); return
+        yield _ev({"type": "progress", "value": 10})
 
-        yield _event({"type": "progress", "value": 10})
+        yield _ev({"type": "phase", "phase": "processing"})
+        t = time.perf_counter()
+        selected = pipe.filter_sheets(sheets)
+        log_timing("stream.filter", t, selected=len(selected))
+        yield _ev({"type": "progress", "value": 18})
 
-        # ---- Step 2: Relevance filter ----
-        yield _event({"type": "phase", "phase": "processing"})
-        yield _event({"type": "thinking", "text": "Selecting relevant sheets..."})
-        rel_start = time.perf_counter()
-        relevant_names = pick_relevant_sheets(sheets_data, active_tables)
-        rel_ms = _log_timing("stream.relevance", rel_start, selected=len(relevant_names))
-        selected = {k: v for k, v in sheets_data.items() if k in relevant_names} or sheets_data
-        yield _event({"type": "thinking",
-                       "text": f"Selected {len(selected)} sheet(s) in {rel_ms:.0f}ms."})
-        yield _event({"type": "progress", "value": 18})
+        t = time.perf_counter()
+        segments = pipe.detect_segments(selected)
+        log_timing("stream.segments", t, segments=len(segments))
+        yield _ev({"type": "thinking", "text": f"{len(segments)} segment(s) found."})
+        yield _ev({"type": "progress", "value": 22})
 
-        # ---- Step 3: Segment detection ----
-        yield _event({"type": "thinking", "text": "Detecting table structures..."})
-        seg_start = time.perf_counter()
-        all_segments: list[TableSegment] = []
-        for name, raw_rows in selected.items():
-            segs = detect_table_segments(name, raw_rows)
-            all_segments.extend(segs)
-            if len(segs) > 1:
-                yield _event({"type": "thinking",
-                               "text": f"Sheet '{name}': {len(segs)} separate tables detected."})
-        seg_ms = _log_timing("stream.segmentation", seg_start, segments=len(all_segments))
-        yield _event({"type": "thinking",
-                       "text": f"{len(all_segments)} segment(s) found in {seg_ms:.0f}ms."})
-        yield _event({"type": "progress", "value": 22})
+        yield _ev({"type": "phase", "phase": "analyzing"})
+        yield _ev({"type": "thinking", "text": f"Mapping {len(segments)} segment(s) via AI..."})
+        t = time.perf_counter()
+        raw = pipe.map_segments(segments)
+        ms = log_timing("stream.mapping", t, segments=len(segments))
+        yield _ev({"type": "thinking", "text": f"Mapped in {ms:.0f}ms. Raw: {', '.join(f'{k}({len(v)})' for k,v in raw.items())}"})
+        yield _ev({"type": "progress", "value": 45})
 
-        # ---- Step 4: Column mapping (parallel) ----
-        yield _event({"type": "phase", "phase": "analyzing"})
-        yield _event({"type": "thinking",
-                       "text": f"Mapping {len(all_segments)} segment(s) via AI..."})
+        yield _ev({"type": "phase", "phase": "validating"})
+        pipe.validate_coach_levels(raw);           yield _ev({"type": "progress", "value": 50})
+        pipe.validate_players(raw);                yield _ev({"type": "progress", "value": 55})
+        pipe.validate_eval_categories(raw)
+        pipe.validate_classes(raw);                yield _ev({"type": "progress", "value": 65})
+        pipe.validate_players_in_classes(raw)
+        pipe.validate_presences(raw);              yield _ev({"type": "progress", "value": 75})
+        pipe.revalidate_players_in_classes(raw)
+        pipe.validate_evaluations(raw)
+        pipe.validate_strengths(raw)
+        pipe.validate_weaknesses(raw);             yield _ev({"type": "progress", "value": 85})
 
-        from concurrent.futures import ThreadPoolExecutor, as_completed
+        final = pipe.results()
+        yield _ev({"type": "progress", "value": 90})
+        total_rec = sum(len(v) for v in final.values())
+        total_drop = sum(pipe.drop_counts.values())
+        yield _ev({"type": "thinking", "text": f"Done — {total_rec} records, {total_drop} dropped."})
+        if pipe.drop_counts:
+            yield _ev({"type": "thinking", "text": f"Drops: {', '.join(f'{k}: {v}' for k,v in pipe.drop_counts.items())}"})
+        yield _ev({"type": "tables", "tables": final})
+        yield _ev({"type": "done"})
+        log_timing("stream.total", t0, tables=len(final), records=total_rec, dropped=total_drop)
 
-        raw_analysis: dict[str, list[dict]] = {}
-        map_start = time.perf_counter()
-        with ThreadPoolExecutor(max_workers=min(len(all_segments), 4)) as pool:
-            futures = {
-                pool.submit(_process_segment, seg, active_tables): seg
-                for seg in all_segments
-            }
-            done = 0
-            for future in as_completed(futures):
-                seg = futures[future]
-                done += 1
-                try:
-                    seg_result = future.result()
-                    _merge_into(raw_analysis, seg_result)
-                    records = sum(len(v) for v in seg_result.values())
-                    yield _event({"type": "thinking",
-                                   "text": f"[{done}/{len(all_segments)}] "
-                                           f"'{seg.label}' -> {records} records"})
-                except Exception as exc:
-                    _logger.exception("[AI] Failed to map segment '%s'", seg.label)
-                    yield _event({"type": "thinking",
-                                   "text": f"Could not map '{seg.label}': {exc}"})
-
-        map_ms = _log_timing("stream.mapping", map_start, segments=len(all_segments))
-        yield _event({"type": "thinking",
-                       "text": f"Column mapping done in {map_ms:.0f}ms. "
-                               f"Raw tables: {', '.join(f'{k}({len(v)})' for k, v in raw_analysis.items())}"})
-        yield _event({"type": "progress", "value": 45})
-
-        # ---- Step 5: Ordered validation chain ----
-        yield _event({"type": "phase", "phase": "validating"})
-        analysis: dict[str, list] = {}
-        drop_counts: dict[str, int] = {}
-
-        # 5a. Coach Levels
-        yield _event({"type": "thinking", "text": "Mapping coach levels..."})
-        try:
-            from .coach_service import get_coach_levels
-            existing_levels = get_coach_levels(coach_id)
-        except (ImportError, Exception) as exc:
-            _logger.warning("[AI] Could not fetch coach levels: %s", exc)
-            existing_levels = []
-
-        raw_levels = raw_analysis.get("Coach Levels", [])
-        raw_players = raw_analysis.get("Players", [])
-        mapped_levels, level_mapping = _map_coach_levels(raw_levels, raw_players, existing_levels)
-        if mapped_levels:
-            analysis["Coach Levels"] = mapped_levels
-        yield _event({"type": "thinking",
-                       "text": f"Coach Levels: {len(raw_levels)} found, "
-                               f"{len(mapped_levels)} mapped, "
-                               f"mapping: {level_mapping}"})
-        yield _event({"type": "progress", "value": 50})
-
-        # 5b. Players
-        if "Players" in active_tables:
-            yield _event({"type": "thinking", "text": "Validating players..."})
-            raw_players = raw_analysis.get("Players", [])
-            clean_players = _validate_players(raw_players, level_mapping)
-
-            # Discover players referenced in other tables but missing from Players
-            new_players = _discover_players_from_tables(raw_analysis, {
-                str(p.get("name", "")).strip().lower() for p in clean_players
-                if not _is_empty(p.get("name"))
-            })
-            if new_players:
-                yield _event({"type": "thinking",
-                               "text": f"Discovered {len(new_players)} additional player(s) "
-                                       f"from dependent tables."})
-                clean_players = _deduplicate_rows(clean_players, new_players)
-
-            analysis["Players"] = clean_players
-            yield _event({"type": "thinking",
-                           "text": f"Players: {len(raw_players)} raw -> {len(clean_players)} valid"})
-
-        # Build known players set for downstream validation
-        known_player_names: set[str] = set()
-        for p in analysis.get("Players", []):
-            name = p.get("name")
-            if not _is_empty(name):
-                known_player_names.add(str(name).strip().lower())
-
-        yield _event({"type": "progress", "value": 55})
-
-        # 5c. Evaluation Categories
-        if "Evaluation Categories" in active_tables:
-            raw_cats = raw_analysis.get("Evaluation Categories", [])
-            raw_evals_for_scale = raw_analysis.get("Evaluations", [])
-            clean_cats = _validate_eval_categories(raw_cats, raw_evals_for_scale)
-            if clean_cats:
-                analysis["Evaluation Categories"] = clean_cats
-            dropped = len(raw_cats) - len(clean_cats)
-            if dropped:
-                drop_counts["Evaluation Categories"] = dropped
-            yield _event({"type": "thinking",
-                           "text": f"Eval Categories: {len(raw_cats)} raw -> {len(clean_cats)} valid"
-                                   f"{f' ({dropped} dropped: numeric/invalid names)' if dropped else ''}"})
-
-        known_categories: set[str] = {
-            str(c.get("name", "")).strip().lower()
-            for c in analysis.get("Evaluation Categories", [])
-            if not _is_empty(c.get("name"))
-        }
-
-        # 5d. Classes
-        if "Classes" in active_tables:
-            raw_classes = raw_analysis.get("Classes", [])
-            clean_classes = _validate_classes(raw_classes)
-            if clean_classes:
-                analysis["Classes"] = clean_classes
-            dropped = len(raw_classes) - len(clean_classes)
-            if dropped:
-                drop_counts["Classes"] = dropped
-            yield _event({"type": "thinking",
-                           "text": f"Classes: {len(raw_classes)} raw -> {len(clean_classes)} valid"
-                                   f"{f' ({dropped} dropped: missing date/times)' if dropped else ''}"})
-
-        known_class_titles: set[str] = {
-            str(c.get("title", "")).strip().lower()
-            for c in analysis.get("Classes", [])
-            if not _is_empty(c.get("title"))
-        }
-
-        yield _event({"type": "progress", "value": 65})
-
-        # 5e. Players in Classes
-        if "Players in Classes" in active_tables:
-            raw_pic = raw_analysis.get("Players in Classes", [])
-            clean_pic, dropped = _validate_players_in_classes(
-                raw_pic, known_player_names, known_class_titles)
-            if clean_pic:
-                analysis["Players in Classes"] = clean_pic
-            if dropped:
-                drop_counts["Players in Classes"] = dropped
-            yield _event({"type": "thinking",
-                           "text": f"Players in Classes: {len(raw_pic)} raw -> {len(clean_pic)} valid"
-                                   f"{f' ({dropped} dropped)' if dropped else ''}"})
-
-        # 5f. Presences
-        if "Presences" in active_tables:
-            raw_pres = raw_analysis.get("Presences", [])
-            clean_pres, dropped = _validate_presences(raw_pres, known_player_names)
-            if clean_pres:
-                analysis["Presences"] = clean_pres
-            if dropped:
-                drop_counts["Presences"] = dropped
-            yield _event({"type": "thinking",
-                           "text": f"Presences: {len(raw_pres)} raw -> {len(clean_pres)} valid"
-                                   f"{f' ({dropped} dropped: missing player/status/date)' if dropped else ''}"})
-
-        yield _event({"type": "progress", "value": 75})
-
-        # 5g. Evaluations
-        if "Evaluations" in active_tables:
-            raw_evals = raw_analysis.get("Evaluations", [])
-            clean_evals, dropped = _validate_evaluations(
-                raw_evals, known_player_names, known_categories)
-            if clean_evals:
-                analysis["Evaluations"] = clean_evals
-            if dropped:
-                drop_counts["Evaluations"] = dropped
-            yield _event({"type": "thinking",
-                           "text": f"Evaluations: {len(raw_evals)} raw -> {len(clean_evals)} valid"
-                                   f"{f' ({dropped} dropped)' if dropped else ''}"})
-
-        # 5h. Strengths
-        if "Strengths" in active_tables:
-            raw_str = raw_analysis.get("Strengths", [])
-            clean_str, dropped = _validate_player_linked(
-                raw_str, known_player_names, text_field="strengths")
-            if clean_str:
-                analysis["Strengths"] = clean_str
-            if dropped:
-                drop_counts["Strengths"] = dropped
-            yield _event({"type": "thinking",
-                           "text": f"Strengths: {len(raw_str)} raw -> {len(clean_str)} valid"
-                                   f"{f' ({dropped} dropped)' if dropped else ''}"})
-
-        # 5i. Weaknesses
-        if "Weaknesses" in active_tables:
-            raw_weak = raw_analysis.get("Weaknesses", [])
-            clean_weak, dropped = _validate_player_linked(
-                raw_weak, known_player_names, text_field="weaknesses")
-            if clean_weak:
-                analysis["Weaknesses"] = clean_weak
-            if dropped:
-                drop_counts["Weaknesses"] = dropped
-            yield _event({"type": "thinking",
-                           "text": f"Weaknesses: {len(raw_weak)} raw -> {len(clean_weak)} valid"
-                                   f"{f' ({dropped} dropped)' if dropped else ''}"})
-
-        yield _event({"type": "progress", "value": 85})
-
-        # ---- Strip tables the user didn't request ----
-        # (Coach Levels and Eval Categories were auto-included as dependencies
-        # but only keep them in output if they have data)
-        final_analysis = {
-            k: v for k, v in analysis.items()
-            if v  # non-empty
-        }
-
-        yield _event({"type": "progress", "value": 90})
-
-        # ---- Summary ----
-        total_records = sum(len(v) for v in final_analysis.values())
-        total_dropped = sum(drop_counts.values())
-
-        summary_parts = []
-        for table_name, rows in final_analysis.items():
-            part = f"{table_name}: {len(rows)}"
-            if table_name in drop_counts:
-                part += f" ({drop_counts[table_name]} dropped)"
-            summary_parts.append(part)
-
-        yield _event({"type": "thinking",
-                       "text": f"Done - {total_records} records across {len(final_analysis)} tables"
-                               f"{f', {total_dropped} rows dropped total' if total_dropped else ''}."})
-
-        if drop_counts:
-            yield _event({"type": "thinking",
-                           "text": f"Dropped row summary: "
-                                   + ", ".join(f"{k}: {v}" for k, v in drop_counts.items())})
-
-        yield _event({"type": "tables", "tables": final_analysis})
-        yield _event({"type": "done"})
-        _log_timing("stream.total", total_start,
-                    tables=len(final_analysis), records=total_records,
-                    dropped=total_dropped)
-
+    except ValueError as exc:
+        logger.error("[AI] Validation error: %s", exc)
+        yield _ev({"type": "error", "message": str(exc)})
     except Exception as exc:
-        _logger.exception("[AI] stream_import_analysis failed")
-        _log_timing("stream.total", total_start, status="failed")
-        yield _event({"type": "error", "message": str(exc)})
+        logger.exception("[AI] stream_import_analysis failed")
+        yield _ev({"type": "error", "message": str(exc)})

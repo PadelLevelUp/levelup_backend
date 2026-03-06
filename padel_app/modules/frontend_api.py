@@ -48,6 +48,8 @@ from padel_app.services.player_service import (
     add_player_service,
     edit_player_service,
     remove_player_service,
+    get_coach_players_list,
+    get_coach_players_paginated,
 )
 from padel_app.services.user_service import (
     create_user_service,
@@ -289,15 +291,23 @@ def users():
 @jwt_required()
 def coach_players():
     coach = current_coach()
+    coach = Coach.query.get_or_404(coach.id)
+    return jsonify(get_coach_players_list(coach))
 
-    if coach:
-        coach = Coach.query.get_or_404(coach.id)
-        players = coach.players
 
-    return jsonify([
-        p.coach_player_info(coach.id)
-        for p in players
-    ])
+@bp.get("/coach_players_paginated")
+@jwt_required()
+def coach_players_paginated():
+    coach = current_coach()
+    coach = Coach.query.get_or_404(coach.id)
+
+    page = request.args.get("page", default=1, type=int)
+    per_page = request.args.get("per_page", default=25, type=int)
+    page = max(1, page or 1)
+    per_page = max(1, min(100, per_page or 25))
+
+    result = get_coach_players_paginated(coach, page=page, per_page=per_page)
+    return jsonify(result)
 
 
 @bp.get("/coach_levels")

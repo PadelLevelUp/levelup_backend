@@ -622,8 +622,12 @@ def bulk_create_coach_notes(rows, coach, note_type):
     for rel in coach.players_relations:
         coach_players_by_name.setdefault(rel.player.user.name, rel)
 
-    # The column name in the AI row (e.g. "strengths" / "weaknesses").
-    col = note_type + "s"
+    # The column name in the AI row.
+    col_by_type = {
+        "strength": "strengths",
+        "weakness": "weaknesses",
+    }
+    col = col_by_type.get(note_type, f"{note_type}s")
 
     for i, row in enumerate(rows):
         try:
@@ -633,7 +637,12 @@ def bulk_create_coach_notes(rows, coach, note_type):
                 errors.append({"row": i, "error": f"Player not found: {player_name!r}"})
                 continue
 
-            raw = row.get(col) or ""
+            raw = (
+                row.get(col)
+                or row.get(note_type)
+                or row.get(f"{note_type}s")
+                or ""
+            )
             texts = [t.strip() for t in str(raw).split(",") if t.strip()]
             if not texts:
                 continue
