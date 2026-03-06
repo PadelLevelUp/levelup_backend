@@ -62,10 +62,12 @@ def create_message_service(data, user_id):
     # SSE tracking and skip push for online recipients.
     sender_name = sender.name if sender else "Someone"
     for participant in recipient_participants:
+        message_text = data.get("text", "")
+        body = f"{sender_name}: {message_text[:100]}" if message_text else f"{sender_name} sent you a message"
         send_push_notification(
             participant.user_id,
-            title="New message",
-            body=f"{sender_name} sent you a message",
+            title=sender_name,
+            body=body,
             url="/messages",
         )
 
