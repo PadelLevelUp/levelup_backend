@@ -62,6 +62,9 @@ jobs:
             -e FLASK_SECRET_KEY=${{ secrets.FLASK_SECRET_KEY }} \
             -e MAIL_PASSWORD=${{ secrets.MAIL_PASSWORD }} \
             -e GCS_UPLOADS_BUCKET=${{ secrets.GCS_UPLOADS_BUCKET }} \
+            -e VAPID_PUBLIC_KEY=${{ secrets.VAPID_PUBLIC_KEY }} \
+            -e VAPID_PRIVATE_KEY=${{ secrets.VAPID_PRIVATE_KEY }} \
+            -e VAPID_CLAIMS_EMAIL=${{ secrets.VAPID_CLAIMS_EMAIL }} \
             ${{ secrets.DOCKERHUB_USERNAME }}/levelup_backend:latest
 
     - name: Copy backup script to VM

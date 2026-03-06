@@ -47,6 +47,7 @@ dependencies = [
     "typing-extensions>=4.6,<5",
     "python-dotenv>=1.0.1",
     "python-dateutil==2.9.0",
+    "pywebpush>=2.0.3",
 
     # --- AI / Excel import ---
     "openai>=1.0.0",

@@ -7,10 +7,12 @@ from padel_app.models import (
     Message,
     Conversation,
     ConversationParticipant,
+    User,
 )
 from padel_app.tools.request_adapter import JsonRequestAdapter
 from padel_app.realtime import publish
 from padel_app.serializers.message import serialize_message
+from padel_app.utils.push_notifications import send_push_notification
 
 
 def get_unread_count(user_id):
@@ -48,6 +50,24 @@ def create_message_service(data, user_id):
 
     message.update_with_dict(values)
     message.create()
+
+    sender = User.query.get(user_id)
+    recipient_participants = ConversationParticipant.query.filter(
+        ConversationParticipant.conversation_id == message.conversation_id,
+        ConversationParticipant.user_id != user_id,
+    ).all()
+
+    # TODO: SSE currently tracks global queue subscribers only (not user presence),
+    # so this fallback sends push unconditionally to recipients. Add user-scoped
+    # SSE tracking and skip push for online recipients.
+    sender_name = sender.name if sender else "Someone"
+    for participant in recipient_participants:
+        send_push_notification(
+            participant.user_id,
+            title="New message",
+            body=f"{sender_name} sent you a message",
+            url="/messages",
+        )
 
     publish({
         "type": "message_created",

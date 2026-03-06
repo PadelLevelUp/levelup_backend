@@ -5,6 +5,7 @@ from .coaches import Coach
 from .lesson_instances import LessonInstance
 from .lessons import Lesson
 from .messages import Message
+from .push_subscriptions import PushSubscription
 from .player_level_history import PlayerLevelHistory
 from .players import Player
 from .users import User
@@ -31,6 +32,7 @@ MODELS = {
     "lessoninstance": LessonInstance,
     "lesson": Lesson,
     "lessage": Message,
+    "pushsubscription": PushSubscription,
     "playerlevelhistory": PlayerLevelHistory,
     "player": Player,
     "user": User,
