@@ -447,13 +447,13 @@ def add_class_service(data, coach, club):
 
 def confirm_presences_service(class_instance_data, presences_data):
     """Materialises an instance if needed and records presences."""
-    if class_instance_data['model'] == 'Lesson':
+    if 'parentClassId' in class_instance_data.keys():
         lesson = Lesson.query.get_or_404(class_instance_data.get('originalId'))
         payload = lesson.to_instance_data()
         payload['date'] = class_instance_data['date']
         payload['original_lesson_occurence_date'] = class_instance_data['date']
         instance = create_lesson_instance_helper(data=payload, parent_lesson=lesson)
-    elif class_instance_data['model'] == 'LessonInstance':
+    else:
         instance = LessonInstance.query.get_or_404(class_instance_data.get('originalId'))
 
     return add_presences(instance, presences_data)
