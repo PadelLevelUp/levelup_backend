@@ -1,5 +1,5 @@
 from datetime import datetime
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey
+from sqlalchemy import Column, Integer, String, DateTime, Boolean, ForeignKey
 from sqlalchemy.orm import relationship
 from padel_app.sql_db import db
 from padel_app import model
@@ -36,6 +36,15 @@ class Message(db.Model, model.Model):
     conversation = relationship(
         "Conversation", back_populates="messages"
     )
+
+    # Reply-to (self-referential)
+    reply_to_id = Column(Integer, ForeignKey("messages.id", ondelete="SET NULL"), nullable=True)
+    reply_to    = relationship("Message", remote_side="Message.id", foreign_keys="Message.reply_to_id")
+
+    edited     = Column(Boolean, default=False, nullable=False, server_default="false")
+    is_deleted = Column(Boolean, default=False, nullable=False, server_default="false")
+
+    reactions = relationship("MessageReaction", back_populates="message", cascade="all, delete-orphan")
 
     @property
     def attachment_url(self):

@@ -68,6 +68,9 @@ from padel_app.services.coach_service import (
 from padel_app.services.messaging_service import (
     get_unread_count,
     create_message_service,
+    edit_message_service,
+    delete_message_service,
+    toggle_reaction_service,
     get_user_conversations,
     create_conversation_service,
     mark_conversation_read_service,
@@ -461,6 +464,29 @@ def create_message():
     data = request.get_json() or {}
     message = create_message_service(data, current_user().id)
     return jsonify(serialize_message(message, None)), 201
+
+
+@bp.put("/message/<int:message_id>")
+@jwt_required()
+def edit_message(message_id):
+    data = request.get_json() or {}
+    edit_message_service(message_id, data["text"], current_user().id)
+    return jsonify({"ok": True})
+
+
+@bp.delete("/message/<int:message_id>")
+@jwt_required()
+def delete_message(message_id):
+    delete_message_service(message_id, current_user().id)
+    return jsonify({"ok": True})
+
+
+@bp.post("/message/<int:message_id>/reaction")
+@jwt_required()
+def toggle_reaction(message_id):
+    data = request.get_json() or {}
+    toggle_reaction_service(message_id, data["emoji"], current_user().id)
+    return jsonify({"ok": True})
 
 
 @bp.post("/conversation")

@@ -1,10 +1,12 @@
 from datetime import datetime, timezone
 
+from flask import abort
 from sqlalchemy import func
 
 from padel_app.sql_db import db
 from padel_app.models import (
     Message,
+    MessageReaction,
     Conversation,
     ConversationParticipant,
     User,
@@ -26,6 +28,7 @@ def get_unread_count(user_id):
         .join(CP, CP.conversation_id == M.conversation_id)
         .filter(CP.user_id == user_id)
         .filter(M.sender_id != user_id)
+        .filter(M.is_deleted == False)
         .filter(M.sent_at > func.coalesce(CP.last_read_at, epoch))
         .scalar()
     )
@@ -49,6 +52,7 @@ def create_message_service(data, user_id):
     values = form.set_values(fake_request)
 
     message.update_with_dict(values)
+    message.reply_to_id = data.get("replyToId")
     message.create()
 
     sender = User.query.get(user_id)
@@ -57,9 +61,6 @@ def create_message_service(data, user_id):
         ConversationParticipant.user_id != user_id,
     ).all()
 
-    # TODO: SSE currently tracks global queue subscribers only (not user presence),
-    # so this fallback sends push unconditionally to recipients. Add user-scoped
-    # SSE tracking and skip push for online recipients.
     sender_name = sender.name if sender else "Someone"
     for participant in recipient_participants:
         message_text = data.get("text", "")
@@ -77,6 +78,54 @@ def create_message_service(data, user_id):
     })
 
     return message
+
+
+def edit_message_service(message_id, new_text, user_id):
+    """Edit a message. Only the sender may edit."""
+    message = Message.query.get_or_404(message_id)
+    if message.sender_id != user_id:
+        abort(403, "Not your message")
+    message.text   = new_text
+    message.edited = True
+    message.save()
+    publish({
+        "type": "message_edited",
+        "payload": serialize_message(message, None),
+    })
+    return message
+
+
+def delete_message_service(message_id, user_id):
+    """Soft-delete a message. Only the sender may delete."""
+    message = Message.query.get_or_404(message_id)
+    if message.sender_id != user_id:
+        abort(403, "Not your message")
+    message.is_deleted = True
+    message.save()
+    publish({
+        "type": "message_deleted",
+        "payload": {
+            "id": message_id,
+            "conversationId": message.conversation_id,
+        },
+    })
+
+
+def toggle_reaction_service(message_id, emoji, user_id):
+    """Add or remove a reaction (toggle)."""
+    existing = MessageReaction.query.filter_by(
+        message_id=message_id, user_id=user_id, emoji=emoji
+    ).first()
+    if existing:
+        existing.delete()
+    else:
+        MessageReaction(message_id=message_id, user_id=user_id, emoji=emoji).create()
+
+    message = Message.query.get_or_404(message_id)
+    publish({
+        "type": "message_reaction",
+        "payload": serialize_message(message, None),
+    })
 
 
 def get_user_conversations(user):
