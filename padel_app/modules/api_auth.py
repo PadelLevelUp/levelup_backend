@@ -1,8 +1,9 @@
 from flask import Blueprint, request, jsonify
-from flask_jwt_extended import create_access_token, jwt_required, get_jwt_identity
+from flask_jwt_extended import create_access_token, jwt_required, get_jwt_identity, get_jwt
 from werkzeug.security import check_password_hash
 
-from padel_app.models import User
+from padel_app.models import User, TokenBlocklist
+from padel_app.sql_db import db
 
 bp = Blueprint("auth_api", __name__, url_prefix="/api/auth")
 
@@ -33,6 +34,14 @@ def login():
         }
     }
     
+@bp.post("/logout")
+@jwt_required()
+def logout():
+    jti = get_jwt()["jti"]
+    db.session.add(TokenBlocklist(jti=jti))
+    db.session.commit()
+    return {"message": "Successfully logged out"}, 200
+
 @bp.get("/me")
 @jwt_required()
 def me():

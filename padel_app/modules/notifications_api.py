@@ -47,6 +47,29 @@ def subscribe_notifications():
     return jsonify({"success": True}), 201
 
 
+@bp.post("/save-subscription")
+@jwt_required()
+def save_subscription():
+    user_id = int(get_jwt_identity())
+    data = request.get_json() or {}
+    subscription = data.get("subscription")
+    if not subscription:
+        abort(400, "subscription is required")
+
+    record = PushSubscription.query.filter_by(user_id=user_id).first()
+    if record is None:
+        record = PushSubscription(
+            user_id=user_id,
+            subscription_json=json.dumps(subscription),
+        )
+        db.session.add(record)
+    else:
+        record.subscription_json = json.dumps(subscription)
+
+    db.session.commit()
+    return jsonify({"success": True}), 201
+
+
 @bp.delete("/unsubscribe")
 @jwt_required()
 def unsubscribe_notifications():

@@ -20,7 +20,7 @@ class Config:
     # Secret key (fallback only for dev)
     SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret-key")
     JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "dev-jwt-secret")
-    JWT_ACCESS_TOKEN_EXPIRES = timedelta(minutes=120)
+    JWT_ACCESS_TOKEN_EXPIRES = timedelta(days=30)
     JWT_TOKEN_LOCATION = ["headers", "query_string"]
     JWT_QUERY_STRING_NAME = "token"
     JWT_COOKIE_CSRF_PROTECT = False

@@ -1,4 +1,5 @@
 import os
+from datetime import datetime, timezone, timedelta
 from tempfile import mkdtemp
 
 from flask import Flask
@@ -6,7 +7,7 @@ from flask_cors import CORS
 from flask_assets import Bundle, Environment
 from flask_login import LoginManager
 from flask_session import Session
-from flask_jwt_extended import JWTManager
+from flask_jwt_extended import JWTManager, get_jwt, get_jwt_identity, create_access_token
 from .auth import register_jwt_handlers
 
 from . import cli, mail, modules, sql_db
@@ -22,6 +23,7 @@ def create_app(test_config=None):
         ]}},
         supports_credentials=False,
         allow_headers=["Content-Type", "Authorization"],
+        expose_headers=["X-New-Token"],
     )
 
     # Load config
@@ -37,12 +39,27 @@ def create_app(test_config=None):
 
         app.config.from_object(DevConfig)
 
-    # Ensure responses aren't cached
+    # Ensure responses aren't cached + refresh nearly-expired JWT tokens
     @app.after_request
     def after_request(response):
         response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
         response.headers["Expires"] = 0
         response.headers["Pragma"] = "no-cache"
+
+        try:
+            jwt_data = get_jwt()
+            exp_timestamp = jwt_data.get("exp")
+            if exp_timestamp:
+                remaining = (
+                    datetime.fromtimestamp(exp_timestamp, timezone.utc)
+                    - datetime.now(timezone.utc)
+                )
+                if remaining < timedelta(days=15):
+                    new_token = create_access_token(identity=get_jwt_identity())
+                    response.headers["X-New-Token"] = new_token
+        except Exception:
+            pass
+
         return response
 
     with app.app_context():

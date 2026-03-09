@@ -1,4 +1,4 @@
-from padel_app.models import User
+from padel_app.models import User, TokenBlocklist
 from flask_jwt_extended import JWTManager
 
 def register_jwt_handlers(jwt):
@@ -14,6 +14,11 @@ def register_jwt_handlers(jwt):
     @jwt.expired_token_loader
     def expired(jwt_header, jwt_payload):
         return {"error": "Token expired"}, 401
+
+    @jwt.token_in_blocklist_loader
+    def check_if_token_revoked(jwt_header, jwt_payload):
+        jti = jwt_payload["jti"]
+        return TokenBlocklist.query.filter_by(jti=jti).first() is not None
 
 
 def setup_login_manager(login_manager):

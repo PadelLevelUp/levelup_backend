@@ -1,3 +1,4 @@
+from .token_blocklist import TokenBlocklist
 from .backend_apps import Backend_App
 from .clubs import Club
 from .coach_levels import CoachLevel
@@ -25,6 +26,7 @@ from .Association_PlayerLesson import Association_PlayerLesson
 from .Association_PlayerLessonInstance import Association_PlayerLessonInstance
 
 MODELS = {
+    "tokenblocklist": TokenBlocklist,
     "backend_app": Backend_App,
     "club": Club,
     "coachlevel": CoachLevel,
