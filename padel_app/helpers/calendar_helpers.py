@@ -165,7 +165,6 @@ def build_lesson_events(lessons, instances_by_key, range_start, range_end):
         for occ_start in occurrences:
             occ_date = occ_start.date()
             key = (lesson.id, occ_date)
-
             instance = instances_by_key.get(key)
 
             if instance:

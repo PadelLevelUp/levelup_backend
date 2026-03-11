@@ -12,7 +12,7 @@ from padel_app.models import (
     Association_CoachLessonInstance,
 )
 from padel_app.tools.request_adapter import JsonRequestAdapter
-from padel_app.tools.calendar_tools import build_datetime, _format_time
+from padel_app.tools.calendar_tools import build_datetime, _format_time, _format_date
 from padel_app.helpers.calendar_helpers import (
     load_lessons_for_coach,
     load_lesson_instances_for_coach,
@@ -64,15 +64,8 @@ def get_or_materialize_instance(lesson: Lesson, date):
 
     if instance:
         return instance
-
-    instance = LessonInstance(
-        lesson_id=lesson.id,
-        start_datetime=datetime.combine(date, lesson.start_datetime.time()),
-        end_datetime=datetime.combine(date, lesson.end_datetime.time()),
-        status="scheduled",
-        max_players=lesson.max_players,
-        notifications_enabled=getattr(lesson, "notifications_enabled", True),
-    )
+    
+    instance = create_lesson_instance_helper({'date':date, 'original_lesson_occurence_date': date}, lesson)
 
     instance.add_to_session()
     instance.flush()
@@ -96,15 +89,20 @@ def create_lesson_instance_helper(data, parent_lesson=None):
     if not parent_lesson:
         parent_lesson = Lesson.query.get_or_404(data.get('lesson_id'))
 
-    data = transform_to_datetime(parent_lesson, data)
-    data['lesson'] = parent_lesson.id
-    data['max_players'] = data['max_players'] or parent_lesson.max_players
-    data['overwrite_title'] = data.get('title')
+    data = data or {}
+    instance_data = parent_lesson.data_for_instance()
+    instance_data.update(data)
+    instance_data = transform_to_datetime(parent_lesson, instance_data)
+    instance_data['lesson'] = parent_lesson.id
+    instance_data['max_players'] = (
+        instance_data.get('max_players') or parent_lesson.max_players
+    )
+    instance_data['overwrite_title'] = instance_data.get('title')
 
     lesson_instance = LessonInstance()
     form = lesson_instance.get_create_form()
 
-    fake_request = JsonRequestAdapter(data, form)
+    fake_request = JsonRequestAdapter(instance_data, form)
     values = form.set_values(fake_request)
 
     lesson_instance.update_with_dict(values)
@@ -112,20 +110,20 @@ def create_lesson_instance_helper(data, parent_lesson=None):
 
     add_ids = {
         int(pid)
-        for pid in data.get('add_player_ids', [])
+        for pid in instance_data.get('add_player_ids', [])
         if pid is not None
     }
 
     remove_ids = {
         int(pid)
-        for pid in data.get('remove_player_ids', [])
+        for pid in instance_data.get('remove_player_ids', [])
         if pid is not None
     }
 
     existing_ids = [
-        int(rel.player_id)
-        for rel in parent_lesson.players_relations
-        if rel.player_id is not None
+        int(player_id)
+        for player_id in instance_data.get('player_ids', [])
+        if player_id is not None
     ]
 
     seen = set()
@@ -140,9 +138,9 @@ def create_lesson_instance_helper(data, parent_lesson=None):
             lesson_instance_id=lesson_instance.id,
         ).create()
 
-    for rel in parent_lesson.coaches_relations:
+    for coach_id in instance_data.get('coach_ids', []):
         Association_CoachLessonInstance(
-            coach_id=rel.coach_id,
+            coach_id=coach_id,
             lesson_instance_id=lesson_instance.id,
         ).create()
 

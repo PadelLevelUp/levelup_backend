@@ -70,7 +70,7 @@ def serialize_class_instance(obj) -> dict:
 
     data = {
         "coachId": str(coach_id) if coach_id else None,
-        "name": lesson.title,
+        "name": obj.title,
         "levelId": (
             str(lesson.default_level_id)
             if lesson.default_level_id

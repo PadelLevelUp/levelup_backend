@@ -133,16 +133,31 @@ class Lesson(db.Model, model.Model):
 
         return form
 
-    def to_instance_data(self):
-        """
-        Extracts relevant template data from the Lesson to populate a LessonInstance.
-        Note: start_datetime and end_datetime should be calculated externally 
-        based on the specific occurrence date.
-        """
+    def data_for_instance(self):
         return {
             "lesson_id": self.id,
-            "level_id": self.default_level_id,
-            "max_players": self.max_players,
+            "lesson": self.id,
+            "original_lesson_occurence_date": self.start_datetime.date(),
+            "start_datetime": self.start_datetime,
+            "end_datetime": self.end_datetime,
             "overwrite_title": self.title,
+            "title": self.title,
+            "level": self.default_level_id,
+            "level_id": self.default_level_id,
+            "notifications_enabled": self.notifications_enabled,
             "status": "scheduled",
+            "max_players": self.max_players,
+            "player_ids": [
+                rel.player_id
+                for rel in self.players_relations
+                if rel.player_id is not None
+            ],
+            "coach_ids": [
+                rel.coach_id
+                for rel in self.coaches_relations
+                if rel.coach_id is not None
+            ],
         }
+
+    def to_instance_data(self):
+        return self.data_for_instance()
