@@ -6,6 +6,7 @@ from padel_app.tools.tools import _parse_range_or_default
 
 from padel_app.helpers.dashboard.events import build_dashboard_event_lists
 from padel_app.helpers.dashboard.kpis import compute_coach_kpis
+from padel_app.services.notification_service import get_notification_activity
 
 
 def build_coach_dashboard_blocks(*, coach) -> List[Dict[str, Any]]:
@@ -84,6 +85,14 @@ def build_coach_dashboard_blocks(*, coach) -> List[Dict[str, Any]]:
                         },
                     },
                 ],
+            },
+        },
+        {
+            "id": "notification_activity",
+            "type": "notification_activity",
+            "data": {
+                "title": "Notification activity",
+                "items": get_notification_activity(coach_id=coach.id, limit=8),
             },
         },
     ]

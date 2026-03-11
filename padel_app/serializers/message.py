@@ -31,4 +31,6 @@ def serialize_message(message, last_read_at):
             {"emoji": r.emoji, "userId": r.user_id}
             for r in (message.reactions or [])
         ],
+        "messageType": getattr(message, "message_type", "text") or "text",
+        "metadata": getattr(message, "msg_metadata", None),
     }

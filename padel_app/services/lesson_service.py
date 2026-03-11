@@ -71,6 +71,7 @@ def get_or_materialize_instance(lesson: Lesson, date):
         end_datetime=datetime.combine(date, lesson.end_datetime.time()),
         status="scheduled",
         max_players=lesson.max_players,
+        notifications_enabled=getattr(lesson, "notifications_enabled", True),
     )
 
     instance.add_to_session()
@@ -448,13 +449,14 @@ def add_class_service(data, coach, club):
 def confirm_presences_service(class_instance_data, presences_data):
     """Materialises an instance if needed and records presences."""
     if 'parentClassId' in class_instance_data.keys():
-        lesson = Lesson.query.get_or_404(class_instance_data.get('originalId'))
-        payload = lesson.to_instance_data()
-        payload['date'] = class_instance_data['date']
-        payload['original_lesson_occurence_date'] = class_instance_data['date']
-        instance = create_lesson_instance_helper(data=payload, parent_lesson=lesson)
-    else:
+        # Already a materialized LessonInstance — originalId is the instance ID
         instance = LessonInstance.query.get_or_404(class_instance_data.get('originalId'))
+    else:
+        # Non-materialized recurring Lesson — materialize for the given date
+        lesson = Lesson.query.get_or_404(class_instance_data.get('originalId'))
+        from datetime import datetime as _dt
+        date = _dt.strptime(class_instance_data['date'], '%Y-%m-%d').date()
+        instance = get_or_materialize_instance(lesson, date)
 
     return add_presences(instance, presences_data)
 

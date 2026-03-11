@@ -80,7 +80,8 @@ def serialize_class_instance(obj) -> dict:
             serialize_player(rel.player)
             for rel in obj.players_relations
         ],
-        "recurrenceEnd": lesson.recurrence_end.isoformat() if lesson.recurrence_end else None
+        "recurrenceEnd": lesson.recurrence_end.isoformat() if lesson.recurrence_end else None,
+        "notificationsEnabled": obj.notifications_enabled if hasattr(obj, "notifications_enabled") else True,
     }
 
     if is_instance:

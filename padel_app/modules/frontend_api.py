@@ -571,9 +571,25 @@ def edit_calendar_block(block_id):
 
 
 @bp.post("/class_instance/presences/confirm")
+@jwt_required()
 def confirm_presences():
+    from datetime import datetime
+    from padel_app.services.notification_service import trigger_auto_notifications
     data = request.get_json()
     presences = confirm_presences_service(data['classInstance'], data['presences'])
+
+    # Auto-trigger notifications if any student is absent and class is in the future
+    has_absences = any(p.status == "absent" for p in presences)
+    if has_absences and presences:
+        coach = current_coach()
+        instance = presences[0].lesson_instance
+        if instance and instance.start_datetime > datetime.utcnow():
+            try:
+                trigger_auto_notifications(instance, coach.id)
+            except Exception:
+                from padel_app.sql_db import db
+                db.session.rollback()
+
     return jsonify([serialize_presence(p) for p in presences])
 
 

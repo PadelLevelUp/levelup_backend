@@ -1,5 +1,5 @@
 from datetime import datetime
-from sqlalchemy import Column, Integer, String, DateTime, Boolean, ForeignKey
+from sqlalchemy import Column, Integer, String, DateTime, Boolean, ForeignKey, JSON
 from sqlalchemy.orm import relationship
 from padel_app.sql_db import db
 from padel_app import model
@@ -43,6 +43,10 @@ class Message(db.Model, model.Model):
 
     edited     = Column(Boolean, default=False, nullable=False, server_default="false")
     is_deleted = Column(Boolean, default=False, nullable=False, server_default="false")
+
+    # Notification / system messages
+    message_type = Column(String, default="text", nullable=False, server_default="text")
+    msg_metadata = Column(JSON, nullable=True)
 
     reactions = relationship("MessageReaction", back_populates="message", cascade="all, delete-orphan")
 

@@ -6,6 +6,7 @@ from . import (
     frontend_api,
     api_auth,
     notifications_api,
+    notification_engine_api,
     startup,
 )
 
@@ -19,6 +20,7 @@ def register_blueprints(app):
     app.register_blueprint(frontend_api.bp)
     app.register_blueprint(api_auth.bp)
     app.register_blueprint(notifications_api.bp)
+    app.register_blueprint(notification_engine_api.bp)
     return True
 
 
@@ -30,5 +32,6 @@ __all__ = [
     "frontend_api",
     "api_auth",
     "notifications_api",
+    "notification_engine_api",
     "startup",
 ]

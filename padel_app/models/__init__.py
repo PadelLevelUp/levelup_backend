@@ -25,6 +25,8 @@ from .Association_CoachPlayer import Association_CoachPlayer
 from .Association_PlayerClub import Association_PlayerClub
 from .Association_PlayerLesson import Association_PlayerLesson
 from .Association_PlayerLessonInstance import Association_PlayerLessonInstance
+from .notification_config import NotificationConfig
+from .notification_event import NotificationEvent
 
 MODELS = {
     "tokenblocklist": TokenBlocklist,
@@ -54,4 +56,6 @@ MODELS = {
     "association_playerclub": Association_PlayerClub,
     "association_playerlesson": Association_PlayerLesson,
     "association_playerlessoninstance": Association_PlayerLessonInstance,
+    "notificationconfig": NotificationConfig,
+    "notificationevent": NotificationEvent,
 }

@@ -33,6 +33,7 @@ class Lesson(db.Model, model.Model):
 
     color = Column(String(10))
     status = Column(Enum("active", "ended", name="lesson_status"), default="active")
+    notifications_enabled = Column(Boolean, default=True, nullable=False, server_default="1")
 
     # Many-to-many: Lesson <-> Coach
     coaches_relations = relationship(

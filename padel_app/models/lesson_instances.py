@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, ForeignKey, DateTime, Enum, Text, String, Date
+from sqlalchemy import Boolean, Column, Integer, ForeignKey, DateTime, Enum, Text, String, Date
 from sqlalchemy.orm import relationship
 
 
@@ -28,6 +28,8 @@ class LessonInstance(db.Model, model.Model):
     
     level_id = Column(Integer, ForeignKey("coach_levels.id"))
     level = relationship("CoachLevel")
+
+    notifications_enabled = Column(Boolean, default=True, nullable=False, server_default="1")
 
     status = Column(
         Enum(
