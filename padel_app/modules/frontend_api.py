@@ -578,19 +578,22 @@ def confirm_presences():
     data = request.get_json()
     presences = confirm_presences_service(data['classInstance'], data['presences'])
 
-    # Auto-trigger notifications if any student is absent and class is in the future
+    notified_players = []
     has_absences = any(p.status == "absent" for p in presences)
     if has_absences and presences:
         coach = current_coach()
         instance = presences[0].lesson_instance
         if instance and instance.start_datetime > datetime.utcnow():
             try:
-                trigger_auto_notifications(instance, coach.id)
+                notified_players = trigger_auto_notifications(instance, coach.id) or []
             except Exception:
                 from padel_app.sql_db import db
                 db.session.rollback()
 
-    return jsonify([serialize_presence(p) for p in presences])
+    return jsonify({
+        "presences": [serialize_presence(p) for p in presences],
+        "notifiedPlayers": notified_players,
+    })
 
 
 @bp.post("/lesson/<int:lesson_id>/status")

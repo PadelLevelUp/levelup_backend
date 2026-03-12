@@ -441,7 +441,13 @@ def add_class_service(data, coach, club):
         lesson_payload["recurrence_rule"] = json.dumps(data.get("recurrenceRule"))
         lesson_payload["recurrence_end"] = data.get("endDate")
 
-    return create_lesson_helper(lesson_payload)
+    lesson = create_lesson_helper(lesson_payload)
+
+    if data.get("notificationsEnabled") is not None:
+        lesson.notifications_enabled = data["notificationsEnabled"]
+        lesson.save()
+
+    return lesson
 
 
 def confirm_presences_service(class_instance_data, presences_data):
@@ -547,6 +553,8 @@ def edit_class_service(data):
     if not event or not scope:
         return {"error": "Invalid payload"}, 400
 
+    notifications_enabled = updates.get("notificationsEnabled")
+
     event_date = datetime.strptime(event["date"], "%Y-%m-%d").date()
     date_str = updates.get("date")
     new_date = datetime.strptime(date_str, "%Y-%m-%d").date() if date_str else None
@@ -573,6 +581,9 @@ def edit_class_service(data):
         if scope == "single":
             _ensure_date(payload, event_date)
             edit_lesson_instance_helper(payload, instance)
+            if notifications_enabled is not None:
+                instance.notifications_enabled = notifications_enabled
+                instance.save()
             return {"id": instance.id}, 200
 
         if scope == "future":
@@ -589,6 +600,9 @@ def edit_class_service(data):
                 from_date=from_date,
                 payload=payload,
             )
+            if notifications_enabled is not None:
+                lesson_to_edit.notifications_enabled = notifications_enabled
+                lesson_to_edit.save()
             return {"id": lesson_to_edit.id}, 201
 
         return {"error": "Invalid scope"}, 400
@@ -599,6 +613,9 @@ def edit_class_service(data):
         payload["original_lesson_occurence_date"] = event_date.strftime("%Y-%m-%d")
         _ensure_date(payload, event_date)
         instance = create_lesson_instance_helper(data=payload, parent_lesson=lesson)
+        if notifications_enabled is not None:
+            instance.notifications_enabled = notifications_enabled
+            instance.save()
         return {"id": instance.id}, 201
 
     if scope == "future":
@@ -609,6 +626,9 @@ def edit_class_service(data):
             new_date=new_date,
             payload=payload,
         )
+        if notifications_enabled is not None:
+            lesson_to_edit.notifications_enabled = notifications_enabled
+            lesson_to_edit.save()
         return {"id": lesson_to_edit.id}, 201
 
     return {"error": "Invalid scope"}, 400

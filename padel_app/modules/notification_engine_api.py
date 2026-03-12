@@ -14,6 +14,7 @@ from padel_app.services.notification_service import (
     get_notification_activity,
     get_notification_groups,
     respond_to_notification,
+    coach_respond_to_notification,
 )
 
 bp = Blueprint("notification_engine_api", __name__, url_prefix="/api/app/notify")
@@ -114,6 +115,18 @@ def respond():
     notification_event_id = int(data.get("notificationEventId"))
     action = data.get("action")  # "yes" | "no"
     result = respond_to_notification(notification_event_id, action, user_id)
+    return jsonify(result)
+
+
+@bp.post("/coach_respond")
+@jwt_required()
+def coach_respond():
+    """Coach manually records a player's Yes/No response to an invitation."""
+    coach = _current_coach()
+    data = request.get_json() or {}
+    notification_event_id = int(data.get("notificationEventId"))
+    action = data.get("action")  # "yes" | "no"
+    result = coach_respond_to_notification(notification_event_id, action, coach.id)
     return jsonify(result)
 
 

@@ -375,45 +375,50 @@ def send_manual_notifications(
 # Auto-trigger
 # ---------------------------------------------------------------------------
 
-def trigger_auto_notifications(instance: LessonInstance, coach_id: int) -> None:
+def trigger_auto_notifications(instance: LessonInstance, coach_id: int) -> list[dict]:
     """
     Called after a presence is confirmed absent. Fires Round 1 immediately;
     queues subsequent rounds for processing by process_queued_rounds().
+    Returns a list of {"id", "name"} dicts for players notified in Round 1.
     """
     config = get_or_create_config(coach_id)
 
     if not config.auto_notify_enabled:
-        return
+        return []
     if not instance.notifications_enabled:
-        return
+        return []
 
-    # Count open spots
-    attending = sum(
-        1 for p in instance.presences if p.status == "present"
-    )
-    open_spots = instance.max_players - attending
+    # Count open spots (enrolled minus confirmed absences)
+    open_spots = instance.max_players - _effective_filled_spots(instance)
     if open_spots <= 0:
-        return
+        return []
 
     restrictions = config.get_restrictions()
     if not _check_restrictions(instance, coach_id, restrictions):
-        return
+        return []
 
     eligible = get_eligible_students(instance, coach_id, config)
     if not eligible:
-        return
+        return []
 
     rounds = config.get_rounds()
     max_sim = restrictions.get("maxSimultaneous", {}).get("value", 3)
 
-    # Already-notified players for this instance (don't double-notify)
+    # Players with an active (pending) notification — don't send again.
+    # "expired" events are excluded so a player who previously declined can be
+    # re-invited if a new spot opens later.
     already_notified = {
         e.player_id
-        for e in NotificationEvent.query.filter_by(lesson_instance_id=instance.id).all()
+        for e in NotificationEvent.query.filter(
+            NotificationEvent.lesson_instance_id == instance.id,
+            NotificationEvent.status.in_(["sent", "queued", "confirmed"]),
+        ).all()
     }
 
     # Split eligible students into round buckets
     remaining = [cp for cp in eligible if cp.player_id not in already_notified]
+
+    round1_notified: list[dict] = []
 
     for round_idx, round_cfg in enumerate(rounds):
         bucket = remaining[:max_sim]
@@ -421,24 +426,55 @@ def trigger_auto_notifications(instance: LessonInstance, coach_id: int) -> None:
         round_number = round_idx + 1
 
         if round_number == 1:
+            from padel_app.models import Coach, Player
+            coach_obj = Coach.query.get(coach_id)
+            coach_user_id = coach_obj.user_id if coach_obj else None
+            templates = config.get_message_templates()
+            level_code = instance.level.code if getattr(instance, "level", None) else "this"
+            weekday = instance.start_datetime.strftime("%A") if instance.start_datetime else ""
+            time_str = instance.start_datetime.strftime("%H:%M") if instance.start_datetime else ""
+
             # Fire immediately
             for cp in bucket:
                 if not _check_per_student_daily_limit(cp.player_id, coach_id, restrictions):
                     continue
-                send_push_notification(
-                    user_id=_user_id_for_player(cp.player_id),
-                    title="Spot available!",
-                    body=f"A spot opened in {instance.title}. Tap to see details.",
-                    url="/calendar",
-                )
-                NotificationEvent(
+                player_user_id = _user_id_for_player(cp.player_id)
+                if not coach_user_id or not player_user_id:
+                    continue  # skip players we can't message
+                player_name = (cp.player.user.name if cp.player and cp.player.user else "Player").split()[0]
+
+                event = NotificationEvent(
                     coach_id=coach_id,
                     lesson_instance_id=instance.id,
                     player_id=cp.player_id,
                     type="auto",
                     round_number=1,
                     status="sent",
-                ).create()
+                )
+                event.create()
+
+                text = _format_template(
+                    templates.get("invite", DEFAULT_MESSAGE_TEMPLATES["invite"]),
+                    name=player_name,
+                    level=level_code,
+                    weekday=weekday,
+                    time=time_str,
+                )
+                msg = _send_system_message(
+                    coach_user_id=coach_user_id,
+                    player_user_id=player_user_id,
+                    text=text,
+                    message_type="notification_invite",
+                    msg_metadata={
+                        "notificationEventId": event.id,
+                        "lessonInstanceId": instance.id,
+                        "responded": False,
+                    },
+                )
+                event.message_id = msg.id
+                event.save()
+
+                round1_notified.append({"id": str(cp.player_id), "name": player_name})
         else:
             # Queue for later rounds
             for cp in bucket:
@@ -462,6 +498,8 @@ def trigger_auto_notifications(instance: LessonInstance, coach_id: int) -> None:
             "type": "auto",
         },
     })
+
+    return round1_notified
 
 
 # ---------------------------------------------------------------------------
@@ -491,8 +529,7 @@ def process_queued_rounds() -> int:
 
         # Check if spot is still open
         instance = event.lesson_instance
-        attending = sum(1 for p in instance.presences if p.status == "present")
-        if attending >= instance.max_players:
+        if _effective_filled_spots(instance) >= instance.max_players:
             event.status = "expired"
             event.save()
             continue
@@ -570,12 +607,20 @@ def get_notification_groups(
     enabled_groups = [g for g in groups_config if g.get("enabled")]
 
     # Resolve level_id and enrolled_ids from the event
+    already_notified_ids: set[int] = set()
     if model.lower() == "lessoninstance":
         obj = LessonInstance.query.get(original_id)
         if obj is None:
             return []
         level_id = obj.level_id or (obj.lesson.default_level_id if obj.lesson else None)
         enrolled_ids = {rel.player_id for rel in obj.players_relations}
+        already_notified_ids = {
+            e.player_id
+            for e in NotificationEvent.query.filter(
+                NotificationEvent.lesson_instance_id == obj.id,
+                NotificationEvent.status.in_(["sent", "queued", "confirmed"]),
+            ).all()
+        }
     else:
         from padel_app.models import Lesson
         obj = Lesson.query.get(original_id)
@@ -584,10 +629,10 @@ def get_notification_groups(
         level_id = obj.default_level_id
         enrolled_ids = {rel.player_id for rel in obj.players_relations}
 
-    # All coach players not already enrolled
+    # All coach players not already enrolled and not already notified for this instance
     all_coach_players = [
         cp for cp in Association_CoachPlayer.query.filter_by(coach_id=coach_id).all()
-        if cp.player_id not in enrolled_ids
+        if cp.player_id not in enrolled_ids and cp.player_id not in already_notified_ids
     ]
 
     result = []
@@ -683,11 +728,11 @@ def respond_to_notification(notification_event_id: int, action: str, acting_user
     coach_user_id = coach.user_id if coach else None
     player_user_id = acting_user_id
 
-    # Mark the original invite message as responded
+    # Mark the original invite message as responded with the actual action
     if event.message_id:
         invite_msg = Message.query.get(event.message_id)
         if invite_msg and invite_msg.msg_metadata is not None:
-            invite_msg.msg_metadata = {**invite_msg.msg_metadata, "responded": True}
+            invite_msg.msg_metadata = {**invite_msg.msg_metadata, "responded": True, "response": action}
             invite_msg.save()
             publish({"type": "message_edited", "payload": serialize_message(invite_msg, None)})
 
@@ -704,12 +749,8 @@ def respond_to_notification(notification_event_id: int, action: str, acting_user
         return {"action": "declined"}
 
     elif action == "yes":
-        # Check capacity using enrolled count
-        enrolled_count = Association_PlayerLessonInstance.query.filter_by(
-            lesson_instance_id=instance.id
-        ).count()
-
-        if enrolled_count >= instance.max_players:
+        # Check capacity: enrolled minus confirmed absences
+        if _effective_filled_spots(instance) >= instance.max_players:
             # Spot already filled
             event.status = "expired"
             event.save()
@@ -725,9 +766,56 @@ def respond_to_notification(notification_event_id: int, action: str, acting_user
         event.status = "confirmed"
         event.save()
 
-        # Notify all other pending invitees that the spot is filled
+        # Confirm to the player and notify other pending invitees
         if coach_user_id:
+            confirm_text = templates.get("confirm", DEFAULT_MESSAGE_TEMPLATES["confirm"])
+            _send_system_message(coach_user_id, player_user_id, confirm_text)
             _broadcast_spot_filled(instance, event.id, coach_user_id, templates)
+
+        return {"action": "confirmed"}
+
+    return {"action": "unknown"}
+
+
+def coach_respond_to_notification(notification_event_id: int, action: str, coach_id: int) -> dict:
+    """
+    Called by the coach to manually record a player's Yes/No response to an invitation.
+    Does not send chat messages — purely updates invitation status and roster.
+    Returns {"action": "confirmed" | "declined" | "spot_filled" | "unknown"}.
+    """
+    from flask import abort
+
+    event = NotificationEvent.query.get_or_404(notification_event_id)
+
+    if event.coach_id != coach_id:
+        abort(403, "Not authorized to respond to this notification")
+
+    instance = event.lesson_instance
+
+    if action == "no":
+        event.status = "expired"
+        event.save()
+        return {"action": "declined"}
+
+    elif action == "yes":
+        if _effective_filled_spots(instance) >= instance.max_players:
+            event.status = "expired"
+            event.save()
+            return {"action": "spot_filled"}
+
+        _add_player_to_instance(event.player_id, instance)
+        event.status = "confirmed"
+        event.save()
+
+        # Expire all other pending invitations for this instance
+        other_events = NotificationEvent.query.filter(
+            NotificationEvent.lesson_instance_id == instance.id,
+            NotificationEvent.status == "sent",
+            NotificationEvent.id != event.id,
+        ).all()
+        for other in other_events:
+            other.status = "expired"
+            other.save()
 
         return {"action": "confirmed"}
 
@@ -785,11 +873,11 @@ def _broadcast_spot_filled(
         if not other_player_user_id:
             continue
 
-        # Mark invite message as responded
+        # Mark invite message as responded (spot was filled by someone else)
         if other_event.message_id:
             invite_msg = Message.query.get(other_event.message_id)
             if invite_msg and invite_msg.msg_metadata is not None:
-                invite_msg.msg_metadata = {**invite_msg.msg_metadata, "responded": True}
+                invite_msg.msg_metadata = {**invite_msg.msg_metadata, "responded": True, "response": "spot_filled"}
                 invite_msg.save()
                 publish({"type": "message_edited", "payload": serialize_message(invite_msg, None)})
 
@@ -807,3 +895,13 @@ def _user_id_for_player(player_id: int) -> int | None:
     from padel_app.models import Player  # avoid circular import at module level
     player = Player.query.get(player_id)
     return player.user_id if player else None
+
+
+def _effective_filled_spots(instance: LessonInstance) -> int:
+    """
+    How many spots are actually occupied: enrolled players minus those
+    with a confirmed absence (absent players free up their spot).
+    """
+    enrolled = len(instance.players_relations)
+    absent = sum(1 for p in instance.presences if p.status == "absent")
+    return max(0, enrolled - absent)

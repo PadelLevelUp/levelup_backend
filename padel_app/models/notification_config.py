@@ -37,6 +37,7 @@ DEFAULT_NOTIFICATION_GROUPS = [
 
 DEFAULT_MESSAGE_TEMPLATES = {
     "invite": "Hey {name}, we have an opening in the {level} class next {weekday} at {time}. Do you want to come?",
+    "confirm": "Great! I'm counting on you! See you there 🎾",
     "decline": "No problem, see you next time!",
     "spot_filled": "Sorry, this place was filled already! I'll get back to you if something else opens up.",
 }

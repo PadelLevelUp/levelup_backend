@@ -85,6 +85,11 @@ def serialize_class_instance(obj) -> dict:
     }
 
     if is_instance:
+        from padel_app.models.notification_event import NotificationEvent
+        notification_events = NotificationEvent.query.filter_by(
+            lesson_instance_id=obj.id
+        ).all()
+
         data.update(
             {
                 "parentClassId": str(lesson.id),
@@ -97,6 +102,19 @@ def serialize_class_instance(obj) -> dict:
                 "presences": [
                     serialize_presence(p)
                     for p in getattr(obj, "presences", [])
+                ],
+                "invitations": [
+                    {
+                        "id": ev.id,
+                        "playerId": str(ev.player_id),
+                        "playerName": (
+                            ev.player.user.name
+                            if ev.player and ev.player.user
+                            else "Unknown"
+                        ),
+                        "status": ev.status,
+                    }
+                    for ev in notification_events
                 ],
             }
         )
