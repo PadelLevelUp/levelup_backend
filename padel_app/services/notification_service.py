@@ -746,6 +746,10 @@ def respond_to_notification(notification_event_id: int, action: str, acting_user
             decline_text = templates.get("decline", DEFAULT_MESSAGE_TEMPLATES["decline"])
             _send_system_message(coach_user_id, player_user_id, decline_text)
 
+        publish({
+            "type": "notification_responded",
+            "payload": {"lessonInstanceId": instance.id, "notificationEventId": event.id, "response": "no"},
+        })
         return {"action": "declined"}
 
     elif action == "yes":
@@ -759,6 +763,10 @@ def respond_to_notification(notification_event_id: int, action: str, acting_user
                 spot_filled_text = templates.get("spot_filled", DEFAULT_MESSAGE_TEMPLATES["spot_filled"])
                 _send_system_message(coach_user_id, player_user_id, spot_filled_text)
 
+            publish({
+                "type": "notification_responded",
+                "payload": {"lessonInstanceId": instance.id, "notificationEventId": event.id, "response": "spot_filled"},
+            })
             return {"action": "spot_filled"}
 
         # Add the player to the lesson instance
@@ -772,6 +780,10 @@ def respond_to_notification(notification_event_id: int, action: str, acting_user
             _send_system_message(coach_user_id, player_user_id, confirm_text)
             _broadcast_spot_filled(instance, event.id, coach_user_id, templates)
 
+        publish({
+            "type": "notification_responded",
+            "payload": {"lessonInstanceId": instance.id, "notificationEventId": event.id, "response": "yes"},
+        })
         return {"action": "confirmed"}
 
     return {"action": "unknown"}
@@ -885,6 +897,10 @@ def _broadcast_spot_filled(
 
         other_event.status = "expired"
         other_event.save()
+        publish({
+            "type": "notification_responded",
+            "payload": {"lessonInstanceId": instance.id, "notificationEventId": other_event.id, "response": "spot_filled"},
+        })
 
 
 # ---------------------------------------------------------------------------
