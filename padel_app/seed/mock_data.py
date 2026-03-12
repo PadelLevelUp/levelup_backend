@@ -21,6 +21,8 @@ from padel_app.models import (
     CoachLevel,
     Conversation,
     ConversationParticipant,
+    Exercise,
+    ExerciseGroup,
     Lesson,
     LessonInstance,
     Message,
@@ -29,6 +31,8 @@ from padel_app.models import (
     Presence,
     User,
 )
+from padel_app.models.Association_CoachExercise import Association_CoachExercise
+from padel_app.models.Association_CoachExerciseGroup import Association_CoachExerciseGroup
 from padel_app.sql_db import db
 
 
@@ -340,6 +344,93 @@ MOCK_CONVERSATIONS = [
 ]
 
 
+MOCK_EXERCISES = [
+    {
+        "name": "Cross-court Lob Recovery",
+        "description": (
+            "Player 1 at the net plays a volley, opponent responds with a cross-court lob. "
+            "Player 2 recovers behind and plays a bandeja. Focus on positioning and communication."
+        ),
+        "type": "defense",
+        "difficulty": 3,
+        "level_ids": [],
+        "notes": "Emphasize split-step timing and early ball tracking. Rotate players after 5 reps.",
+        "coach_username": "bernardo_terroso",
+        "diagram": {
+            "elements": [
+                {"id": "m1-p1", "type": "player_1", "x": 80, "y": 210, "label": "P1"},
+                {"id": "m1-p2", "type": "player_2", "x": 180, "y": 210, "label": "P2"},
+                {"id": "m1-p3", "type": "player_3", "x": 90, "y": 330, "label": "P3"},
+                {"id": "m1-p4", "type": "player_4", "x": 170, "y": 330, "label": "P4"},
+                {"id": "m1-coach", "type": "coach", "x": 40, "y": 270},
+                {"id": "m1-ball", "type": "ball", "x": 80, "y": 230},
+                {"id": "m1-a1", "type": "arrow", "x": 90, "y": 330, "endX": 160, "endY": 200, "label": "Lob", "curve": -35},
+                {"id": "m1-a2", "type": "movement", "x": 180, "y": 210, "endX": 180, "endY": 130, "label": "Recovery", "curve": 20},
+                {"id": "m1-a3", "type": "arrow", "x": 180, "y": 130, "endX": 90, "endY": 350, "label": "Bandeja", "curve": 25},
+                {"id": "m1-c1", "type": "cone", "x": 120, "y": 180},
+                {"id": "m1-c2", "type": "cone", "x": 140, "y": 180},
+            ]
+        },
+    },
+    {
+        "name": "Serve & Volley Drill",
+        "description": (
+            "Practice the serve and immediate net approach. Server hits wide, "
+            "follows the ball to the net, and finishes with a volley."
+        ),
+        "type": "serve",
+        "difficulty": 2,
+        "level_ids": [],
+        "notes": None,
+        "coach_username": "bernardo_terroso",
+        "diagram": {
+            "elements": [
+                {"id": "m2-p1", "type": "player_1", "x": 80, "y": 460, "label": "P1"},
+                {"id": "m2-p3", "type": "player_3", "x": 170, "y": 100, "label": "P3"},
+                {"id": "m2-a1", "type": "arrow", "x": 80, "y": 460, "endX": 170, "endY": 120, "label": "Serve", "curve": 15},
+                {"id": "m2-a2", "type": "movement", "x": 80, "y": 460, "endX": 90, "endY": 280, "label": "Approach", "curve": -20},
+                {"id": "m2-a3", "type": "arrow", "x": 90, "y": 280, "endX": 160, "endY": 350, "label": "Volley", "curve": 0},
+            ]
+        },
+    },
+    {
+        "name": "Net Approach Volley",
+        "description": "Quick volley exchanges at the net. Both players rally volleys cross-court with emphasis on soft hands.",
+        "type": "volley",
+        "difficulty": 2,
+        "level_ids": [],
+        "notes": None,
+        "coach_username": "bernardo_terroso",
+        "diagram": None,
+    },
+    {
+        "name": "Smash & Bandeja Rotation",
+        "description": "Coach feeds high balls alternating between smash and bandeja zones. Players rotate after each shot.",
+        "type": "attack",
+        "difficulty": 4,
+        "level_ids": [],
+        "notes": None,
+        "coach_username": "bernardo_terroso",
+        "diagram": None,
+    },
+]
+
+MOCK_EXERCISE_GROUPS = [
+    {
+        "name": "Attacking Training at the Net",
+        "description": "A series of drills focused on net play, volleys and finishing shots.",
+        "coach_username": "bernardo_terroso",
+        "exercise_names": ["Serve & Volley Drill", "Net Approach Volley", "Smash & Bandeja Rotation"],
+    },
+    {
+        "name": "Defensive Positioning",
+        "description": "Drills for lob recovery and defensive transitions.",
+        "coach_username": "bernardo_terroso",
+        "exercise_names": ["Cross-court Lob Recovery"],
+    },
+]
+
+
 @dataclass
 class SeedResult:
     inserted: int = 0
@@ -362,6 +453,8 @@ TABLE_DEPENDENCIES = {
     "conversations": ["users"],
     "messages": ["conversations"],
     "presences": ["lesson_instances", "players"],
+    "exercises": ["coaches"],
+    "exercise_groups": ["coaches", "exercises"],
 }
 
 ALL_SEED_TABLES = [
@@ -380,6 +473,8 @@ ALL_SEED_TABLES = [
     "conversations",
     "messages",
     "presences",
+    "exercises",
+    "exercise_groups",
 ]
 
 
@@ -418,6 +513,10 @@ TABLE_ALIASES = {
     "messages": "messages",
     "presence": "presences",
     "presences": "presences",
+    "exercise": "exercises",
+    "exercises": "exercises",
+    "exercise_group": "exercise_groups",
+    "exercise_groups": "exercise_groups",
 }
 
 
@@ -1069,6 +1168,96 @@ def _seed_presences() -> SeedResult:
     return result
 
 
+def _seed_exercises() -> SeedResult:
+    result = SeedResult()
+
+    for row in MOCK_EXERCISES:
+        coach = _coach_by_username(row["coach_username"])
+
+        exercise = Exercise.query.filter_by(name=row["name"], owner_coach_id=coach.id).first()
+        if not exercise:
+            exercise = Exercise(
+                name=row["name"],
+                description=row.get("description"),
+                type=row["type"],
+                difficulty=row["difficulty"],
+                level_ids=row.get("level_ids", []),
+                notes=row.get("notes"),
+                diagram=row.get("diagram"),
+                owner_coach_id=coach.id,
+            )
+            db.session.add(exercise)
+            db.session.flush()
+
+            db.session.add(Association_CoachExercise(
+                coach_id=coach.id,
+                exercise_id=exercise.id,
+                role="owner",
+            ))
+            result.inserted += 1
+            continue
+
+        changed = False
+        updates = {
+            "description": row.get("description"),
+            "type": row["type"],
+            "difficulty": row["difficulty"],
+            "level_ids": row.get("level_ids", []),
+            "notes": row.get("notes"),
+            "diagram": row.get("diagram"),
+        }
+        for field, expected in updates.items():
+            if getattr(exercise, field) != expected:
+                setattr(exercise, field, expected)
+                changed = True
+
+        if changed:
+            result.updated += 1
+
+    db.session.flush()
+    return result
+
+
+def _seed_exercise_groups() -> SeedResult:
+    result = SeedResult()
+
+    for row in MOCK_EXERCISE_GROUPS:
+        coach = _coach_by_username(row["coach_username"])
+
+        group = ExerciseGroup.query.filter_by(name=row["name"], owner_coach_id=coach.id).first()
+        if not group:
+            group = ExerciseGroup(
+                name=row["name"],
+                description=row.get("description"),
+                owner_coach_id=coach.id,
+            )
+            db.session.add(group)
+            db.session.flush()
+
+            db.session.add(Association_CoachExerciseGroup(
+                coach_id=coach.id,
+                exercise_group_id=group.id,
+                role="owner",
+            ))
+            result.inserted += 1
+        else:
+            changed = False
+            if group.description != row.get("description"):
+                group.description = row.get("description")
+                changed = True
+            if changed:
+                result.updated += 1
+
+        # Sync exercises in the group
+        for exercise_name in row["exercise_names"]:
+            exercise = Exercise.query.filter_by(name=exercise_name, owner_coach_id=coach.id).first()
+            if exercise and exercise not in group.exercises:
+                group.exercises.append(exercise)
+
+    db.session.flush()
+    return result
+
+
 _SEEDERS = {
     "users": _seed_users,
     "clubs": _seed_clubs,
@@ -1085,4 +1274,6 @@ _SEEDERS = {
     "conversations": _seed_conversations,
     "messages": _seed_messages,
     "presences": _seed_presences,
+    "exercises": _seed_exercises,
+    "exercise_groups": _seed_exercise_groups,
 }

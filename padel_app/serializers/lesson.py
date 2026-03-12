@@ -86,7 +86,11 @@ def serialize_class_instance(obj) -> dict:
 
     if is_instance:
         from padel_app.models.notification_event import NotificationEvent
+        from padel_app.models.lesson_instance_training import LessonInstanceTraining
         notification_events = NotificationEvent.query.filter_by(
+            lesson_instance_id=obj.id
+        ).all()
+        training_rows = LessonInstanceTraining.query.filter_by(
             lesson_instance_id=obj.id
         ).all()
 
@@ -116,6 +120,7 @@ def serialize_class_instance(obj) -> dict:
                     }
                     for ev in notification_events
                 ],
+                "plannedExerciseIds": [str(t.exercise_id) for t in training_rows],
             }
         )
         data["levelId"] = str(obj.level_id) if obj.level_id else data["levelId"]

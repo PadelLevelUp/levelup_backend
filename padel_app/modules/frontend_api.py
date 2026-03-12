@@ -733,3 +733,113 @@ def import_confirm():
         results[table_name] = fn(rows, coach, club) if needs_club else fn(rows, coach)
 
     return jsonify(results)
+
+
+# -------------------------------------------------------------------
+# Training – Exercises
+# -------------------------------------------------------------------
+
+from padel_app.serializers.training import serialize_exercise, serialize_exercise_group
+from padel_app.services.training_service import (
+    get_exercises_for_coach,
+    get_exercise_for_coach,
+    create_exercise_service,
+    update_exercise_service,
+    delete_exercise_service,
+    get_exercise_groups_for_coach,
+    create_exercise_group_service,
+    update_exercise_group_service,
+    delete_exercise_group_service,
+    confirm_training_service,
+)
+
+
+@bp.get("/exercises")
+@jwt_required()
+def exercises():
+    coach = current_coach()
+    return jsonify([serialize_exercise(ex) for ex in get_exercises_for_coach(coach)])
+
+
+@bp.get("/exercises/<int:exercise_id>")
+@jwt_required()
+def exercise_detail(exercise_id):
+    coach = current_coach()
+    return jsonify(serialize_exercise(get_exercise_for_coach(coach, exercise_id)))
+
+
+@bp.post("/exercises")
+@jwt_required()
+def create_exercise():
+    coach = current_coach()
+    data = request.get_json() or {}
+    exercise = create_exercise_service(coach, data)
+    return jsonify(serialize_exercise(exercise)), 201
+
+
+@bp.put("/exercises/<int:exercise_id>")
+@jwt_required()
+def update_exercise(exercise_id):
+    coach = current_coach()
+    data = request.get_json() or {}
+    exercise = update_exercise_service(exercise_id, coach, data)
+    return jsonify(serialize_exercise(exercise))
+
+
+@bp.delete("/exercises/<int:exercise_id>")
+@jwt_required()
+def delete_exercise(exercise_id):
+    coach = current_coach()
+    delete_exercise_service(exercise_id, coach)
+    return "", 204
+
+
+# -------------------------------------------------------------------
+# Training – Exercise Groups
+# -------------------------------------------------------------------
+
+@bp.get("/exercise-groups")
+@jwt_required()
+def exercise_groups():
+    coach = current_coach()
+    return jsonify([serialize_exercise_group(g) for g in get_exercise_groups_for_coach(coach)])
+
+
+@bp.post("/exercise-groups")
+@jwt_required()
+def create_exercise_group():
+    coach = current_coach()
+    data = request.get_json() or {}
+    group = create_exercise_group_service(coach, data)
+    return jsonify(serialize_exercise_group(group)), 201
+
+
+@bp.put("/exercise-groups/<int:group_id>")
+@jwt_required()
+def update_exercise_group(group_id):
+    coach = current_coach()
+    data = request.get_json() or {}
+    group = update_exercise_group_service(group_id, coach, data)
+    return jsonify(serialize_exercise_group(group))
+
+
+@bp.delete("/exercise-groups/<int:group_id>")
+@jwt_required()
+def delete_exercise_group(group_id):
+    coach = current_coach()
+    delete_exercise_group_service(group_id, coach)
+    return "", 204
+
+
+# -------------------------------------------------------------------
+# Training – Lesson Instance Training
+# -------------------------------------------------------------------
+
+@bp.post("/class_instance/training/confirm")
+@jwt_required()
+def confirm_training():
+    data = request.get_json()
+    training = confirm_training_service(data['classInstance'], data['exerciseIds'])
+    return jsonify({
+        "plannedExerciseIds": [str(t.exercise_id) for t in training],
+    })

@@ -18,6 +18,7 @@ from .conversation_participants import ConversationParticipant
 from .coach_player_note import CoachPlayerNote
 from .evaluation_category import EvaluationCategory
 from .evaluation_entry import EvaluationEntry
+from .exercise import Exercise, ExerciseGroup
 from .Association_CoachClub import Association_CoachClub
 from .Association_CoachLesson import Association_CoachLesson
 from .Association_CoachLessonInstance import Association_CoachLessonInstance
@@ -25,6 +26,9 @@ from .Association_CoachPlayer import Association_CoachPlayer
 from .Association_PlayerClub import Association_PlayerClub
 from .Association_PlayerLesson import Association_PlayerLesson
 from .Association_PlayerLessonInstance import Association_PlayerLessonInstance
+from .Association_CoachExercise import Association_CoachExercise
+from .Association_CoachExerciseGroup import Association_CoachExerciseGroup
+from .lesson_instance_training import LessonInstanceTraining
 from .notification_config import NotificationConfig
 from .notification_event import NotificationEvent
 
@@ -48,6 +52,8 @@ MODELS = {
     "coachplayernote": CoachPlayerNote,
     "evaluationcategory": EvaluationCategory,
     "evaluationentry": EvaluationEntry,
+    "exercise": Exercise,
+    "exercisegroup": ExerciseGroup,
     "conversation_participant": ConversationParticipant,
     "association_coachclub": Association_CoachClub,
     "association_coachlesson": Association_CoachLesson,
@@ -56,6 +62,9 @@ MODELS = {
     "association_playerclub": Association_PlayerClub,
     "association_playerlesson": Association_PlayerLesson,
     "association_playerlessoninstance": Association_PlayerLessonInstance,
+    "association_coachexercise": Association_CoachExercise,
+    "association_coachexercisegroup": Association_CoachExerciseGroup,
+    "lesson_instance_training": LessonInstanceTraining,
     "notificationconfig": NotificationConfig,
     "notificationevent": NotificationEvent,
 }

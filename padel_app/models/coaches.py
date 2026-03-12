@@ -120,3 +120,33 @@ class Coach(db.Model, model.Model):
         form.add_block(info_block)
 
         return form
+
+    # Training: exercises owned by this coach
+    owned_exercises = relationship(
+        "Exercise",
+        foreign_keys="Exercise.owner_coach_id",
+        back_populates="owner_coach",
+        cascade="all, delete-orphan",
+    )
+
+    # Training: all exercise access (owner + follower)
+    exercise_relations = relationship(
+        "Association_CoachExercise",
+        back_populates="coach",
+        cascade="all, delete-orphan",
+    )
+
+    # Training: exercise groups owned by this coach
+    owned_exercise_groups = relationship(
+        "ExerciseGroup",
+        foreign_keys="ExerciseGroup.owner_coach_id",
+        back_populates="owner_coach",
+        cascade="all, delete-orphan",
+    )
+
+    # Training: all exercise group access (owner + follower)
+    exercise_group_relations = relationship(
+        "Association_CoachExerciseGroup",
+        back_populates="coach",
+        cascade="all, delete-orphan",
+    )
