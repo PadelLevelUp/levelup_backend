@@ -78,6 +78,10 @@ from padel_app.services.messaging_service import (
 from padel_app.services.calendar_service import (
     create_calendar_block_service,
     edit_calendar_block_service,
+    add_event_service,
+    edit_event_service,
+    reschedule_block_service,
+    remove_block_service,
 )
 from padel_app.services.ai_service import stream_import_analysis
 from padel_app.services.import_service import (
@@ -503,6 +507,45 @@ def add_class():
     data = request.get_json() or {}
     lesson = add_class_service(data, current_coach(), current_club())
     return jsonify(serialize_calendar_event(lesson))
+
+
+@bp.post("/add_event")
+@jwt_required()
+def add_event():
+    data = request.get_json() or {}
+    block = add_event_service(current_user().id, data)
+    return jsonify(serialize_calendar_block(block)), 201
+
+
+@bp.get("/calendar_block/<int:block_id>")
+@jwt_required()
+def get_calendar_block(block_id):
+    block = CalendarBlock.query.filter_by(id=block_id, user_id=current_user().id).first_or_404()
+    return jsonify(serialize_calendar_block(block))
+
+
+@bp.put("/calendar_block/<int:block_id>")
+@jwt_required()
+def put_calendar_block(block_id):
+    data = request.get_json() or {}
+    block = edit_event_service(block_id, current_user().id, data)
+    return jsonify(serialize_calendar_block(block))
+
+
+@bp.delete("/calendar_block/<int:block_id>")
+@jwt_required()
+def delete_calendar_block(block_id):
+    data = request.get_json() or {}
+    remove_block_service(block_id, current_user().id, data.get('occDate'), data.get('scope', 'all'))
+    return "", 204
+
+
+@bp.post("/reschedule_block/<int:block_id>")
+@jwt_required()
+def reschedule_block(block_id):
+    data = request.get_json() or {}
+    reschedule_block_service(block_id, current_user().id, data)
+    return "", 204
 
 
 @bp.post("/add_coach_level")
