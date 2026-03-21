@@ -80,6 +80,30 @@ def get_or_materialize_instance(lesson: Lesson, date):
         ).add_to_session()
 
     instance.save()
+
+    # Schedule reminder + invitation-start jobs for this new instance
+    try:
+        from flask import current_app
+        from padel_app.scheduler import schedule_instance_jobs
+        if lesson.coaches_relations:
+            coach_id = lesson.coaches_relations[0].coach_id
+            schedule_instance_jobs(current_app._get_current_object(), instance.id, coach_id)
+    except Exception:
+        pass  # scheduler may not be running (tests, CLI, etc.)
+
+    # Fan out standing waiting list entries to this new instance
+    # Use a SAVEPOINT so any DB failure (e.g. migration not yet run) doesn't
+    # poison the outer transaction and break unrelated operations like presence confirmation.
+    try:
+        sp = db.session.begin_nested()
+        from padel_app.services.notification_service import _sync_standing_entries_for_new_instance
+        if lesson.coaches_relations:
+            coach_id = lesson.coaches_relations[0].coach_id
+            _sync_standing_entries_for_new_instance(instance, coach_id)
+        sp.commit()
+    except Exception:
+        sp.rollback()
+
     return instance
 
 
@@ -194,18 +218,21 @@ def add_presences(lesson_instance, payload):
     for item in payload:
         player_id = item.get('playerId')
         lesson_instance_id = lesson_instance.id
-        data = {
-            "status": item.get('status'),
-            "justification": item.get('justification'),
-            "invited": True,
-            "confirmed": True,
-            "validated": True,
-        }
 
         existing = Presence.query.filter_by(
             lesson_instance_id=lesson_instance_id,
             player_id=player_id,
         ).first()
+
+        # Preserve invited/confirmed from the reminder flow; only set them on
+        # brand-new presences where no reminder was ever sent.
+        data = {
+            "status": item.get('status'),
+            "justification": item.get('justification'),
+            "invited": existing.invited if existing else False,
+            "confirmed": existing.confirmed if existing else False,
+            "validated": True,
+        }
 
         if existing:
             presence_obj = existing
@@ -472,6 +499,16 @@ def update_lesson_status_service(lesson_id, data):
     instance = get_or_materialize_instance(lesson, date)
     instance.status = data["status"]  # canceled | completed
     instance.save()
+
+    # Cancel scheduled notification jobs when a class is canceled
+    if data.get("status") == "canceled":
+        try:
+            from flask import current_app
+            from padel_app.scheduler import cancel_instance_jobs
+            cancel_instance_jobs(current_app._get_current_object(), instance.id)
+        except Exception:
+            pass
+
     return instance
 
 

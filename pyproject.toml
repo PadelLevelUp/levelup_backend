@@ -49,6 +49,9 @@ dependencies = [
     "python-dateutil==2.9.0",
     "pywebpush>=2.0.3",
 
+    # --- Scheduler ---
+    "APScheduler>=3.10,<4",
+
     # --- AI / Excel import ---
     "openai>=1.0.0",
     "openpyxl>=3.1.5",

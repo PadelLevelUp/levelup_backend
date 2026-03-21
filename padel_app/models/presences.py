@@ -31,7 +31,7 @@ class Presence(db.Model, model.Model):
     status = Column(Enum("present", "absent", name="lesson_presence_status"), nullable=True)
     justification = Column(Enum("justified", "unjustified", name="lesson_presence_justification"), nullable=True)
 
-    invited = Column(Boolean, default=True)
+    invited = Column(Boolean, default=False)
     confirmed = Column(Boolean, default=False)
     validated = Column(Boolean, default=False)
     

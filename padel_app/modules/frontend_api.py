@@ -617,7 +617,9 @@ def edit_calendar_block(block_id):
 @jwt_required()
 def confirm_presences():
     from datetime import datetime
-    from padel_app.services.notification_service import trigger_auto_notifications
+    from padel_app.scheduler import _compute_invite_start_dt
+    from padel_app.services.notification_service import get_or_create_config, trigger_invitations
+
     data = request.get_json()
     presences = confirm_presences_service(data['classInstance'], data['presences'])
 
@@ -627,11 +629,16 @@ def confirm_presences():
         coach = current_coach()
         instance = presences[0].lesson_instance
         if instance and instance.start_datetime > datetime.utcnow():
-            try:
-                notified_players = trigger_auto_notifications(instance, coach.id) or []
-            except Exception:
-                from padel_app.sql_db import db
-                db.session.rollback()
+            config = get_or_create_config(coach.id)
+            invite_start_dt = _compute_invite_start_dt(instance, config.get_invitation_start_timing())
+            # Only trigger now if the invitation window has already opened
+            if invite_start_dt is None or datetime.utcnow() >= invite_start_dt:
+                try:
+                    notified_players = trigger_invitations(instance, coach.id) or []
+                except Exception:
+                    from padel_app.sql_db import db
+                    db.session.rollback()
+            # else: the scheduled invite_start job will fire at the right time
 
     return jsonify({
         "presences": [serialize_presence(p) for p in presences],

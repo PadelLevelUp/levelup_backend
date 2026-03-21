@@ -31,6 +31,9 @@ from .Association_CoachExerciseGroup import Association_CoachExerciseGroup
 from .lesson_instance_training import LessonInstanceTraining
 from .notification_config import NotificationConfig
 from .notification_event import NotificationEvent
+from .vacancy import Vacancy
+from .waiting_list_entry import WaitingListEntry
+from .standing_waiting_list_entry import StandingWaitingListEntry
 
 MODELS = {
     "tokenblocklist": TokenBlocklist,
@@ -67,4 +70,7 @@ MODELS = {
     "lesson_instance_training": LessonInstanceTraining,
     "notificationconfig": NotificationConfig,
     "notificationevent": NotificationEvent,
+    "vacancy": Vacancy,
+    "waitinglistentry": WaitingListEntry,
+    "standingwaitinglistentry": StandingWaitingListEntry,
 }

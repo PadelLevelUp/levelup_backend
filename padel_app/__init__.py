@@ -109,6 +109,9 @@ def create_app(test_config=None):
     sql_db.init_db(app)
     cli.register_cli(app)
 
+    from .scheduler import init_scheduler
+    init_scheduler(app, test_config=test_config)
+
     @app.teardown_appcontext
     def shutdown_session(exception=None):
         sql_db.db.session.remove()

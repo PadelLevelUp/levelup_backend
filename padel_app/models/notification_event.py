@@ -25,10 +25,13 @@ class NotificationEvent(db.Model, model.Model):
     )
     # The conversation message that delivered this invite (nullable for older/auto events)
     message_id = Column(Integer, ForeignKey("messages.id", ondelete="SET NULL"), nullable=True)
+    # The vacancy this invitation belongs to (nullable for manual notifications and legacy rows)
+    vacancy_id = Column(Integer, ForeignKey("vacancies.id", ondelete="CASCADE"), nullable=True)
 
     lesson_instance = relationship("LessonInstance")
     player = relationship("Player")
     coach = relationship("Coach")
+    vacancy = relationship("Vacancy", back_populates="notification_events")
 
     @property
     def name(self):
