@@ -7,6 +7,9 @@ class Config:
 
     SQLALCHEMY_TRACK_MODIFICATIONS = False
     TEMPLATES_AUTO_RELOAD = True
+    # Pre-ping validates each connection before use — ensures stale connections
+    # (e.g. after the test DB is dropped and recreated) are replaced automatically.
+    SQLALCHEMY_ENGINE_OPTIONS = {"pool_pre_ping": True}
 
     # Database
     POSTGRES_USER = os.getenv("POSTGRES_USER", "padel_app_user")

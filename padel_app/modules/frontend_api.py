@@ -631,14 +631,15 @@ def confirm_presences():
         if instance and instance.start_datetime > datetime.utcnow():
             config = get_or_create_config(coach.id)
             invite_start_dt = _compute_invite_start_dt(instance, config.get_invitation_start_timing())
-            # Only trigger now if the invitation window has already opened
+            # Only send invitations if the invitation window has opened.
+            # If not yet open, the invite_start scheduler job will call trigger_invitations
+            # at the configured time, which will find the absent presences and invite.
             if invite_start_dt is None or datetime.utcnow() >= invite_start_dt:
                 try:
                     notified_players = trigger_invitations(instance, coach.id) or []
                 except Exception:
                     from padel_app.sql_db import db
                     db.session.rollback()
-            # else: the scheduled invite_start job will fire at the right time
 
     return jsonify({
         "presences": [serialize_presence(p) for p in presences],

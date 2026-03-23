@@ -121,9 +121,8 @@ def update_config(coach_id: int, data: dict) -> NotificationConfig:
 
     if timing_changed:
         try:
-            from flask import current_app
             from padel_app.scheduler import reschedule_all_future_jobs
-            reschedule_all_future_jobs(current_app._get_current_object(), coach_id)
+            reschedule_all_future_jobs(coach_id)
         except Exception:
             pass  # scheduler may not be running (tests, etc.)
 
@@ -697,14 +696,35 @@ def send_class_reminders(instance_id: int, *, now: datetime | None = None) -> No
     """
     from padel_app.models import Coach
 
+    from flask import current_app, has_app_context
+    _log = current_app.logger if has_app_context() else None
+
     _now = now or datetime.utcnow()
 
     instance = LessonInstance.query.get(instance_id)
     if not instance:
+        if _log:
+            _log.warning("send_class_reminders: instance %s not found — skipping", instance_id)
         return
     if instance.status in ("canceled", "completed"):
+        if _log:
+            _log.info("send_class_reminders: instance %s status=%s — skipping", instance_id, instance.status)
         return
     if instance.start_datetime <= _now:
+        if _log:
+            _log.info("send_class_reminders: instance %s start_datetime in the past — skipping", instance_id)
+        return
+
+    player_count = len(list(instance.players_relations))
+    if _log:
+        _log.info(
+            "send_class_reminders: instance=%s start=%s players=%d — sending",
+            instance_id, instance.start_datetime, player_count,
+        )
+
+    if player_count == 0:
+        if _log:
+            _log.info("send_class_reminders: instance %s has no enrolled players — nothing to send", instance_id)
         return
 
     # Find the coach for this instance
@@ -712,6 +732,8 @@ def send_class_reminders(instance_id: int, *, now: datetime | None = None) -> No
         lesson_instance_id=instance_id
     ).first()
     if not coach_rel:
+        if _log:
+            _log.warning("send_class_reminders: instance %s has no coach association — skipping", instance_id)
         return
 
     coach = Coach.query.get(coach_rel.coach_id)
@@ -803,10 +825,35 @@ def respond_to_reminder(
     config = get_or_create_config(coach.id) if coach else None
     templates = config.get_message_templates() if config else DEFAULT_MESSAGE_TEMPLATES
 
+    # Mark the reminder message as responded so the frontend shows the badge on reload
+    if coach_user_id:
+        from padel_app.models import Message
+        from padel_app.serializers.message import serialize_message
+        conv = _get_or_create_direct_conversation(coach_user_id, acting_user_id)
+        recent_reminders = Message.query.filter_by(
+            conversation_id=conv.id,
+            message_type="notification_reminder",
+        ).order_by(Message.id.desc()).all()
+        reminder_msg = next(
+            (m for m in recent_reminders
+             if m.msg_metadata
+             and m.msg_metadata.get("lessonInstanceId") == lesson_instance_id
+             and not m.msg_metadata.get("responded")),
+            None,
+        )
+        if reminder_msg:
+            reminder_msg.msg_metadata = {
+                **reminder_msg.msg_metadata,
+                "responded": True,
+                "response": action,
+            }
+            reminder_msg.save()
+            publish({"type": "message_edited", "payload": serialize_message(reminder_msg, None)})
+
     if action == "yes":
         if presence:
             presence.confirmed = True
-            presence.status = "present"
+            # status intentionally not set — only the coach marks someone as present
             presence.save()
         if coach_user_id:
             _send_system_message(
@@ -820,6 +867,7 @@ def respond_to_reminder(
         if presence:
             presence.confirmed = True
             presence.status = "absent"
+            presence.justification = "justified"
             presence.save()
         if coach_user_id:
             _send_system_message(
@@ -828,13 +876,15 @@ def respond_to_reminder(
                 templates.get("reminder_decline", DEFAULT_MESSAGE_TEMPLATES["reminder_decline"]),
             )
 
-        # If invitation start has already passed, trigger invitations immediately
+        # Always pre-create vacancy so the invite_start job finds it when window opens.
+        # If the invitation window is already open, trigger invitations immediately.
         if coach and config:
             from padel_app.scheduler import _compute_invite_start_dt
+            _ensure_vacancy_for_player(instance, coach.id, player.id)
             invite_start_dt = _compute_invite_start_dt(instance, config.get_invitation_start_timing())
             _now = now or datetime.utcnow()
             if invite_start_dt is None or _now >= invite_start_dt:
-                _trigger_vacancy_for_player(instance, coach.id, player.id)
+                trigger_invitations(instance, coach.id)
 
         return {"action": "declined"}
 
@@ -856,6 +906,23 @@ def _trigger_vacancy_for_player(
     if not existing:
         _create_vacancy_for_absent_player(instance, coach_id, player_id)
     trigger_invitations(instance, coach_id)
+
+
+def _ensure_vacancy_for_player(
+    instance: LessonInstance,
+    coach_id: int,
+    player_id: int,
+) -> None:
+    """Create a vacancy for an absent player without triggering invitations.
+    Used when the invitation window hasn't opened yet — the invite_start scheduler
+    job will call trigger_invitations when the window opens."""
+    existing = Vacancy.query.filter_by(
+        lesson_instance_id=instance.id,
+        original_player_id=player_id,
+        status="open",
+    ).first()
+    if not existing:
+        _create_vacancy_for_absent_player(instance, coach_id, player_id)
 
 
 # ---------------------------------------------------------------------------

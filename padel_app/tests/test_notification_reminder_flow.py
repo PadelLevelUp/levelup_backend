@@ -288,7 +288,7 @@ class TestSendClassRemindersIntegration:
 class TestRespondToReminder:
 
     def test_yes_response_confirms_presence(self, app):
-        """Responding 'yes' sets presence.status='present' and presence.confirmed=True."""
+        """Responding 'yes' sets confirmed=True but does NOT set status — coach controls presence."""
         from padel_app.models.presences import Presence
         from padel_app.services.notification_service import respond_to_reminder
 
@@ -308,17 +308,34 @@ class TestRespondToReminder:
             updated = Presence.query.filter_by(
                 lesson_instance_id=instance_id, player_id=ids["student_id"]
             ).first()
-            assert updated.status == "present"
+            assert updated.status is None  # coach has not marked them present yet
             assert updated.confirmed is True
 
-    def test_no_response_marks_absent(self, app):
-        """Responding 'no' sets presence.status='absent' and presence.confirmed=True."""
+    def test_yes_response_does_not_create_vacancy(self, app):
+        """Responding 'yes' should not create a Vacancy — no spot has opened."""
         from padel_app.models.presences import Presence
-        from padel_app.services.notification_service import respond_to_reminder
         from padel_app.models.vacancy import Vacancy
+        from padel_app.services.notification_service import respond_to_reminder
 
         ids = _seed_coach_and_student(app)
-        # Place class far enough in future so invite start has NOT passed (48h before, invite start 24h before)
+        instance_id = _seed_instance(app, ids["coach_id"], ids["student_id"])
+
+        with app.app_context():
+            p = Presence(lesson_instance_id=instance_id, player_id=ids["student_id"],
+                         invited=True, confirmed=False)
+            p.create()
+
+            with patch(PATCHES[0]), patch(PATCHES[1]):
+                respond_to_reminder(instance_id, "yes", ids["student_user_id"])
+
+            assert Vacancy.query.filter_by(lesson_instance_id=instance_id).count() == 0
+
+    def test_no_response_marks_absent(self, app):
+        """Responding 'no' sets status='absent', justification='justified', confirmed=True."""
+        from padel_app.models.presences import Presence
+        from padel_app.services.notification_service import respond_to_reminder
+
+        ids = _seed_coach_and_student(app)
         instance_id = _seed_instance(app, ids["coach_id"], ids["student_id"], start_offset_hours=96)
 
         with app.app_context():
@@ -326,26 +343,28 @@ class TestRespondToReminder:
                          invited=True, confirmed=False)
             p.create()
 
-            # now = 72h before class → invite start (24h before) has NOT passed
-            now = datetime.utcnow()
             with patch(PATCHES[0]), patch(PATCHES[1]):
-                result = respond_to_reminder(instance_id, "no", ids["student_user_id"], now=now)
+                result = respond_to_reminder(instance_id, "no", ids["student_user_id"])
 
             assert result["action"] == "declined"
             updated = Presence.query.filter_by(
                 lesson_instance_id=instance_id, player_id=ids["student_id"]
             ).first()
             assert updated.status == "absent"
+            assert updated.justification == "justified"
             assert updated.confirmed is True
 
-    def test_no_response_before_invite_start_does_not_create_vacancy(self, app):
-        """Declining a reminder before invitation start time should NOT create a Vacancy."""
+    def test_no_response_always_creates_vacancy(self, app):
+        """Declining before the invitation window opens creates a Vacancy immediately
+        (so the invite_start scheduler job finds it when the window opens) but does NOT
+        send invitations yet."""
         from padel_app.models.presences import Presence
         from padel_app.models.vacancy import Vacancy
+        from padel_app.models.notification_event import NotificationEvent
         from padel_app.services.notification_service import respond_to_reminder
 
         ids = _seed_coach_and_student(app)
-        # Class is 96h away; default invite start is 24h before, so invite start is 72h away
+        # Class is 96h away; default invite start is 24h before — window is still 72h away
         instance_id = _seed_instance(app, ids["coach_id"], ids["student_id"], start_offset_hours=96)
 
         with app.app_context():
@@ -353,13 +372,15 @@ class TestRespondToReminder:
                          invited=True, confirmed=False)
             p.create()
 
-            # now = current time → invite start is still 72h away → should NOT trigger vacancy
-            now = datetime.utcnow()
             with patch(PATCHES[0]), patch(PATCHES[1]):
-                respond_to_reminder(instance_id, "no", ids["student_user_id"], now=now)
+                respond_to_reminder(instance_id, "no", ids["student_user_id"])
 
+            # Vacancy is pre-created so the scheduler job finds it when the window opens
             vacancy_count = Vacancy.query.filter_by(lesson_instance_id=instance_id).count()
-            assert vacancy_count == 0
+            assert vacancy_count >= 1
+            # But no invitations were sent yet (window not open)
+            event_count = NotificationEvent.query.filter_by(lesson_instance_id=instance_id).count()
+            assert event_count == 0
 
     def test_no_response_after_invite_start_creates_vacancy(self, app):
         """Declining after invitation start has passed should create a Vacancy immediately."""

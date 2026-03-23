@@ -82,14 +82,8 @@ def get_or_materialize_instance(lesson: Lesson, date):
     instance.save()
 
     # Schedule reminder + invitation-start jobs for this new instance
-    try:
-        from flask import current_app
-        from padel_app.scheduler import schedule_instance_jobs
-        if lesson.coaches_relations:
-            coach_id = lesson.coaches_relations[0].coach_id
-            schedule_instance_jobs(current_app._get_current_object(), instance.id, coach_id)
-    except Exception:
-        pass  # scheduler may not be running (tests, CLI, etc.)
+    from padel_app.scheduler import _maybe_schedule_instance
+    _maybe_schedule_instance(instance)
 
     # Fan out standing waiting list entries to this new instance
     # Use a SAVEPOINT so any DB failure (e.g. migration not yet run) doesn't
@@ -208,6 +202,10 @@ def edit_lesson_instance_helper(data, lesson_instance=None):
         ).first()
         if presence:
             presence.delete()
+
+    # Reschedule reminder/invite jobs — start_datetime may have changed
+    from padel_app.scheduler import _maybe_schedule_instance
+    _maybe_schedule_instance(lesson_instance)
 
     return lesson_instance
 
@@ -380,7 +378,9 @@ def delete_future_instances(lesson, cutoff):
         LessonInstance.lesson_id == lesson.id,
         LessonInstance.start_datetime >= cutoff,
     ).all()
+    from padel_app.scheduler import _maybe_cancel_instance
     for instance in instances:
+        _maybe_cancel_instance(instance.id)
         instance.delete()
     return True
 
@@ -474,6 +474,11 @@ def add_class_service(data, coach, club):
         lesson.notifications_enabled = data["notificationsEnabled"]
         lesson.save()
 
+    # Schedule reminder jobs for all upcoming occurrences within the 60-day horizon
+    if lesson.coaches_relations:
+        from padel_app.scheduler import schedule_lesson_reminder_jobs
+        schedule_lesson_reminder_jobs(lesson.id, lesson.coaches_relations[0].coach_id)
+
     return lesson
 
 
@@ -502,12 +507,8 @@ def update_lesson_status_service(lesson_id, data):
 
     # Cancel scheduled notification jobs when a class is canceled
     if data.get("status") == "canceled":
-        try:
-            from flask import current_app
-            from padel_app.scheduler import cancel_instance_jobs
-            cancel_instance_jobs(current_app._get_current_object(), instance.id)
-        except Exception:
-            pass
+        from padel_app.scheduler import _maybe_cancel_instance
+        _maybe_cancel_instance(instance.id)
 
     return instance
 
@@ -653,10 +654,16 @@ def edit_class_service(data):
         if notifications_enabled is not None:
             instance.notifications_enabled = notifications_enabled
             instance.save()
+        # Schedule reminder/invite jobs for this newly materialized instance
+        from padel_app.scheduler import _maybe_schedule_instance
+        _maybe_schedule_instance(instance)
         return {"id": instance.id}, 201
 
     if scope == "future":
         _ensure_date(payload, event_date)
+        # Cancel old lesson occurrence jobs from event_date before the split
+        from padel_app.scheduler import cancel_lesson_reminder_jobs, schedule_lesson_reminder_jobs
+        cancel_lesson_reminder_jobs(lesson.id, from_date=event_date)
         lesson_to_edit, _ = _apply_future_edit_to_lesson(
             lesson=lesson,
             event_date=event_date,
@@ -666,6 +673,9 @@ def edit_class_service(data):
         if notifications_enabled is not None:
             lesson_to_edit.notifications_enabled = notifications_enabled
             lesson_to_edit.save()
+        # Schedule reminder jobs for the resulting lesson (may be same or new)
+        if lesson_to_edit.coaches_relations:
+            schedule_lesson_reminder_jobs(lesson_to_edit.id, lesson_to_edit.coaches_relations[0].coach_id)
         return {"id": lesson_to_edit.id}, 201
 
     return {"error": "Invalid scope"}, 400
@@ -679,13 +689,22 @@ def _truncate_lesson_future(*, lesson, from_date):
     lesson.recurrence_end = from_date - timedelta(days=1)
     lesson.save()
     delete_future_instances(lesson, from_date)
+    # Cancel lesson-level reminder jobs for occurrences that no longer exist
+    from padel_app.scheduler import cancel_lesson_reminder_jobs
+    cancel_lesson_reminder_jobs(lesson.id, from_date=from_date)
 
 
 def _remove_single_occurrence_from_lesson(*, lesson, date):
+    from padel_app.scheduler import cancel_lesson_occurrence_job
+    cancel_lesson_occurrence_job(lesson.id, date.isoformat())
     if not lesson.recurrence_rule:
         lesson.delete()
         return
-    split_lesson(lesson, date, remove_current_date=True)
+    _, new_lesson = split_lesson(lesson, date, remove_current_date=True)
+    # Schedule reminder jobs for the new lesson (post-split occurrences)
+    if new_lesson and new_lesson.coaches_relations:
+        from padel_app.scheduler import schedule_lesson_reminder_jobs
+        schedule_lesson_reminder_jobs(new_lesson.id, new_lesson.coaches_relations[0].coach_id)
 
 
 def remove_class_service(data):
@@ -710,13 +729,17 @@ def remove_class_service(data):
 
     obj = models_map[model_name].query.get_or_404(class_id)
 
+    from padel_app.scheduler import _maybe_cancel_instance
+
     if model_name == "LessonInstance":
         if scope == "single" or not scope:
+            _maybe_cancel_instance(obj.id)
             obj.delete()
             return {"status": "deleted"}, 200
 
         if scope == "future":
             parent_lesson = obj.lesson
+            _maybe_cancel_instance(obj.id)
             obj.delete()
             delete_future_instances(parent_lesson, event_date)
             _truncate_lesson_future(lesson=parent_lesson, from_date=event_date)
