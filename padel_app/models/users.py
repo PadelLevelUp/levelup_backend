@@ -20,6 +20,7 @@ class User(db.Model, model.Model, UserMixin):
     phone = Column(String(20), nullable=True)
     password = Column(String(255), nullable=True)
     is_admin = Column(Boolean, default=False, nullable=False)
+    is_superadmin = Column(Boolean, default=False, nullable=False)
     generated_code = Column(Integer)
 
     user_image_id = Column(Integer, ForeignKey("images.id", ondelete="SET NULL"))
@@ -58,6 +59,7 @@ class User(db.Model, model.Model, UserMixin):
             {"field": "name", "label": "Name"},
             {"field": "email", "label": "Email"},
             {"field": "is_admin", "label": "Admin"},
+            {"field": "is_superadmin", "label": "Super Admin"},
             {"field": "generated_code", "label": "Generated Code"},
         ]
         return searchable, fields
@@ -92,6 +94,7 @@ class User(db.Model, model.Model, UserMixin):
                 get_field("phone", "Phone", "Text", required=False),
                 get_field("password", "Password", "Password", required=True),
                 get_field("is_admin", "Admin", "Boolean"),
+                get_field("is_superadmin", "Super Admin", "Boolean"),
                 get_field("generated_code", "Generated Code", "Integer"),
                 get_field("status", type="Select", label="Status", options=["inactive", "active", "disabled"]),
             ],

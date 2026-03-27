@@ -54,4 +54,5 @@ def me():
         "name": user.name,
         "roles": ["coach"] if user.coach else ["player"],
         "coachId": user.coach.id if user.coach else None,
+        "isSuperAdmin": user.is_superadmin,
     })

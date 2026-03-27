@@ -17,7 +17,7 @@ from openai import AuthenticationError, OpenAI
 
 _BASE_URL = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
 _API_KEY = os.environ.get("OPENROUTER_API_KEY") or os.environ.get("OPENAI_API_KEY", "")
-_MODEL = os.environ.get("OPENROUTER_MODEL", "arcee-ai/trinity-large-preview:free")
+_MODEL = os.environ.get("OPENROUTER_MODEL", "inception/mercury-2")
 _REASONING = os.environ.get("OPENROUTER_REASONING_ENABLED", "true").lower() in {
     "1", "true", "yes", "on",
 }

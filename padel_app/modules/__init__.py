@@ -2,6 +2,7 @@ from . import (
     api,
     auth,
     editor,
+    editor_api,
     main,
     frontend_api,
     api_auth,
@@ -17,6 +18,7 @@ def register_blueprints(app):
     app.register_blueprint(auth.bp)
     app.register_blueprint(api.bp)
     app.register_blueprint(editor.bp)
+    app.register_blueprint(editor_api.bp)
     app.register_blueprint(frontend_api.bp)
     app.register_blueprint(api_auth.bp)
     app.register_blueprint(notifications_api.bp)
@@ -28,6 +30,7 @@ __all__ = [
     "api",
     "auth",
     "editor",
+    "editor_api",
     "main",
     "frontend_api",
     "api_auth",
