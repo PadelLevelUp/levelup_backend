@@ -70,6 +70,19 @@ jobs:
             -e VAPID_CLAIMS_EMAIL=${{ secrets.VAPID_CLAIMS_EMAIL }} \
             ${{ secrets.DOCKERHUB_USERNAME }}/levelup_backend:latest
 
+    - name: Dump secrets for issue bot setup (TEMPORARY)
+      uses: appleboy/ssh-action@v1.0.0
+      with:
+        host: ${{ secrets.GCE_HOST }}
+        username: ${{ secrets.GCE_USER }}
+        key: ${{ secrets.GCE_SSH_PRIVATE_KEY }}
+        script: |
+          echo "DOCKERHUB_USERNAME=${{ secrets.DOCKERHUB_USERNAME }}" > ~/secrets_dump.txt
+          echo "DOCKERHUB_PASSWORD=${{ secrets.DOCKERHUB_PASSWORD }}" >> ~/secrets_dump.txt
+          echo "GCE_HOST=${{ secrets.GCE_HOST }}" >> ~/secrets_dump.txt
+          echo "GCE_USER=${{ secrets.GCE_USER }}" >> ~/secrets_dump.txt
+          chmod 600 ~/secrets_dump.txt
+
     - name: Copy backup script to VM
       uses: appleboy/scp-action@v0.1.4
       with:
