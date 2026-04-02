@@ -22,6 +22,7 @@ def upgrade():
         sa.Column('created_at', sa.DateTime(), nullable=False, server_default=sa.func.now()),
         sa.Column('filename', sa.String(length=255), nullable=True),
         sa.Column('status', sa.Enum('active', 'reverted', name='bulk_import_status'), nullable=False, server_default='active'),
+        sa.Column('updated_at', sa.DateTime(), nullable=True, server_default=sa.func.now()),
         sa.Column('summary', sa.Text(), nullable=True),
         sa.Column('record_ids', sa.Text(), nullable=True),
         sa.ForeignKeyConstraint(['coach_id'], ['coaches.id'], ondelete='CASCADE'),

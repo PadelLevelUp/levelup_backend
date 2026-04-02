@@ -15,7 +15,6 @@ class BulkImport(db.Model, model.Model):
 
     id = Column(Integer, primary_key=True)
     coach_id = Column(Integer, ForeignKey("coaches.id", ondelete="CASCADE"), nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     filename = Column(String(255), nullable=True)
     status = Column(
         Enum("active", "reverted", name="bulk_import_status"),
