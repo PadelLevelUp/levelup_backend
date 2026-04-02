@@ -311,12 +311,25 @@ def coach_players_paginated():
     page = request.args.get("page", default=1, type=int)
     per_page = request.args.get("per_page", default=25, type=int)
     search = request.args.get("search", default=None, type=str)
+    sort_by = request.args.get("sort_by", default="name", type=str)
+    sort_dir = request.args.get("sort_dir", default="asc", type=str)
+    missing_level = request.args.get("missing_level", default="", type=str) == "true"
+    missing_side = request.args.get("missing_side", default="", type=str) == "true"
+
     page = max(1, page or 1)
     per_page = max(1, min(100, per_page or 25))
     if search:
         search = search.strip() or None
+    if sort_by not in ("name", "level"):
+        sort_by = "name"
+    if sort_dir not in ("asc", "desc"):
+        sort_dir = "asc"
 
-    result = get_coach_players_paginated(coach, page=page, per_page=per_page, search=search)
+    result = get_coach_players_paginated(
+        coach, page=page, per_page=per_page, search=search,
+        sort_by=sort_by, sort_dir=sort_dir,
+        missing_level=missing_level, missing_side=missing_side,
+    )
     return jsonify(result)
 
 

@@ -5,6 +5,7 @@ from padel_app.models import (
     PlayerLevelHistory,
 )
 from sqlalchemy.orm import joinedload
+from sqlalchemy import func, case
 from padel_app.tools.request_adapter import JsonRequestAdapter
 
 
@@ -116,7 +117,8 @@ def get_players_list(coach, club):
 def _serialize_coach_player_relation(rel):
     player = rel.player
     user = player.user if player else None
-    return {
+    level = rel.level if rel.level_id else None
+    result = {
         "id": f"p-{rel.player_id}_c-{rel.coach_id}",
         "coachId": rel.coach_id,
         "playerId": rel.player_id,
@@ -130,6 +132,15 @@ def _serialize_coach_player_relation(rel):
         "userId": player.user_id if player else None,
         "isActive": user.status == "active" if user else False,
     }
+    if level:
+        result["level"] = {
+            "id": str(level.id),
+            "coachId": level.coach_id,
+            "code": level.code,
+            "label": level.label,
+            "displayOrder": level.display_order,
+        }
+    return result
 
 
 def get_coach_players_list(coach):
@@ -144,19 +155,53 @@ def get_coach_players_list(coach):
     return [_serialize_coach_player_relation(rel) for rel in relations]
 
 
-def get_coach_players_paginated(coach, page=1, per_page=25, search=None):
+def get_coach_players_paginated(coach, page=1, per_page=25, search=None,
+                                sort_by="name", sort_dir="asc",
+                                missing_level=False, missing_side=False):
+    from padel_app.models.coach_levels import CoachLevel
+
     query = (
         Association_CoachPlayer.query.options(
-            joinedload(Association_CoachPlayer.player).joinedload(Player.user)
+            joinedload(Association_CoachPlayer.player).joinedload(Player.user),
+            joinedload(Association_CoachPlayer.level),
         )
         .filter_by(coach_id=coach.id)
     )
+
+    # Always join Player/User for sorting and filtering
+    query = query.join(Association_CoachPlayer.player).join(Player.user)
+
     if search:
-        query = query.join(Association_CoachPlayer.player).join(Player.user).filter(
-            User.name.ilike(f"%{search}%")
-        )
-    query = query.order_by(Association_CoachPlayer.id.desc())
+        query = query.filter(User.name.ilike(f"%{search}%"))
+
+    # Alert-based filters
+    if missing_level:
+        query = query.filter(Association_CoachPlayer.level_id.is_(None))
+    if missing_side:
+        query = query.filter(Association_CoachPlayer.side.is_(None))
+
+    # Sorting
+    if sort_by == "level":
+        query = query.outerjoin(CoachLevel, Association_CoachPlayer.level_id == CoachLevel.id)
+        # Use case() to push NULLs last (portable across SQLite and PostgreSQL)
+        null_last = case((CoachLevel.display_order.is_(None), 1), else_=0)
+        if sort_dir == "desc":
+            query = query.order_by(null_last, CoachLevel.display_order.desc(), User.name.asc())
+        else:
+            query = query.order_by(null_last, CoachLevel.display_order.asc(), User.name.asc())
+    else:
+        if sort_dir == "desc":
+            query = query.order_by(User.name.desc())
+        else:
+            query = query.order_by(User.name.asc())
+
     pagination = query.paginate(page=page, per_page=per_page, error_out=False)
+
+    # Compute alert counts across ALL coach players (not just current page)
+    base_query = Association_CoachPlayer.query.filter_by(coach_id=coach.id)
+    missing_level_count = base_query.filter(Association_CoachPlayer.level_id.is_(None)).count()
+    missing_side_count = base_query.filter(Association_CoachPlayer.side.is_(None)).count()
+
     return {
         "items": [_serialize_coach_player_relation(rel) for rel in pagination.items],
         "pagination": {
@@ -166,6 +211,10 @@ def get_coach_players_paginated(coach, page=1, per_page=25, search=None):
             "pages": pagination.pages,
             "hasNext": pagination.has_next,
             "hasPrev": pagination.has_prev,
+        },
+        "alerts": {
+            "missingLevel": missing_level_count,
+            "missingSide": missing_side_count,
         },
     }
 
