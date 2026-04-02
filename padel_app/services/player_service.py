@@ -144,14 +144,18 @@ def get_coach_players_list(coach):
     return [_serialize_coach_player_relation(rel) for rel in relations]
 
 
-def get_coach_players_paginated(coach, page=1, per_page=25):
+def get_coach_players_paginated(coach, page=1, per_page=25, search=None):
     query = (
         Association_CoachPlayer.query.options(
             joinedload(Association_CoachPlayer.player).joinedload(Player.user)
         )
         .filter_by(coach_id=coach.id)
-        .order_by(Association_CoachPlayer.id.desc())
     )
+    if search:
+        query = query.join(Association_CoachPlayer.player).join(Player.user).filter(
+            User.name.ilike(f"%{search}%")
+        )
+    query = query.order_by(Association_CoachPlayer.id.desc())
     pagination = query.paginate(page=page, per_page=per_page, error_out=False)
     return {
         "items": [_serialize_coach_player_relation(rel) for rel in pagination.items],
