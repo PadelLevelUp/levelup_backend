@@ -233,7 +233,7 @@ def dashboard():
 
 @bp.get("/conversations")
 @jwt_required()
-def conversations():
+def get_conversations():
     user = current_user()
     if not user.id:
         abort(400, "user_id is required")
@@ -270,7 +270,7 @@ def coach_detail():
 
 @bp.get("/players")
 @jwt_required()
-def players():
+def get_players():
     coach = current_coach()
     club = current_club()
     player_list = get_players_list(coach, club)
@@ -289,7 +289,7 @@ def players():
 
 @bp.get("/users")
 @jwt_required()
-def users():
+def get_users():
     users = User.query.filter_by(status="active").all()
     return jsonify([serialize_user(u) for u in users])
 
@@ -319,13 +319,13 @@ def coach_players_paginated():
 
 @bp.get("/coach_levels")
 @jwt_required()
-def coach_levels():
+def get_coach_levels():
     coach = current_coach()
     return jsonify([serialize_coach_level(l) for l in coach.levels])
 
 
 @bp.get("/lessons")
-def lessons():
+def get_lessons():
     return jsonify([serialize_lesson(lesson) for lesson in Lesson.query.all()])
 
 
@@ -345,7 +345,7 @@ def evaluation_categories():
 
 @bp.get("/lesson_instances")
 @jwt_required()
-def lesson_instances():
+def get_lesson_instances():
     start = request.args.get("from")
     end = request.args.get("to")
     coach = current_coach()
@@ -399,6 +399,26 @@ def class_instance():
         abort(400, "model is required")
 
     current_class = event_types[model].query.get_or_404(id)
+
+    if model == "lesson":
+        date_str = request.args.get("date")
+        if date_str:
+            try:
+                event_date = parser.isoparse(date_str).date()
+            except (TypeError, ValueError):
+                abort(400, "date must be an ISO date")
+
+            instance = (
+                LessonInstance.query
+                .filter_by(
+                    lesson_id=current_class.id,
+                    original_lesson_occurence_date=event_date,
+                )
+                .first()
+            )
+            if instance is not None:
+                current_class = instance
+
     return jsonify(serialize_class_instance(current_class))
 
 
