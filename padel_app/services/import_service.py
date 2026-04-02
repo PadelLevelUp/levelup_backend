@@ -48,8 +48,11 @@ def _apply_form(form, payload, element):
     return element
 
 
-def _ok(imported, errors):
-    return {"imported": imported, "errors": errors}
+def _ok(imported, errors, created_ids=None):
+    result = {"imported": imported, "errors": errors}
+    if created_ids is not None:
+        result["created_ids"] = created_ids
+    return result
 
 
 def _sanitize_email_part(value):
@@ -116,6 +119,7 @@ def bulk_create_coach_levels(rows, coach):
     """Find-or-create coach levels. Uniqueness key: (coach, code)."""
     imported = 0
     errors = []
+    created_ids = {"coach_levels": []}
 
     for i, row in enumerate(rows):
         try:
@@ -141,13 +145,14 @@ def bulk_create_coach_levels(rows, coach):
             level = CoachLevel()
             _apply_form(level.get_create_form(), payload, level)
             level.create()
+            created_ids["coach_levels"].append(level.id)
             imported += 1
 
         except Exception as e:
             db.session.rollback()
             errors.append({"row": i, "data": row, "error": str(e)})
 
-    return _ok(imported, errors)
+    return _ok(imported, errors, created_ids)
 
 
 # ---------------------------------------------------------------------------
@@ -158,6 +163,7 @@ def bulk_create_evaluation_categories(rows, coach):
     """Find-or-create evaluation categories. Uniqueness key: (coach, name)."""
     imported = 0
     errors = []
+    created_ids = {"evaluation_categories": []}
 
     for i, row in enumerate(rows):
         try:
@@ -183,13 +189,14 @@ def bulk_create_evaluation_categories(rows, coach):
             category = EvaluationCategory()
             _apply_form(category.get_create_form(), payload, category)
             category.create()
+            created_ids["evaluation_categories"].append(category.id)
             imported += 1
 
         except Exception as e:
             db.session.rollback()
             errors.append({"row": i, "data": row, "error": str(e)})
 
-    return _ok(imported, errors)
+    return _ok(imported, errors, created_ids)
 
 
 # ---------------------------------------------------------------------------
@@ -218,6 +225,7 @@ def bulk_create_players(rows, coach, club):
     """
     imported = 0
     errors = []
+    created_ids = {"users": [], "players": [], "coach_players": [], "player_level_history": []}
 
     levels_by_code = {lvl.code: lvl for lvl in coach.levels}
 
@@ -236,6 +244,7 @@ def bulk_create_players(rows, coach, club):
                 if not player:
                     player = Player(user_id=existing_user.id)
                     player.create()
+                    created_ids["players"].append(player.id)
 
                 # Check if the coach↔player association already exists.
                 rel = Association_CoachPlayer.query.filter_by(
@@ -256,13 +265,16 @@ def bulk_create_players(rows, coach, club):
                 rel = Association_CoachPlayer()
                 _apply_form(rel.get_create_form(), rel_payload, rel)
                 rel.create()
+                created_ids["coach_players"].append(rel.id)
 
                 if level:
-                    PlayerLevelHistory(
+                    plh = PlayerLevelHistory(
                         coach_id=coach.id,
                         player_id=player.id,
                         level_id=level.id,
-                    ).create()
+                    )
+                    plh.create()
+                    created_ids["player_level_history"].append(plh.id)
 
             else:
                 # Full creation: User + Player + Association_CoachPlayer.
@@ -281,6 +293,17 @@ def bulk_create_players(rows, coach, club):
                     },
                 }
                 create_player_helper(payload)
+                # Look up the newly created records
+                new_user = User.query.filter_by(email=email).first()
+                if new_user:
+                    created_ids["users"].append(new_user.id)
+                    if new_user.player:
+                        created_ids["players"].append(new_user.player.id)
+                        cp = Association_CoachPlayer.query.filter_by(
+                            coach_id=coach.id, player_id=new_user.player.id
+                        ).first()
+                        if cp:
+                            created_ids["coach_players"].append(cp.id)
 
             imported += 1
 
@@ -295,7 +318,7 @@ def bulk_create_players(rows, coach, club):
             db.session.rollback()
             errors.append({"row": i, "data": row, "error": str(e)})
 
-    return _ok(imported, errors)
+    return _ok(imported, errors, created_ids)
 
 
 # ---------------------------------------------------------------------------
@@ -315,6 +338,7 @@ def bulk_create_lessons(rows, coach, club):
 
     imported = 0
     errors = []
+    created_ids = {"lessons": []}
 
     # Build an in-memory set of existing lesson titles for this coach.
     existing_titles = {rel.lesson.title for rel in coach.lessons_relations}
@@ -347,6 +371,11 @@ def bulk_create_lessons(rows, coach, club):
                 "coach": coach.id,
             }
             create_lesson_helper(payload)
+            # Look up the newly created lesson
+            from padel_app.models import Lesson as LessonModel
+            new_lesson = LessonModel.query.filter_by(title=title, club_id=club.id).first()
+            if new_lesson:
+                created_ids["lessons"].append(new_lesson.id)
             existing_titles.add(title)  # Prevent duplicate within the same batch.
             imported += 1
 
@@ -354,7 +383,7 @@ def bulk_create_lessons(rows, coach, club):
             db.session.rollback()
             errors.append({"row": i, "data": row, "error": str(e)})
 
-    return _ok(imported, errors)
+    return _ok(imported, errors, created_ids)
 
 
 # ---------------------------------------------------------------------------
@@ -371,6 +400,7 @@ def bulk_create_player_lesson_associations(rows, coach):
     """
     imported = 0
     errors = []
+    created_ids = {"player_lessons": []}
 
     # Build lookups scoped to this coach.
     lessons_by_title = {}
@@ -403,17 +433,19 @@ def bulk_create_player_lesson_associations(rows, coach):
             if existing:
                 continue
 
-            Association_PlayerLesson(
+            apl = Association_PlayerLesson(
                 lesson_id=lesson.id,
                 player_id=player.id,
-            ).create()
+            )
+            apl.create()
+            created_ids["player_lessons"].append(apl.id)
             imported += 1
 
         except Exception as e:
             db.session.rollback()
             errors.append({"row": i, "data": row, "error": str(e)})
 
-    return _ok(imported, errors)
+    return _ok(imported, errors, created_ids)
 
 
 # ---------------------------------------------------------------------------
@@ -434,6 +466,7 @@ def bulk_create_presences(rows, coach):
     """
     imported = 0
     errors = []
+    created_ids = {"presences": []}
 
     lessons_by_title = {}
     for rel in coach.lessons_relations:
@@ -481,7 +514,7 @@ def bulk_create_presences(rows, coach):
                 existing.validated = True
                 existing.save()
             else:
-                Presence(
+                p = Presence(
                     player_id=player.id,
                     lesson_instance_id=instance.id,
                     status=status,
@@ -489,7 +522,9 @@ def bulk_create_presences(rows, coach):
                     invited=True,
                     confirmed=True,
                     validated=True,
-                ).create()
+                )
+                p.create()
+                created_ids["presences"].append(p.id)
 
             imported += 1
 
@@ -497,7 +532,7 @@ def bulk_create_presences(rows, coach):
             db.session.rollback()
             errors.append({"row": i, "data": row, "error": str(e)})
 
-    return _ok(imported, errors)
+    return _ok(imported, errors, created_ids)
 
 
 # ---------------------------------------------------------------------------
@@ -522,6 +557,7 @@ def bulk_create_evaluation_entries(rows, coach):
     """
     imported = 0
     errors = []
+    created_ids = {"evaluation_entries": []}
 
     # coach_player relations indexed by player display name.
     coach_players_by_name = {}
@@ -546,7 +582,6 @@ def bulk_create_evaluation_entries(rows, coach):
             evaluated_at = _coerce_import_datetime(row.get("date"))
 
             if is_normalized:
-                # Each row = one (category_name, score) pair.
                 category_name = row.get("category_name")
                 value = row.get("score")
 
@@ -574,10 +609,10 @@ def bulk_create_evaluation_entries(rows, coach):
                 entry = EvaluationEntry()
                 _apply_form(entry.get_create_form(), ev_payload, entry)
                 entry.create()
+                created_ids["evaluation_entries"].append(entry.id)
                 imported += 1
 
             else:
-                # Wide format: non-reserved keys are category names.
                 row_imported = 0
                 for key, value in row.items():
                     if key in reserved_keys or value is None or value == "":
@@ -603,6 +638,7 @@ def bulk_create_evaluation_entries(rows, coach):
                     entry = EvaluationEntry()
                     _apply_form(entry.get_create_form(), ev_payload, entry)
                     entry.create()
+                    created_ids["evaluation_entries"].append(entry.id)
                     row_imported += 1
 
                 if row_imported > 0:
@@ -612,7 +648,7 @@ def bulk_create_evaluation_entries(rows, coach):
             db.session.rollback()
             errors.append({"row": i, "data": row, "error": str(e)})
 
-    return _ok(imported, errors)
+    return _ok(imported, errors, created_ids)
 
 
 # ---------------------------------------------------------------------------
@@ -632,6 +668,7 @@ def bulk_create_coach_notes(rows, coach, note_type):
     """
     imported = 0
     errors = []
+    created_ids = {"coach_notes": []}
 
     coach_players_by_name = {}
     for rel in coach.players_relations:
@@ -679,6 +716,7 @@ def bulk_create_coach_notes(rows, coach, note_type):
                     "text": text,
                 }, note)
                 note.create()
+                created_ids["coach_notes"].append(note.id)
                 existing_texts.add(text)
                 row_imported += 1
 
@@ -689,4 +727,85 @@ def bulk_create_coach_notes(rows, coach, note_type):
             db.session.rollback()
             errors.append({"row": i, "data": row, "error": str(e)})
 
-    return _ok(imported, errors)
+    return _ok(imported, errors, created_ids)
+
+
+# ---------------------------------------------------------------------------
+# Import history & revert
+# ---------------------------------------------------------------------------
+
+def get_import_history(coach):
+    """Return all bulk imports for a coach, newest first."""
+    import json
+    from padel_app.models.bulk_import import BulkImport
+
+    imports = (
+        BulkImport.query
+        .filter_by(coach_id=coach.id)
+        .order_by(BulkImport.created_at.desc())
+        .all()
+    )
+
+    result = []
+    for imp in imports:
+        summary = json.loads(imp.summary) if imp.summary else {}
+        result.append({
+            "id": imp.id,
+            "created_at": imp.created_at.isoformat(),
+            "filename": imp.filename,
+            "status": imp.status,
+            "summary": summary,
+        })
+
+    return result
+
+
+def revert_import(import_id, coach):
+    """
+    Delete all records created by a specific bulk import.
+    Returns a summary of what was deleted.
+    """
+    import json
+    from padel_app.models.bulk_import import BulkImport
+
+    bulk_import = BulkImport.query.filter_by(
+        id=import_id, coach_id=coach.id
+    ).first()
+
+    if not bulk_import:
+        return {"error": "Import not found"}, 404
+
+    if bulk_import.status == "reverted":
+        return {"error": "Import already reverted"}, 400
+
+    record_ids = json.loads(bulk_import.record_ids) if bulk_import.record_ids else {}
+    deleted = {}
+
+    # Delete in reverse dependency order to avoid FK violations
+    _delete_by_ids(CoachPlayerNote, record_ids.get("coach_notes", []), deleted, "coach_notes")
+    _delete_by_ids(EvaluationEntry, record_ids.get("evaluation_entries", []), deleted, "evaluation_entries")
+    _delete_by_ids(Presence, record_ids.get("presences", []), deleted, "presences")
+    _delete_by_ids(Association_PlayerLesson, record_ids.get("player_lessons", []), deleted, "player_lessons")
+    _delete_by_ids(PlayerLevelHistory, record_ids.get("player_level_history", []), deleted, "player_level_history")
+    _delete_by_ids(Association_CoachPlayer, record_ids.get("coach_players", []), deleted, "coach_players")
+    _delete_by_ids(Player, record_ids.get("players", []), deleted, "players")
+    _delete_by_ids(User, record_ids.get("users", []), deleted, "users")
+
+    from padel_app.models import Lesson as LessonModel
+    _delete_by_ids(LessonModel, record_ids.get("lessons", []), deleted, "lessons")
+    _delete_by_ids(EvaluationCategory, record_ids.get("evaluation_categories", []), deleted, "evaluation_categories")
+    _delete_by_ids(CoachLevel, record_ids.get("coach_levels", []), deleted, "coach_levels")
+
+    bulk_import.status = "reverted"
+    db.session.commit()
+
+    return {"deleted": deleted, "status": "reverted"}
+
+
+def _delete_by_ids(model_class, ids, deleted_dict, key):
+    """Delete records by IDs, collecting count of actually deleted records."""
+    if not ids:
+        return
+    count = model_class.query.filter(model_class.id.in_(ids)).delete(synchronize_session=False)
+    if count > 0:
+        deleted_dict[key] = count
