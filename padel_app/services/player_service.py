@@ -247,21 +247,32 @@ def edit_player_service(data):
 
 
 def remove_player_service(data):
-    """Removes or deletes a player depending on their account status. Returns (result_dict, status_code)."""
+    """Removes or deletes a player depending on coach count and account status.
+
+    - Multiple coaches: only remove the coach-player relationship.
+    - Single coach + active player: delete the player record (cascades associations).
+    - Single coach + inactive player: delete both player and user records.
+    """
     coach_id = data.get("coachId", None)
     player_id = data.get("playerId", None)
 
     player = Player.query.get_or_404(player_id)
     user = player.user
 
-    if user.status == "active":
-        rel = Association_CoachPlayer.query.filter_by(
-            coach_id=coach_id,
-            player_id=player_id,
-        ).first_or_404()
+    rel = Association_CoachPlayer.query.filter_by(
+        coach_id=coach_id,
+        player_id=player_id,
+    ).first_or_404()
+
+    coach_count = Association_CoachPlayer.query.filter_by(player_id=player_id).count()
+
+    if coach_count > 1:
         rel.delete()
-        return {"status": "Removed active user"}, 200
+        return {"status": "Removed coach-player relationship"}, 200
+    elif user.status == "active":
+        player.delete()
+        return {"status": "Deleted active player"}, 200
     else:
         player.delete()
         user.delete()
-        return {"status": "Delete inactive user"}, 200
+        return {"status": "Deleted inactive player and user"}, 200
