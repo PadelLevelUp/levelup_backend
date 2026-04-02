@@ -310,10 +310,13 @@ def coach_players_paginated():
 
     page = request.args.get("page", default=1, type=int)
     per_page = request.args.get("per_page", default=25, type=int)
+    search = request.args.get("search", default=None, type=str)
     page = max(1, page or 1)
     per_page = max(1, min(100, per_page or 25))
+    if search:
+        search = search.strip() or None
 
-    result = get_coach_players_paginated(coach, page=page, per_page=per_page)
+    result = get_coach_players_paginated(coach, page=page, per_page=per_page, search=search)
     return jsonify(result)
 
 
