@@ -771,19 +771,71 @@ def import_analyze():
 @bp.post("/import/confirm")
 @jwt_required()
 def import_confirm():
+    import json
+    from padel_app.sql_db import db
+    from padel_app.models.bulk_import import BulkImport
+
     coach = current_coach()
     club = current_club()
     data = request.get_json() or {}
     results = {}
+    all_created_ids = {}
+    summary = {}
 
     for table_name, fn, needs_club in _TABLE_MAP:
         rows = data.get(table_name)
         if not rows:
             continue
         print(f"Importing {len(rows)} to {table_name}")
-        results[table_name] = fn(rows, coach, club) if needs_club else fn(rows, coach)
+        result = fn(rows, coach, club) if needs_club else fn(rows, coach)
+        results[table_name] = result
+
+        # Collect created IDs for tracking
+        if result.get("created_ids"):
+            for key, ids in result["created_ids"].items():
+                all_created_ids.setdefault(key, []).extend(ids)
+
+        # Build summary of imported counts
+        if result.get("imported", 0) > 0:
+            summary[table_name] = result["imported"]
+
+    # Create a BulkImport record if anything was imported
+    if summary:
+        bulk_import = BulkImport(
+            coach_id=coach.id,
+            filename=data.get("_filename"),
+            status="active",
+            summary=json.dumps(summary),
+            record_ids=json.dumps(all_created_ids),
+        )
+        db.session.add(bulk_import)
+        db.session.commit()
 
     return jsonify(results)
+
+
+@bp.get("/import/history")
+@jwt_required()
+def import_history():
+    from padel_app.services.import_service import get_import_history
+    coach = current_coach()
+    if not coach:
+        return jsonify({"error": "Coach not found"}), 404
+    return jsonify(get_import_history(coach))
+
+
+@bp.post("/import/<int:import_id>/revert")
+@jwt_required()
+def import_revert(import_id):
+    from padel_app.services.import_service import revert_import
+    coach = current_coach()
+    if not coach:
+        return jsonify({"error": "Coach not found"}), 404
+
+    result = revert_import(import_id, coach)
+    if isinstance(result, tuple):
+        return jsonify(result[0]), result[1]
+    return jsonify(result)
 
 
 # -------------------------------------------------------------------

@@ -34,6 +34,7 @@ from .notification_event import NotificationEvent
 from .vacancy import Vacancy
 from .waiting_list_entry import WaitingListEntry
 from .standing_waiting_list_entry import StandingWaitingListEntry
+from .bulk_import import BulkImport
 
 MODELS = {
     "tokenblocklist": TokenBlocklist,
@@ -73,4 +74,5 @@ MODELS = {
     "vacancy": Vacancy,
     "waitinglistentry": WaitingListEntry,
     "standingwaitinglistentry": StandingWaitingListEntry,
+    "bulkimport": BulkImport,
 }
