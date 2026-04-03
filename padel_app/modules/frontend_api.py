@@ -713,8 +713,11 @@ def add_player():
     except IntegrityError as e:
         from padel_app.sql_db import db
         db.session.rollback()
-        if "username" in str(e.orig).lower():
-            return jsonify({"error": "username_taken", "message": "A player with this username already exists"}), 409
+        detail = str(e.orig).lower()
+        if "username" in detail:
+            return jsonify({"field": "username", "message": "This username is already taken"}), 409
+        if "email" in detail:
+            return jsonify({"field": "email", "message": "This email is already taken"}), 409
         raise
     return jsonify(coach_player_info)
 
