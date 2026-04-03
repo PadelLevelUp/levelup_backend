@@ -3,6 +3,7 @@ from datetime import timezone
 from dateutil import parser
 import json
 from flask_jwt_extended import jwt_required, get_jwt_identity
+from sqlalchemy.exc import IntegrityError
 
 from padel_app.models import *
 from padel_app.realtime import subscribe, unsubscribe
@@ -707,7 +708,14 @@ def remove_class():
 @bp.post("/add_player")
 def add_player():
     data = request.get_json() or {}
-    coach_player_info = add_player_service(data)
+    try:
+        coach_player_info = add_player_service(data)
+    except IntegrityError as e:
+        from padel_app.sql_db import db
+        db.session.rollback()
+        if "username" in str(e.orig).lower():
+            return jsonify({"error": "username_taken", "message": "A player with this username already exists"}), 409
+        raise
     return jsonify(coach_player_info)
 
 
