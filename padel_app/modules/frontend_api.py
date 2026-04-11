@@ -705,22 +705,31 @@ def remove_class():
     return jsonify(result), status
 
 
-@bp.post("/check_player_fields")
-def check_player_fields():
-    """Validate username/email availability before creating a player."""
+UNIQUE_FIELD_CHECKS = {
+    ("user", "username"),
+    ("user", "email"),
+}
+
+
+@bp.post("/check_field_available")
+def check_field_available():
+    """Check whether a unique field value is available for any whitelisted model."""
     data = request.get_json() or {}
-    errors = {}
-    username = (data.get("username") or "").strip()
-    email = (data.get("email") or "").strip()
+    model_key = (data.get("model") or "").strip().lower()
+    field = (data.get("field") or "").strip()
+    value = (data.get("value") or "").strip()
 
-    if username and User.query.filter_by(username=username).first():
-        errors["username"] = "This username is already taken"
-    if email and User.query.filter_by(email=email).first():
-        errors["email"] = "This email is already taken"
+    if (model_key, field) not in UNIQUE_FIELD_CHECKS:
+        abort(400, "Check not allowed")
+    if not value:
+        return jsonify({"available": True})
 
-    if errors:
-        return jsonify({"errors": errors}), 409
-    return jsonify({"ok": True})
+    ModelClass = MODELS[model_key]
+    exists = ModelClass.query.filter_by(**{field: value}).first() is not None
+
+    if exists:
+        return jsonify({"available": False, "message": f"This {field} is already taken"}), 409
+    return jsonify({"available": True})
 
 
 @bp.post("/add_player")
