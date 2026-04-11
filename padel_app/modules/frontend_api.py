@@ -3,7 +3,7 @@ from datetime import timezone
 from dateutil import parser
 import json
 from flask_jwt_extended import jwt_required, get_jwt_identity
-from sqlalchemy.exc import IntegrityError
+
 
 from padel_app.models import *
 from padel_app.realtime import subscribe, unsubscribe
@@ -705,20 +705,28 @@ def remove_class():
     return jsonify(result), status
 
 
+@bp.post("/check_player_fields")
+def check_player_fields():
+    """Validate username/email availability before creating a player."""
+    data = request.get_json() or {}
+    errors = {}
+    username = (data.get("username") or "").strip()
+    email = (data.get("email") or "").strip()
+
+    if username and User.query.filter_by(username=username).first():
+        errors["username"] = "This username is already taken"
+    if email and User.query.filter_by(email=email).first():
+        errors["email"] = "This email is already taken"
+
+    if errors:
+        return jsonify({"errors": errors}), 409
+    return jsonify({"ok": True})
+
+
 @bp.post("/add_player")
 def add_player():
     data = request.get_json() or {}
-    try:
-        coach_player_info = add_player_service(data)
-    except IntegrityError as e:
-        from padel_app.sql_db import db
-        db.session.rollback()
-        detail = str(e.orig).lower()
-        if "username" in detail:
-            return jsonify({"field": "username", "message": "This username is already taken"}), 409
-        if "email" in detail:
-            return jsonify({"field": "email", "message": "This email is already taken"}), 409
-        raise
+    coach_player_info = add_player_service(data)
     return jsonify(coach_player_info)
 
 
