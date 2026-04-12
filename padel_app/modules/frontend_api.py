@@ -4,6 +4,7 @@ from dateutil import parser
 import json
 from flask_jwt_extended import jwt_required, get_jwt_identity
 
+
 from padel_app.models import *
 from padel_app.realtime import subscribe, unsubscribe
 from padel_app.serializers.calendar_event import serialize_calendar_event
@@ -702,6 +703,33 @@ def remove_class():
     data = request.get_json() or {}
     result, status = remove_class_service(data)
     return jsonify(result), status
+
+
+UNIQUE_FIELD_CHECKS = {
+    ("user", "username"),
+    ("user", "email"),
+}
+
+
+@bp.post("/check_field_available")
+def check_field_available():
+    """Check whether a unique field value is available for any whitelisted model."""
+    data = request.get_json() or {}
+    model_key = (data.get("model") or "").strip().lower()
+    field = (data.get("field") or "").strip()
+    value = (data.get("value") or "").strip()
+
+    if (model_key, field) not in UNIQUE_FIELD_CHECKS:
+        abort(400, "Check not allowed")
+    if not value:
+        return jsonify({"available": True})
+
+    ModelClass = MODELS[model_key]
+    exists = ModelClass.query.filter_by(**{field: value}).first() is not None
+
+    if exists:
+        return jsonify({"available": False, "message": f"This {field} is already taken"}), 409
+    return jsonify({"available": True})
 
 
 @bp.post("/add_player")
