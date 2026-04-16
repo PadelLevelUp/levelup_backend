@@ -690,8 +690,11 @@ def _truncate_lesson_future(*, lesson, from_date):
     lesson.save()
     delete_future_instances(lesson, from_date)
     # Cancel lesson-level reminder jobs for occurrences that no longer exist
-    from padel_app.scheduler import cancel_lesson_reminder_jobs
-    cancel_lesson_reminder_jobs(lesson.id, from_date=from_date)
+    try:
+        from padel_app.scheduler import cancel_lesson_reminder_jobs
+        cancel_lesson_reminder_jobs(lesson.id, from_date=from_date)
+    except Exception:
+        pass
 
 
 def _remove_single_occurrence_from_lesson(*, lesson, date):
@@ -701,10 +704,15 @@ def _remove_single_occurrence_from_lesson(*, lesson, date):
         lesson.delete()
         return
     _, new_lesson = split_lesson(lesson, date, remove_current_date=True)
-    # Schedule reminder jobs for the new lesson (post-split occurrences)
-    if new_lesson and new_lesson.coaches_relations:
-        from padel_app.scheduler import schedule_lesson_reminder_jobs
-        schedule_lesson_reminder_jobs(new_lesson.id, new_lesson.coaches_relations[0].coach_id)
+    # Schedule reminder jobs for the new lesson (post-split occurrences).
+    # Wrapped in try-except: DB changes are already committed by split_lesson,
+    # so a scheduler failure must not cause a false error response (PAD-10).
+    try:
+        if new_lesson and new_lesson.coaches_relations:
+            from padel_app.scheduler import schedule_lesson_reminder_jobs
+            schedule_lesson_reminder_jobs(new_lesson.id, new_lesson.coaches_relations[0].coach_id)
+    except Exception:
+        pass
 
 
 def remove_class_service(data):
