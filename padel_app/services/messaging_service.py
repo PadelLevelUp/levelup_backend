@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 from padel_app.utils.dates import utcnow_naive
 
 from flask import abort
-from sqlalchemy import func
+from sqlalchemy import func, nullslast
 
 from padel_app.sql_db import db
 from padel_app.models import (
@@ -130,14 +130,25 @@ def toggle_reaction_service(message_id, emoji, user_id):
     })
 
 
-def get_user_conversations(user):
-    """Returns all conversations the user participates in."""
-    return (
+def get_user_conversations(user, page=1, limit=20):
+    """Returns paginated conversations the user participates in, ordered by last message descending."""
+    offset = (page - 1) * limit
+    last_message_at = (
+        db.session.query(func.max(Message.sent_at))
+        .filter(Message.conversation_id == Conversation.id)
+        .correlate(Conversation)
+        .scalar_subquery()
+    )
+    query = (
         Conversation.query
         .join(ConversationParticipant)
         .filter(ConversationParticipant.user_id == user.id)
-        .all()
+        .order_by(nullslast(last_message_at.desc()))
+        .offset(offset)
     )
+    convs = query.limit(limit + 1).all()
+    has_more = len(convs) > limit
+    return {"conversations": convs[:limit], "has_more": has_more}
 
 
 def create_conversation_service(data, user):

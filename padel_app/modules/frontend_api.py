@@ -266,8 +266,13 @@ def get_conversations():
     if not user.id:
         abort(400, "user_id is required")
 
-    convs = get_user_conversations(user)
-    return jsonify([serialize_conversation(c, user.id) for c in convs])
+    page = request.args.get("page", default=1, type=int)
+    limit = min(request.args.get("limit", default=20, type=int), 50)
+    result = get_user_conversations(user, page=page, limit=limit)
+    return jsonify({
+        "conversations": [serialize_conversation(c, user.id) for c in result["conversations"]],
+        "hasMore": result["has_more"],
+    })
 
 
 @bp.get("/conversation/<int:conversation_id>")
