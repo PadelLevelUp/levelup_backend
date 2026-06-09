@@ -10,6 +10,8 @@ where ``imported`` counts newly created records and ``errors`` collects any
 per-row failures so that a bad row never aborts the entire batch.
 """
 from datetime import datetime, date
+
+from padel_app.utils.dates import utcnow_naive
 import re
 
 from psycopg2.errors import UniqueViolation
@@ -94,11 +96,11 @@ def _coerce_import_datetime(value):
         return datetime.combine(value, datetime.min.time())
 
     if value is None:
-        return datetime.utcnow()
+        return utcnow_naive()
 
     text = str(value).strip()
     if not text:
-        return datetime.utcnow()
+        return utcnow_naive()
 
     try:
         return datetime.strptime(text, "%Y-%m-%d")
@@ -108,7 +110,7 @@ def _coerce_import_datetime(value):
     try:
         return datetime.fromisoformat(text.replace("Z", "+00:00"))
     except ValueError:
-        return datetime.utcnow()
+        return utcnow_naive()
 
 
 # ---------------------------------------------------------------------------

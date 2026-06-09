@@ -1,5 +1,7 @@
 from datetime import datetime, timezone
 
+from padel_app.utils.dates import utcnow_naive
+
 from flask import abort
 from sqlalchemy import func
 
@@ -184,5 +186,5 @@ def mark_conversation_read_service(conversation_id, user):
         .first_or_404()
     )
 
-    participation.last_read_at = datetime.utcnow()
+    participation.last_read_at = utcnow_naive()
     participation.save()
