@@ -147,7 +147,18 @@ class Field:
         return True
 
     def set_password_value(self, request):
-        self.value = generate_password_hash(request.form[self.name])
+        # CRITICAL: do NOT hash an empty/blank input. JsonRequestAdapter fills
+        # missing keys with '' by default — without this guard, every update
+        # form that includes a Password field would overwrite the user's
+        # password with hash(''), wiping their credentials silently. This is
+        # both a correctness bug and a security/availability incident — the
+        # user can no longer log in, and an attacker submitting an empty
+        # password could match the corrupted hash.
+        raw = request.form.get(self.name) if self.name in request.form else None
+        if not raw or not str(raw).strip():
+            self.value = None
+            return False
+        self.value = generate_password_hash(raw)
         return True
 
     def set_value(self, request):

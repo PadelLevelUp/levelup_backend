@@ -35,6 +35,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 
 from padel_app.sql_db import db
+from padel_app.utils.dates import utcnow_naive
 from padel_app.models import (
     Association_CoachLessonInstance,
     Association_CoachPlayer,
@@ -436,7 +437,7 @@ def _check_restrictions(
     *,
     now: datetime | None = None,
 ) -> bool:
-    now = now or datetime.utcnow()
+    now = now or utcnow_naive()
 
     if restrictions.get("quietHours", {}).get("enabled"):
         hour = now.hour
@@ -470,7 +471,7 @@ def _check_per_student_daily_limit(
     limit = restrictions.get("maxInvitesPerStudentPerDay", {})
     if not limit.get("enabled"):
         return True
-    _now = now or datetime.utcnow()
+    _now = now or utcnow_naive()
     today_start = _now.replace(hour=0, minute=0, second=0, microsecond=0)
     count = NotificationEvent.query.filter(
         NotificationEvent.player_id == player_id,
@@ -699,7 +700,7 @@ def send_class_reminders(instance_id: int, *, now: datetime | None = None) -> No
     from flask import current_app, has_app_context
     _log = current_app.logger if has_app_context() else None
 
-    _now = now or datetime.utcnow()
+    _now = now or utcnow_naive()
 
     instance = LessonInstance.query.get(instance_id)
     if not instance:
@@ -882,7 +883,7 @@ def respond_to_reminder(
             from padel_app.scheduler import _compute_invite_start_dt
             _ensure_vacancy_for_player(instance, coach.id, player.id)
             invite_start_dt = _compute_invite_start_dt(instance, config.get_invitation_start_timing())
-            _now = now or datetime.utcnow()
+            _now = now or utcnow_naive()
             if invite_start_dt is None or _now >= invite_start_dt:
                 trigger_invitations(instance, coach.id)
 
@@ -1032,7 +1033,7 @@ def _send_invitation_batch(
 
         notified.append({"id": str(cp.player_id), "name": player_name})
 
-    vacancy.last_activity_at = datetime.utcnow()
+    vacancy.last_activity_at = utcnow_naive()
     vacancy.current_batch_number += 1
     vacancy.save()
 
@@ -1158,7 +1159,7 @@ def process_invitation_batches(*, now: datetime | None = None) -> int:
 
     Pass ``now`` in tests to control the current time without waiting for real time to pass.
     """
-    _now = now or datetime.utcnow()
+    _now = now or utcnow_naive()
     open_vacancies = Vacancy.query.filter_by(status="open").all()
     processed = 0
 
@@ -1239,7 +1240,7 @@ def respond_to_notification(notification_event_id: int, action: str, acting_user
         event.save()
 
         if vacancy:
-            vacancy.last_activity_at = datetime.utcnow()
+            vacancy.last_activity_at = utcnow_naive()
             vacancy.save()
             # Immediately invite the next player without waiting for inactivity timer
             _send_next_on_decline(vacancy, instance, event.coach_id, config)
@@ -1312,7 +1313,7 @@ def respond_to_notification(notification_event_id: int, action: str, acting_user
         if vacancy:
             vacancy.status = "filled"
             vacancy.filled_by_player_id = event.player_id
-            vacancy.filled_at = datetime.utcnow()
+            vacancy.filled_at = utcnow_naive()
             vacancy.save()
 
         if coach_user_id:
@@ -1356,7 +1357,7 @@ def coach_respond_to_notification(notification_event_id: int, action: str, coach
         event.status = "expired"
         event.save()
         if vacancy:
-            vacancy.last_activity_at = datetime.utcnow()
+            vacancy.last_activity_at = utcnow_naive()
             vacancy.save()
         return {"action": "declined"}
 
@@ -1378,7 +1379,7 @@ def coach_respond_to_notification(notification_event_id: int, action: str, coach
         if vacancy:
             vacancy.status = "filled"
             vacancy.filled_by_player_id = event.player_id
-            vacancy.filled_at = datetime.utcnow()
+            vacancy.filled_at = utcnow_naive()
             vacancy.save()
 
         # Expire other pending invitations for this vacancy
@@ -1604,7 +1605,7 @@ def _check_waiting_list(
         # Check if linked standing entry is still valid
         if entry.standing_entry_id:
             standing = StandingWaitingListEntry.query.get(entry.standing_entry_id)
-            if standing and (not standing.is_active or standing.expires_at < datetime.utcnow()):
+            if standing and (not standing.is_active or standing.expires_at < utcnow_naive()):
                 _deactivate_standing_entry(standing)
                 continue
 
@@ -1674,7 +1675,7 @@ def _fill_from_waiting_list(
 
     vacancy.status = "filled"
     vacancy.filled_by_player_id = entry.player_id
-    vacancy.filled_at = datetime.utcnow()
+    vacancy.filled_at = utcnow_naive()
     vacancy.save()
 
     entry.is_active = False
@@ -1848,7 +1849,7 @@ def _deactivate_standing_entry(entry: StandingWaitingListEntry) -> None:
 
 def _fan_out_standing_entry(entry: StandingWaitingListEntry) -> None:
     """Create per-class WaitingListEntry rows for all upcoming instances for this coach."""
-    now = datetime.utcnow()
+    now = utcnow_naive()
     coach_instance_ids = {
         rel.lesson_instance_id
         for rel in Association_CoachLessonInstance.query.filter_by(coach_id=entry.coach_id).all()
@@ -1892,7 +1893,7 @@ def add_standing_waiting_list_entry(
         player_id=player_id,
         credits_total=credits_total,
         credits_used=0,
-        expires_at=datetime.utcnow() + timedelta(days=duration_days),
+        expires_at=utcnow_naive() + timedelta(days=duration_days),
         is_active=True,
     )
     entry.create()

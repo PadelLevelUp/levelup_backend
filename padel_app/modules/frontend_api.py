@@ -100,6 +100,33 @@ bp = Blueprint("frontend_api", __name__, url_prefix="/api/app")
 
 
 # -------------------------------------------------------------------
+# Health check
+# -------------------------------------------------------------------
+
+@bp.get("/healthz")
+def healthz():
+    """Liveness + readiness check. 200 when DB is reachable and (in TEST_MODE)
+    the scheduler has initialised. Used by Playwright's webServer readiness."""
+    from sqlalchemy import text
+    from padel_app.sql_db import db
+    from padel_app.scheduler import ensure_scheduler_ready
+    import os as _os
+
+    try:
+        db.session.execute(text("SELECT 1"))
+    except Exception as exc:
+        return jsonify({"status": "db_unreachable", "error": str(exc)}), 503
+
+    if _os.environ.get("TEST_MODE", "").lower() == "true":
+        try:
+            ensure_scheduler_ready()
+        except Exception as exc:
+            return jsonify({"status": "scheduler_not_ready", "error": str(exc)}), 503
+
+    return jsonify({"status": "ok"})
+
+
+# -------------------------------------------------------------------
 # Request context helpers
 # -------------------------------------------------------------------
 
@@ -653,9 +680,9 @@ def edit_calendar_block(block_id):
 @bp.post("/class_instance/presences/confirm")
 @jwt_required()
 def confirm_presences():
-    from datetime import datetime
     from padel_app.scheduler import _compute_invite_start_dt
     from padel_app.services.notification_service import get_or_create_config, trigger_invitations
+    from padel_app.utils.dates import utcnow_naive
 
     data = request.get_json()
     presences = confirm_presences_service(data['classInstance'], data['presences'])
@@ -665,13 +692,13 @@ def confirm_presences():
     if has_absences and presences:
         coach = current_coach()
         instance = presences[0].lesson_instance
-        if instance and instance.start_datetime > datetime.utcnow():
+        if instance and instance.start_datetime > utcnow_naive():
             config = get_or_create_config(coach.id)
             invite_start_dt = _compute_invite_start_dt(instance, config.get_invitation_start_timing())
             # Only send invitations if the invitation window has opened.
             # If not yet open, the invite_start scheduler job will call trigger_invitations
             # at the configured time, which will find the absent presences and invite.
-            if invite_start_dt is None or datetime.utcnow() >= invite_start_dt:
+            if invite_start_dt is None or utcnow_naive() >= invite_start_dt:
                 try:
                     notified_players = trigger_invitations(instance, coach.id) or []
                 except Exception:

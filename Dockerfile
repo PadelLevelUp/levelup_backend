@@ -36,4 +36,6 @@ EXPOSE 80
 RUN chmod +x /app/scripts/entrypoint.sh
 ENTRYPOINT ["/app/scripts/entrypoint.sh"]
 
-CMD ["python", "app.py"]
+# 1 worker (APScheduler must stay in a single process) + 4 threads for concurrency.
+# 3600s timeout keeps SSE connections alive.
+CMD ["gunicorn", "--bind", "0.0.0.0:80", "--workers", "1", "--threads", "4", "--timeout", "3600", "app:run_app"]

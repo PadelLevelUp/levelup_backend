@@ -29,6 +29,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
+from padel_app.utils.dates import utcnow_naive
+
 
 @dataclass
 class ScheduledEvent:
@@ -79,7 +81,7 @@ def preview_notification_schedule(
     from padel_app.scheduler import _compute_timing_dt
     from padel_app.services.notification_service import get_or_create_config
 
-    now = from_dt or datetime.utcnow()
+    now = from_dt or utcnow_naive()
     end = to_dt or (now + timedelta(days=14))
 
     config = get_or_create_config(coach_id)
@@ -207,7 +209,7 @@ def print_schedule(coach_id: int, days: int = 14) -> None:
     Pretty-print the upcoming notification schedule to stdout.
     Intended for use in a Flask shell.
     """
-    from_dt = datetime.utcnow()
+    from_dt = utcnow_naive()
     to_dt = from_dt + timedelta(days=days)
     rows = preview_notification_schedule(coach_id, from_dt=from_dt, to_dt=to_dt)
 

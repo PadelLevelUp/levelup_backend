@@ -207,6 +207,32 @@ class Model:
                 setattr(self, key, incoming)
             return
 
+        # Defense-in-depth: never let an empty/blank password (or a hash of one)
+        # overwrite an existing password column. The primary guard lives in
+        # set_password_value, but this catches any future code path that
+        # bypasses the form layer.
+        if key == "password" and incoming is not None:
+            if not str(incoming).strip():
+                from flask import current_app
+                current_app.logger.warning(
+                    "Refusing to overwrite password column with empty value on %s",
+                    type(self).__name__,
+                )
+                return
+            try:
+                from werkzeug.security import check_password_hash
+                if check_password_hash(str(incoming), ""):
+                    from flask import current_app
+                    current_app.logger.warning(
+                        "Refusing to overwrite password column with hash-of-empty-string on %s",
+                        type(self).__name__,
+                    )
+                    return
+            except Exception:
+                # If the value isn't a valid hash format, fall through to the
+                # generic comparison — that path is unaffected by this guard.
+                pass
+
         if incoming is not None and incoming != current:
             setattr(self, key, incoming)
 

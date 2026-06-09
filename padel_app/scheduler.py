@@ -40,6 +40,8 @@ import sys
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 
+from padel_app.utils.dates import utcnow_naive
+
 # ---------------------------------------------------------------------------
 # Module-level singletons
 # ---------------------------------------------------------------------------
@@ -264,27 +266,35 @@ def init_scheduler(app, test_config=None) -> None:
 
     _app = app
 
-    from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
     from apscheduler.schedulers.background import BackgroundScheduler
     from apscheduler.triggers.interval import IntervalTrigger
 
-    db_url = app.config["SQLALCHEMY_DATABASE_URI"]
-    jobstores = {
-        "default": SQLAlchemyJobStore(
-            url=db_url,
-            engine_options={
-                "pool_pre_ping": True,   # survive DB restart / test DB reset
-                "pool_recycle": 300,     # proactively recycle idle connections
-                "pool_size": 2,          # scheduler needs few connections
-                "max_overflow": 1,
-            },
-        )
-    }
+    test_mode = os.environ.get("TEST_MODE", "").lower() == "true"
+
+    if test_mode:
+        # Tests drop/recreate the DB on every run. SQLAlchemyJobStore would hold
+        # stale connections to the old apscheduler_jobs table and silently fail.
+        # Use MemoryJobStore so the scheduler is fully isolated from DB lifecycle.
+        from apscheduler.jobstores.memory import MemoryJobStore
+        jobstores = {"default": MemoryJobStore()}
+    else:
+        from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
+        db_url = app.config["SQLALCHEMY_DATABASE_URI"]
+        jobstores = {
+            "default": SQLAlchemyJobStore(
+                url=db_url,
+                engine_options={
+                    "pool_pre_ping": True,   # survive DB restart
+                    "pool_recycle": 300,     # proactively recycle idle connections
+                    "pool_size": 2,          # scheduler needs few connections
+                    "max_overflow": 1,
+                },
+            )
+        }
 
     sched = BackgroundScheduler(jobstores=jobstores, timezone="UTC")
 
     # TEST_MODE shortens the batch interval for E2E verification
-    test_mode = os.environ.get("TEST_MODE", "").lower() == "true"
     batch_seconds = 30 if test_mode else 120
 
     sched.add_job(
@@ -318,7 +328,14 @@ def init_scheduler(app, test_config=None) -> None:
 
 
 def _startup_reschedule(app) -> None:
-    """Idempotently re-schedule all future reminder/invite jobs at startup."""
+    """Idempotently re-schedule all future reminder/invite jobs at startup.
+
+    In production we swallow errors (e.g. transient DB issues during deploy)
+    so the server can keep serving requests. In TEST_MODE we re-raise so test
+    failures point at the real cause instead of bubbling up later as
+    "class not found on calendar".
+    """
+    test_mode = os.environ.get("TEST_MODE", "").lower() == "true"
     try:
         with app.app_context():
             from padel_app.models import Coach
@@ -334,6 +351,20 @@ def _startup_reschedule(app) -> None:
             )
     except Exception as exc:
         app.logger.warning("APScheduler startup rescheduling failed: %s", exc)
+        if test_mode:
+            raise
+
+
+def ensure_scheduler_ready() -> None:
+    """Raise if the scheduler did not initialise successfully.
+
+    Exposed so endpoints (and tests) can fail loudly instead of letting
+    a silently-broken scheduler leak into downstream errors.
+    """
+    if _scheduler is None:
+        raise RuntimeError("APScheduler is not initialised — init_scheduler() did not run")
+    if not _scheduler.running:
+        raise RuntimeError("APScheduler is initialised but not running")
 
 
 def _reschedule_for_coach(coach_id: int) -> int:
@@ -347,7 +378,7 @@ def _reschedule_for_coach(coach_id: int) -> int:
     with _app_ctx():
         from padel_app.models import Association_CoachLessonInstance, LessonInstance
 
-        now = datetime.utcnow()
+        now = utcnow_naive()
         instances = (
             LessonInstance.query
             .join(
@@ -429,7 +460,7 @@ def schedule_lesson_reminder_jobs(
             return 0
 
         config = get_or_create_config(coach_id)
-        cutoff = now or datetime.utcnow()
+        cutoff = now or utcnow_naive()
         horizon = cutoff + timedelta(days=horizon_days)
 
         occurrences = expand_occurrences(
@@ -462,7 +493,7 @@ def schedule_lesson_reminder_jobs(
             _scheduler.add_job(
                 func=_run_reminder_for_lesson_occurrence,
                 args=[lesson_id, date_str],
-                trigger=DateTrigger(run_date=reminder_dt),
+                trigger=DateTrigger(run_date=reminder_dt, timezone="UTC"),
                 id=job_id,
                 replace_existing=True,
                 misfire_grace_time=300,
@@ -533,14 +564,14 @@ def schedule_instance_jobs(instance_id: int, coach_id: int, *, now: datetime | N
             return
 
         config = get_or_create_config(coach_id)
-        cutoff = now or datetime.utcnow()
+        cutoff = now or utcnow_naive()
 
         reminder_dt = _compute_reminder_dt(instance, config.get_reminder_timing())
         if reminder_dt and reminder_dt > cutoff:
             _scheduler.add_job(
                 func=_run_send_reminders,
                 args=[instance_id],
-                trigger=DateTrigger(run_date=reminder_dt),
+                trigger=DateTrigger(run_date=reminder_dt, timezone="UTC"),
                 id=f"reminder_{instance_id}",
                 replace_existing=True,
                 misfire_grace_time=300,
@@ -556,7 +587,7 @@ def schedule_instance_jobs(instance_id: int, coach_id: int, *, now: datetime | N
             _scheduler.add_job(
                 func=_run_trigger_invitations,
                 args=[instance_id, coach_id],
-                trigger=DateTrigger(run_date=invite_dt),
+                trigger=DateTrigger(run_date=invite_dt, timezone="UTC"),
                 id=f"invite_start_{instance_id}",
                 replace_existing=True,
                 misfire_grace_time=300,
@@ -587,7 +618,7 @@ def reschedule_all_future_jobs(coach_id: int) -> None:
     with _app_ctx():
         from padel_app.models import Association_CoachLessonInstance, LessonInstance
 
-        now = datetime.utcnow()
+        now = utcnow_naive()
         instances = (
             LessonInstance.query
             .join(
