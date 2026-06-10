@@ -16,6 +16,7 @@ from .calendar_blocks import CalendarBlock
 from .conversations import Conversation
 from .conversation_participants import ConversationParticipant
 from .coach_player_note import CoachPlayerNote
+from .coach_invitation import CoachInvitation
 from .evaluation_category import EvaluationCategory
 from .evaluation_entry import EvaluationEntry
 from .exercise import Exercise, ExerciseGroup
@@ -54,6 +55,7 @@ MODELS = {
     "calendarblock": CalendarBlock,
     "conversation": Conversation,
     "coachplayernote": CoachPlayerNote,
+    "coachinvitation": CoachInvitation,
     "evaluationcategory": EvaluationCategory,
     "evaluationentry": EvaluationEntry,
     "exercise": Exercise,

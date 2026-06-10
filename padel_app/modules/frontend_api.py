@@ -2,7 +2,7 @@ from flask import Blueprint, jsonify, request, abort, g, Response
 from datetime import timezone
 from dateutil import parser
 import json
-from flask_jwt_extended import jwt_required, get_jwt_identity
+from flask_jwt_extended import jwt_required, get_jwt_identity, create_access_token
 
 
 from padel_app.models import *
@@ -57,7 +57,15 @@ from padel_app.services.user_service import (
     edit_user_service,
     activate_user_service,
 )
-from padel_app.services.club_service import create_club_service, edit_club_service
+from padel_app.services.club_service import (
+    create_club_service,
+    edit_club_service,
+    create_coach_invitation_service,
+    get_coach_invitation_service,
+    accept_coach_invitation_service,
+    revoke_coach_invitation_service,
+    list_coach_invitations_service,
+)
 from padel_app.services.coach_service import (
     create_coach_service,
     create_coach_level_service,
@@ -295,9 +303,11 @@ def mark_conversation_read(conversation_id):
 @jwt_required()
 def coach_detail():
     coach = current_coach()
+    club = coach.current_club
     return jsonify({
         "id": coach.id,
         "user": serialize_user(coach.user),
+        "club": {"id": club.id, "name": club.name} if club else None,
     })
 
 
@@ -665,6 +675,79 @@ def edit_club(club_id):
     data = request.get_json() or {}
     edit_club_service(club_id, data)
     return jsonify(success=True)
+
+
+# -------------------------------------------------------------------
+# Coach invitations (clubs.coach-invitation)
+# -------------------------------------------------------------------
+
+@bp.post("/club/<int:club_id>/coach-invitations")
+@jwt_required()
+def create_coach_invitation(club_id):
+    data = request.get_json() or {}
+    coach = current_coach()
+    invitation = create_coach_invitation_service(
+        club_id, coach, email=data.get("email")
+    )
+    return jsonify({
+        "token": invitation.token,
+        "inviteLink": f"/invite/coach/{invitation.token}",
+        "expiresAt": invitation.expires_at.isoformat(),
+    }), 201
+
+
+@bp.get("/club/<int:club_id>/coach-invitations")
+@jwt_required()
+def list_coach_invitations(club_id):
+    coach = current_coach()
+    invitations = list_coach_invitations_service(club_id, coach)
+    return jsonify([
+        {
+            "token": inv.token,
+            "email": inv.email,
+            "expiresAt": inv.expires_at.isoformat(),
+            "createdAt": inv.created_at.isoformat() if inv.created_at else None,
+        }
+        for inv in invitations
+    ])
+
+
+@bp.get("/coach-invitations/<token>")
+def get_coach_invitation(token):
+    invitation = get_coach_invitation_service(token)
+    return jsonify({
+        "clubName": invitation.club.name,
+        "status": invitation.status,
+    })
+
+
+@bp.post("/coach-invitations/<token>/accept")
+@jwt_required(optional=True)
+def accept_coach_invitation(token):
+    data = request.get_json() or {}
+
+    coach = None
+    user_id = get_jwt_identity()
+    if user_id is not None:
+        user = User.query.get(int(user_id))
+        coach = user.coach if user else None
+
+    if coach is not None:
+        accept_coach_invitation_service(token, coach=coach)
+        return jsonify({"success": True})
+
+    user = accept_coach_invitation_service(token, data=data)
+    return jsonify({
+        "accessToken": create_access_token(identity=str(user.id)),
+    })
+
+
+@bp.post("/coach-invitations/<token>/revoke")
+@jwt_required()
+def revoke_coach_invitation(token):
+    coach = current_coach()
+    revoke_coach_invitation_service(token, coach)
+    return jsonify({"success": True})
 
 
 @bp.post("/lesson/<int:lesson_id>")
