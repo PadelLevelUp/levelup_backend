@@ -2,9 +2,6 @@ name: VM Repair and Diagnostics
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
 
 jobs:
   diagnose-and-repair:

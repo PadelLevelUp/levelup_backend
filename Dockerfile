@@ -36,6 +36,9 @@ EXPOSE 80
 RUN chmod +x /app/scripts/entrypoint.sh
 ENTRYPOINT ["/app/scripts/entrypoint.sh"]
 
-# 1 worker (APScheduler must stay in a single process) + 4 threads for concurrency.
+# 1 worker (APScheduler must stay in a single process). Each open SSE stream
+# (messaging + notifications) occupies a thread for its whole lifetime, so the
+# pool must be much larger than the expected number of connected clients —
+# 4 threads wedged the app as soon as two tabs connected.
 # 3600s timeout keeps SSE connections alive.
-CMD ["gunicorn", "--bind", "0.0.0.0:80", "--workers", "1", "--threads", "4", "--timeout", "3600", "app:run_app"]
+CMD ["gunicorn", "--bind", "0.0.0.0:80", "--workers", "1", "--threads", "64", "--timeout", "3600", "app:run_app"]
