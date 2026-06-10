@@ -684,7 +684,7 @@ def edit_club(club_id):
 @bp.post("/club/<int:club_id>/coach-invitations")
 @jwt_required()
 def create_coach_invitation(club_id):
-    data = request.get_json() or {}
+    data = request.get_json(silent=True) or {}
     coach = current_coach()
     invitation = create_coach_invitation_service(
         club_id, coach, email=data.get("email")
@@ -724,7 +724,7 @@ def get_coach_invitation(token):
 @bp.post("/coach-invitations/<token>/accept")
 @jwt_required(optional=True)
 def accept_coach_invitation(token):
-    data = request.get_json() or {}
+    data = request.get_json(silent=True) or {}
 
     coach = None
     user_id = get_jwt_identity()
