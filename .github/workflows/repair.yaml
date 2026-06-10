@@ -1,0 +1,45 @@
+name: VM Repair and Diagnostics
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  diagnose-and-repair:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Diagnose and repair on GCE
+      uses: appleboy/ssh-action@v1.0.0
+      with:
+        host: ${{ secrets.GCE_HOST }}
+        username: ${{ secrets.GCE_USER }}
+        key: ${{ secrets.GCE_SSH_PRIVATE_KEY }}
+        command_timeout: 10m
+        script: |
+          echo "=== uptime ==="
+          uptime
+          echo "=== docker ps -a ==="
+          sudo docker ps -a
+          echo "=== padelapp logs (tail 200) ==="
+          sudo docker logs padelapp --tail 200 2>&1 || true
+          echo "=== postgres activity ==="
+          PG=$(sudo docker ps --format '{{.Names}}' | grep -i -m1 'postgres\|db' || true)
+          echo "PG container: ${PG:-none}"
+          if [ -n "$PG" ]; then
+            sudo docker exec "$PG" psql -U postgres -c "SELECT pid, usename, datname, state, wait_event_type, wait_event, now()-xact_start AS xact_age, left(query,120) AS query FROM pg_stat_activity WHERE xact_start IS NOT NULL OR state <> 'idle' ORDER BY xact_start;" || true
+            sudo docker exec "$PG" psql -U postgres -c "SELECT blocked.pid AS blocked_pid, left(blocked.query,80) AS blocked_query, blocking.pid AS blocking_pid, blocking.state AS blocking_state, now()-blocking.xact_start AS blocking_xact_age, left(blocking.query,80) AS blocking_query FROM pg_stat_activity blocked JOIN unnest(pg_blocking_pids(blocked.pid)) AS bp(pid) ON true JOIN pg_stat_activity blocking ON blocking.pid = bp.pid;" || true
+          elif systemctl is-active postgresql >/dev/null 2>&1; then
+            sudo -u postgres psql -c "SELECT pid, usename, datname, state, wait_event_type, wait_event, now()-xact_start AS xact_age, left(query,120) AS query FROM pg_stat_activity WHERE xact_start IS NOT NULL OR state <> 'idle' ORDER BY xact_start;" || true
+            sudo -u postgres psql -c "SELECT blocked.pid AS blocked_pid, left(blocked.query,80) AS blocked_query, blocking.pid AS blocking_pid, blocking.state AS blocking_state, now()-blocking.xact_start AS blocking_xact_age, left(blocking.query,80) AS blocking_query FROM pg_stat_activity blocked JOIN unnest(pg_blocking_pids(blocked.pid)) AS bp(pid) ON true JOIN pg_stat_activity blocking ON blocking.pid = bp.pid;" || true
+          fi
+          echo "=== guest agent status ==="
+          sudo systemctl status google-guest-agent --no-pager 2>&1 | head -20 || true
+          echo "=== restarting guest agent ==="
+          sudo systemctl restart google-guest-agent || sudo systemctl start google-guest-agent || true
+          sleep 3
+          sudo systemctl is-active google-guest-agent || true
+          echo "=== memory and disk ==="
+          free -m
+          df -h /
