@@ -2,6 +2,7 @@ from flask import Blueprint, jsonify, request, abort, g, Response
 from datetime import timezone
 from dateutil import parser
 import json
+import queue
 from flask_jwt_extended import jwt_required, get_jwt_identity, create_access_token
 
 
@@ -178,15 +179,28 @@ def current_club():
 @jwt_required(locations=["query_string"])
 def events():
     def stream():
+        # Each connected client pins one gunicorn thread for the lifetime of
+        # this generator. A disconnect is only detected when a write fails, so
+        # q.get() must time out and emit a keep-alive: otherwise a closed tab
+        # whose queue never receives an event leaks its thread forever and the
+        # worker pool eventually starves (prod outage 2026-06-10/11).
         q = subscribe()
         try:
             while True:
-                event = q.get()
+                try:
+                    event = q.get(timeout=15)
+                except queue.Empty:
+                    yield ": keep-alive\n\n"
+                    continue
                 yield f"data: {json.dumps(event)}\n\n"
-        except GeneratorExit:
+        finally:
             unsubscribe(q)
 
-    return Response(stream(), mimetype="text/event-stream")
+    return Response(
+        stream(),
+        mimetype="text/event-stream",
+        headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
+    )
 
 
 # -------------------------------------------------------------------
