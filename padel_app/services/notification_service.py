@@ -78,6 +78,7 @@ def get_config_dict(coach_id: int) -> dict:
     config = get_or_create_config(coach_id)
     return {
         "autoNotifyEnabled": config.auto_notify_enabled,
+        "invitationMode": config.get_invitation_mode(),
         "priorityCriteria": config.get_priority_criteria(),
         "restrictions": config.get_restrictions(),
         "rounds": config.get_rounds(),
@@ -97,6 +98,12 @@ def update_config(coach_id: int, data: dict) -> NotificationConfig:
 
     if "autoNotifyEnabled" in data:
         config.auto_notify_enabled = bool(data["autoNotifyEnabled"])
+    if "invitationMode" in data:
+        mode = data["invitationMode"]
+        if mode not in ("automatic", "semi_automatic"):
+            from flask import abort
+            abort(400, "invitationMode must be 'automatic' or 'semi_automatic'")
+        config.invitation_mode = mode
     if "priorityCriteria" in data:
         config.priority_criteria = data["priorityCriteria"]
     if "restrictions" in data:
@@ -128,6 +135,11 @@ def update_config(coach_id: int, data: dict) -> NotificationConfig:
             pass  # scheduler may not be running (tests, etc.)
 
     return config
+
+
+def _is_semi_auto(config: NotificationConfig) -> bool:
+    """True when the coach requires approval before invitations are sent."""
+    return bool(config.auto_notify_enabled) and config.get_invitation_mode() == "semi_automatic"
 
 
 # ---------------------------------------------------------------------------
@@ -645,6 +657,8 @@ def _create_vacancy_for_absent_player(
     side = cp.side if cp else None
     level_id = cp.level_id if cp else None
 
+    config = get_or_create_config(coach_id)
+
     vacancy = Vacancy(
         lesson_instance_id=instance.id,
         coach_id=coach_id,
@@ -652,6 +666,7 @@ def _create_vacancy_for_absent_player(
         side=side,
         level_id=level_id,
         status="open",
+        approval_status="pending" if _is_semi_auto(config) else "not_required",
     )
     vacancy.create()
     return vacancy
@@ -669,6 +684,9 @@ def _create_structural_vacancies(instance: LessonInstance, coach_id: int) -> lis
     open_spots = instance.max_players - _effective_filled_spots(instance)
     spots_to_create = max(0, open_spots - existing_count)
 
+    config = get_or_create_config(coach_id)
+    approval_status = "pending" if _is_semi_auto(config) else "not_required"
+
     vacancies = []
     for _ in range(spots_to_create):
         v = Vacancy(
@@ -678,6 +696,7 @@ def _create_structural_vacancies(instance: LessonInstance, coach_id: int) -> lis
             side=None,
             level_id=instance.level_id,
             status="open",
+            approval_status=approval_status,
         )
         v.create()
         vacancies.append(v)
@@ -881,11 +900,22 @@ def respond_to_reminder(
         # If the invitation window is already open, trigger invitations immediately.
         if coach and config:
             from padel_app.scheduler import _compute_invite_start_dt
-            _ensure_vacancy_for_player(instance, coach.id, player.id)
-            invite_start_dt = _compute_invite_start_dt(instance, config.get_invitation_start_timing())
-            _now = now or utcnow_naive()
-            if invite_start_dt is None or _now >= invite_start_dt:
-                trigger_invitations(instance, coach.id)
+            vacancy = _ensure_vacancy_for_player(instance, coach.id, player.id)
+            if _is_semi_auto(config):
+                # Semi-automatic: ask the coach for approval instead of sending.
+                # No invitations are sent until the coach approves the prompt.
+                if vacancy is not None and vacancy.approval_status == "pending":
+                    from padel_app.services.replacement_approval_service import (
+                        create_approval_prompts,
+                    )
+                    create_approval_prompts(
+                        [vacancy], instance, coach.id, config, now=now
+                    )
+            else:
+                invite_start_dt = _compute_invite_start_dt(instance, config.get_invitation_start_timing())
+                _now = now or utcnow_naive()
+                if invite_start_dt is None or _now >= invite_start_dt:
+                    trigger_invitations(instance, coach.id)
 
         return {"action": "declined"}
 
@@ -913,17 +943,19 @@ def _ensure_vacancy_for_player(
     instance: LessonInstance,
     coach_id: int,
     player_id: int,
-) -> None:
+) -> Vacancy:
     """Create a vacancy for an absent player without triggering invitations.
     Used when the invitation window hasn't opened yet — the invite_start scheduler
-    job will call trigger_invitations when the window opens."""
+    job will call trigger_invitations when the window opens.
+    Returns the existing or newly created vacancy."""
     existing = Vacancy.query.filter_by(
         lesson_instance_id=instance.id,
         original_player_id=player_id,
         status="open",
     ).first()
-    if not existing:
-        _create_vacancy_for_absent_player(instance, coach_id, player_id)
+    if existing:
+        return existing
+    return _create_vacancy_for_absent_player(instance, coach_id, player_id)
 
 
 # ---------------------------------------------------------------------------
@@ -1079,31 +1111,9 @@ def _send_next_on_decline(
 # Main invitation trigger
 # ---------------------------------------------------------------------------
 
-def trigger_invitations(
-    instance: LessonInstance,
-    coach_id: int,
-    *,
-    now: datetime | None = None,
-) -> list[dict]:
-    """
-    Main entry point to start filling open spots.
-    Finds or creates vacancies and sends the first invitation batch for each.
-    Returns list of {id, name} for players notified in round 1.
-
-    Pass ``now`` in tests to control the current time without waiting for real time to pass.
-    """
-    config = get_or_create_config(coach_id)
-
-    if not config.auto_notify_enabled:
-        return []
-    if not instance.notifications_enabled:
-        return []
-
-    restrictions = config.get_restrictions()
-    if not _check_restrictions(instance, coach_id, restrictions, now=now):
-        return []
-
-    # Find existing open vacancies or create new ones
+def _find_or_create_open_vacancies(instance: LessonInstance, coach_id: int) -> list[Vacancy]:
+    """Find existing open vacancies for an instance or create new ones
+    (from absent presences + structural open spots)."""
     open_vacancies = Vacancy.query.filter_by(
         lesson_instance_id=instance.id,
         status="open",
@@ -1126,11 +1136,67 @@ def trigger_invitations(
         # Also create structural vacancies (spots never filled)
         open_vacancies.extend(_create_structural_vacancies(instance, coach_id))
 
+    return open_vacancies
+
+
+def trigger_invitations(
+    instance: LessonInstance,
+    coach_id: int,
+    *,
+    now: datetime | None = None,
+) -> list[dict]:
+    """
+    Main entry point to start filling open spots.
+    Finds or creates vacancies and sends the first invitation batch for each.
+    Returns list of {id, name} for players notified in round 1.
+
+    In semi-automatic mode, vacancies pending coach approval produce a
+    replacement approval prompt instead of invitations; only "not_required"
+    and "approved" vacancies are sent.
+
+    Pass ``now`` in tests to control the current time without waiting for real time to pass.
+    """
+    config = get_or_create_config(coach_id)
+
+    if not config.auto_notify_enabled:
+        return []
+    if not instance.notifications_enabled:
+        return []
+
+    semi_auto = _is_semi_auto(config)
+    open_vacancies: list[Vacancy] | None = None
+
+    if semi_auto:
+        # Restrictions gate SENDING, not asking — create the approval prompts
+        # before the restrictions check so the coach is always asked exactly
+        # once (the invite_start DateTrigger fires only once).
+        open_vacancies = _find_or_create_open_vacancies(instance, coach_id)
+        pending = [v for v in open_vacancies if v.approval_status == "pending"]
+        if pending:
+            from padel_app.services.replacement_approval_service import (
+                create_approval_prompts,
+            )
+            create_approval_prompts(pending, instance, coach_id, config, now=now)
+
+    restrictions = config.get_restrictions()
+    if not _check_restrictions(instance, coach_id, restrictions, now=now):
+        return []
+
+    if open_vacancies is None:
+        open_vacancies = _find_or_create_open_vacancies(instance, coach_id)
+
     if not open_vacancies:
         return []
 
+    _now = now or utcnow_naive()
+    sendable = [
+        v for v in open_vacancies
+        if v.approval_status in ("not_required", "approved")
+        and (v.invite_not_before is None or _now >= v.invite_not_before)
+    ]
+
     all_notified: list[dict] = []
-    for vacancy in open_vacancies:
+    for vacancy in sendable:
         notified = _send_invitation_batch(vacancy, instance, config, coach_id)
         all_notified.extend(notified)
 
@@ -1174,6 +1240,14 @@ def process_invitation_batches(*, now: datetime | None = None) -> int:
         if instance.status in ("canceled", "completed"):
             vacancy.status = "expired"
             vacancy.save()
+            continue
+
+        # Semi-automatic gating: never send (or waiting-list fill) vacancies
+        # awaiting coach approval or dismissed by the coach.
+        if vacancy.approval_status in ("pending", "dismissed"):
+            continue
+        # Approved "at the invitation window": hold until the window opens.
+        if vacancy.invite_not_before is not None and _now < vacancy.invite_not_before:
             continue
 
         config = get_or_create_config(vacancy.coach_id)

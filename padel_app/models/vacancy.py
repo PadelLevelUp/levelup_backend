@@ -35,6 +35,17 @@ class Vacancy(db.Model, model.Model):
         default="open",
         nullable=False,
     )
+    # Semi-automatic mode: "pending" until the coach approves/dismisses.
+    # Automatic mode always uses "not_required".
+    approval_status = Column(
+        Enum("not_required", "pending", "approved", "dismissed", name="vacancy_approval_status"),
+        default="not_required",
+        server_default="not_required",
+        nullable=False,
+    )
+    # Set when the coach approves "at the invitation window" before it opens:
+    # no invitations may be sent for this vacancy before this datetime.
+    invite_not_before = Column(DateTime, nullable=True)
     current_round_number = Column(Integer, default=1, nullable=False)
     current_batch_number = Column(Integer, default=0, nullable=False)
 

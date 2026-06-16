@@ -332,6 +332,8 @@ class TestProcessInvitationBatches:
 
         vacancy = MagicMock()
         vacancy.status = status
+        vacancy.approval_status = "not_required"
+        vacancy.invite_not_before = None
         vacancy.last_activity_at = last_activity_at
         vacancy.coach_id = 1
         vacancy.lesson_instance = instance

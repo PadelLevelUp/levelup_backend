@@ -783,33 +783,58 @@ def edit_calendar_block(block_id):
 @jwt_required()
 def confirm_presences():
     from padel_app.scheduler import _compute_invite_start_dt
-    from padel_app.services.notification_service import get_or_create_config, trigger_invitations
+    from padel_app.services.notification_service import (
+        _ensure_vacancy_for_player,
+        _is_semi_auto,
+        get_or_create_config,
+        trigger_invitations,
+    )
     from padel_app.utils.dates import utcnow_naive
 
     data = request.get_json()
     presences = confirm_presences_service(data['classInstance'], data['presences'])
 
     notified_players = []
+    approval_bundle = None
     has_absences = any(p.status == "absent" for p in presences)
     if has_absences and presences:
         coach = current_coach()
         instance = presences[0].lesson_instance
         if instance and instance.start_datetime > utcnow_naive():
             config = get_or_create_config(coach.id)
-            invite_start_dt = _compute_invite_start_dt(instance, config.get_invitation_start_timing())
-            # Only send invitations if the invitation window has opened.
-            # If not yet open, the invite_start scheduler job will call trigger_invitations
-            # at the configured time, which will find the absent presences and invite.
-            if invite_start_dt is None or utcnow_naive() >= invite_start_dt:
-                try:
-                    notified_players = trigger_invitations(instance, coach.id) or []
-                except Exception:
-                    from padel_app.sql_db import db
-                    db.session.rollback()
+            if _is_semi_auto(config):
+                # Semi-automatic: create pending vacancies for the absent
+                # players and bundle ONE approval prompt instead of sending.
+                from padel_app.services.replacement_approval_service import (
+                    create_approval_prompts,
+                )
+                pending_vacancies = []
+                for p in presences:
+                    if p.status != "absent":
+                        continue
+                    vacancy = _ensure_vacancy_for_player(instance, coach.id, p.player_id)
+                    if vacancy is not None and vacancy.approval_status == "pending":
+                        pending_vacancies.append(vacancy)
+                if pending_vacancies:
+                    approval_bundle = create_approval_prompts(
+                        pending_vacancies, instance, coach.id, config
+                    )
+            else:
+                invite_start_dt = _compute_invite_start_dt(instance, config.get_invitation_start_timing())
+                # Only send invitations if the invitation window has opened.
+                # If not yet open, the invite_start scheduler job will call trigger_invitations
+                # at the configured time, which will find the absent presences and invite.
+                if invite_start_dt is None or utcnow_naive() >= invite_start_dt:
+                    try:
+                        notified_players = trigger_invitations(instance, coach.id) or []
+                    except Exception:
+                        from padel_app.sql_db import db
+                        db.session.rollback()
 
     return jsonify({
         "presences": [serialize_presence(p) for p in presences],
         "notifiedPlayers": notified_players,
+        "approvalBundle": approval_bundle,
     })
 
 
