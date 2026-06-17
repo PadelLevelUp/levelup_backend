@@ -90,7 +90,7 @@ jobs:
         username: ${{ secrets.GCE_USER }}
         key: ${{ secrets.GCE_SSH_PRIVATE_KEY }}
         source: "scripts/backup.sh"
-        target: "/home/${{ secrets.GCE_USER }}//backup.sh"
+        target: "/home/${{ secrets.GCE_USER }}/"
         strip_components: 1
         overwrite: true
 
