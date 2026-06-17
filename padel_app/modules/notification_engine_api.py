@@ -185,6 +185,24 @@ def coach_respond():
     return jsonify(result)
 
 
+@bp.post("/approval/respond")
+@jwt_required()
+def approval_respond():
+    """Coach responds to a replacement approval bundle (semi-automatic mode).
+
+    Body: { "bundleId": str, "action": "yes_now" | "yes_at_window" | "dismiss" }
+    """
+    coach = _current_coach()
+    data = request.get_json() or {}
+    bundle_id = data.get("bundleId")
+    action = data.get("action")
+    if not bundle_id:
+        abort(400, "bundleId is required")
+    from padel_app.services.replacement_approval_service import respond_to_approval
+    result = respond_to_approval(bundle_id, action, coach.id)
+    return jsonify(result)
+
+
 @bp.post("/process_rounds")
 @jwt_required()
 def process_rounds():

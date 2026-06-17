@@ -1,4 +1,4 @@
-from sqlalchemy import Boolean, Column, ForeignKey, Integer, JSON
+from sqlalchemy import Boolean, Column, ForeignKey, Integer, JSON, String
 from sqlalchemy.orm import relationship
 
 from padel_app.sql_db import db
@@ -79,6 +79,12 @@ class NotificationConfig(db.Model, model.Model):
         Integer, ForeignKey("coaches.id", ondelete="CASCADE"), unique=True, nullable=False
     )
     auto_notify_enabled = Column(Boolean, default=False, nullable=False)
+    # "automatic" (default) or "semi_automatic" — only relevant when
+    # auto_notify_enabled is true. In semi_automatic mode vacancies require
+    # coach approval before invitations are sent.
+    invitation_mode = Column(
+        String(20), default="automatic", server_default="automatic", nullable=False
+    )
     priority_criteria = Column(JSON, nullable=True)
     restrictions = Column(JSON, nullable=True)
     rounds = Column(JSON, nullable=True)
@@ -94,6 +100,9 @@ class NotificationConfig(db.Model, model.Model):
     @property
     def name(self):
         return f"NotificationConfig for coach {self.coach_id}"
+
+    def get_invitation_mode(self):
+        return self.invitation_mode or "automatic"
 
     def get_priority_criteria(self):
         return self.priority_criteria if self.priority_criteria is not None else DEFAULT_PRIORITY_CRITERIA
