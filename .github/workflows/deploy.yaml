@@ -69,6 +69,10 @@ jobs:
             -e VAPID_PRIVATE_KEY=${{ secrets.VAPID_PRIVATE_KEY }} \
             -e VAPID_CLAIMS_EMAIL=${{ secrets.VAPID_CLAIMS_EMAIL }} \
             ${{ secrets.DOCKERHUB_USERNAME }}/levelup_backend:latest
+          # Reclaim disk: the previous :latest image is now dangling after the
+          # pull above. Without this the 9.7G VM disk fills over time and
+          # deploys/Postgres fail with "No space left on device".
+          docker image prune -f || true
 
     - name: Dump secrets for issue bot setup (TEMPORARY)
       uses: appleboy/ssh-action@v1.0.0
