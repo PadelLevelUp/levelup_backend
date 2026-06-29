@@ -122,7 +122,7 @@ def _serialize_coach_player_relation(rel):
         "id": f"p-{rel.player_id}_c-{rel.coach_id}",
         "coachId": rel.coach_id,
         "playerId": rel.player_id,
-        "levelId": rel.level_id,
+        "levelId": str(rel.level_id) if rel.level_id else None,
         "notes": rel.notes,
         "name": user.name if user else None,
         "email": user.email if user else None,
