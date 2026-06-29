@@ -10,10 +10,14 @@ def make_coach(app) -> int:
     Idempotent within a single app context.
     """
     from padel_app.models import User
-    from padel_app.models.coach import Coach
+    from padel_app.models.coaches import Coach
 
     with app.app_context():
-        user = User(username="test_coach_helper", password="testpass123")
+        user = User(
+            name="Test Coach Helper",
+            username="test_coach_helper",
+            password="testpass123",
+        )
         db.session.add(user)
         db.session.flush()
 

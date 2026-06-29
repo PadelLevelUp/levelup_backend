@@ -145,7 +145,7 @@ class Player(db.Model, model.Model):
             "id": f"p-{self.id}_c-{coach_id}",
             "coachId": coach_id,
             "playerId": self.id,
-            "levelId": rel.level_id,
+            "levelId": str(rel.level_id) if rel.level_id else None,
             "notes": rel.notes,
             "name": self.user.name,        
             "email": self.user.email,        
