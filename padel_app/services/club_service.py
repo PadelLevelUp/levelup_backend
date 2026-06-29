@@ -134,6 +134,10 @@ def accept_coach_invitation_service(token, data=None, coach=None, now=None):
     db.session.add(new_coach)
     db.session.flush()
 
+    from padel_app.services.coach_service import create_default_levels_for_coach
+
+    create_default_levels_for_coach(new_coach)
+
     db.session.add(
         Association_CoachClub(coach_id=new_coach.id, club_id=invitation.club_id)
     )

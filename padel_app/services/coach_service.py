@@ -6,7 +6,14 @@ from padel_app.models import (
     EvaluationEntry,
     Association_CoachPlayer,
 )
+from padel_app.sql_db import db
 from padel_app.tools.request_adapter import JsonRequestAdapter
+
+DEFAULT_COACH_LEVELS = [
+    {"code": "L1", "label": "Level 1", "display_order": 1},
+    {"code": "L2", "label": "Level 2", "display_order": 2},
+    {"code": "L3", "label": "Level 3", "display_order": 3},
+]
 
 
 def _apply_form(form, payload, element):
@@ -14,6 +21,28 @@ def _apply_form(form, payload, element):
     values = form.set_values(fake_request)
     element.update_with_dict(values)
     return element
+
+
+def create_default_levels_for_coach(coach):
+    """Create the three default skill levels (L1, L2, L3) for a coach.
+
+    Idempotent: does nothing if the coach already has any levels.
+    Returns the coach's levels.
+    """
+    if coach.levels:
+        return coach.levels
+
+    for entry in DEFAULT_COACH_LEVELS:
+        db.session.add(
+            CoachLevel(
+                coach_id=coach.id,
+                code=entry["code"],
+                label=entry["label"],
+                display_order=entry["display_order"],
+            )
+        )
+    db.session.commit()
+    return coach.levels
 
 
 def create_coach_service(data):
@@ -25,6 +54,7 @@ def create_coach_service(data):
 
     coach.update_with_dict(values)
     coach.create()
+    create_default_levels_for_coach(coach)
     return coach
 
 
