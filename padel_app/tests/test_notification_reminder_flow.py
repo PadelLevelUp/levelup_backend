@@ -281,6 +281,123 @@ class TestSendClassRemindersIntegration:
             assert True
 
 
+def _config_with_repeat(app, coach_id, *, count, hours):
+    """Persist a NotificationConfig for the coach with repeat-reminder settings."""
+    from padel_app.models.notification_config import NotificationConfig
+
+    with app.app_context():
+        NotificationConfig(
+            coach_id=coach_id,
+            auto_notify_enabled=False,
+            reminder_timing={
+                "firstReminder": {"type": "hours_before", "value": 48},
+                "reminderCount": count,
+                "hoursBetweenReminders": hours,
+            },
+        ).create()
+
+
+# ---------------------------------------------------------------------------
+# TestRepeatReminders — reminderCount / hoursBetweenReminders behavior
+# ---------------------------------------------------------------------------
+
+class TestRepeatReminders:
+
+    def test_sends_up_to_reminder_count_then_stops(self, app):
+        """With reminderCount=3 and a student who never responds, successive calls
+        produce exactly 3 reminder Messages; a 4th call produces none."""
+        from padel_app.services.notification_service import send_class_reminders
+        from padel_app.models.messages import Message
+
+        ids = _seed_coach_and_student(app)
+        # Class far in the future so all sends are before its start.
+        instance_id = _seed_instance(app, ids["coach_id"], ids["student_id"], start_offset_hours=72)
+        _config_with_repeat(app, ids["coach_id"], count=3, hours=2)
+
+        with app.app_context():
+            t0 = datetime.utcnow()
+            with patch(PATCHES[0]), patch(PATCHES[1]):
+                send_class_reminders(instance_id, now=t0)
+                send_class_reminders(instance_id, now=t0 + timedelta(hours=2))
+                send_class_reminders(instance_id, now=t0 + timedelta(hours=4))
+                fourth = send_class_reminders(instance_id, now=t0 + timedelta(hours=6))
+
+            msgs = Message.query.filter_by(message_type="notification_reminder").all()
+            assert len(msgs) == 3
+            # Each carries the instanceId + an increasing reminderNumber.
+            numbers = sorted(m.msg_metadata.get("reminderNumber") for m in msgs)
+            assert numbers == [1, 2, 3]
+            assert all(m.msg_metadata.get("instanceId") == instance_id for m in msgs)
+            assert fourth == {"sent": 0, "more_due": False}
+
+    def test_stops_early_when_student_responds(self, app):
+        """If the student confirms after the 1st reminder, the next call sends nothing."""
+        from padel_app.services.notification_service import (
+            send_class_reminders,
+            respond_to_reminder,
+        )
+        from padel_app.models.messages import Message
+
+        ids = _seed_coach_and_student(app)
+        instance_id = _seed_instance(app, ids["coach_id"], ids["student_id"], start_offset_hours=72)
+        _config_with_repeat(app, ids["coach_id"], count=3, hours=2)
+
+        with app.app_context():
+            t0 = datetime.utcnow()
+            with patch(PATCHES[0]), patch(PATCHES[1]):
+                first = send_class_reminders(instance_id, now=t0)
+                # Student responds (confirm) — no further reminders should be sent.
+                respond_to_reminder(instance_id, "yes", ids["student_user_id"])
+                second = send_class_reminders(instance_id, now=t0 + timedelta(hours=2))
+
+            msgs = Message.query.filter_by(message_type="notification_reminder").all()
+            assert len(msgs) == 1
+            assert first["sent"] == 1
+            assert second == {"sent": 0, "more_due": False}
+
+    def test_stops_early_when_student_declines(self, app):
+        """A decline also halts further reminders."""
+        from padel_app.services.notification_service import (
+            send_class_reminders,
+            respond_to_reminder,
+        )
+        from padel_app.models.messages import Message
+
+        ids = _seed_coach_and_student(app)
+        instance_id = _seed_instance(app, ids["coach_id"], ids["student_id"], start_offset_hours=72)
+        _config_with_repeat(app, ids["coach_id"], count=3, hours=2)
+
+        with app.app_context():
+            t0 = datetime.utcnow()
+            with patch(PATCHES[0]), patch(PATCHES[1]):
+                send_class_reminders(instance_id, now=t0)
+                respond_to_reminder(instance_id, "no", ids["student_user_id"], now=t0)
+                second = send_class_reminders(instance_id, now=t0 + timedelta(hours=2))
+
+            msgs = Message.query.filter_by(message_type="notification_reminder").all()
+            assert len(msgs) == 1
+            assert second["sent"] == 0
+
+    def test_more_due_true_until_last_reminder(self, app):
+        """more_due is True after reminders 1 and 2 of 3, and False after reminder 3."""
+        from padel_app.services.notification_service import send_class_reminders
+
+        ids = _seed_coach_and_student(app)
+        instance_id = _seed_instance(app, ids["coach_id"], ids["student_id"], start_offset_hours=72)
+        _config_with_repeat(app, ids["coach_id"], count=3, hours=2)
+
+        with app.app_context():
+            t0 = datetime.utcnow()
+            with patch(PATCHES[0]), patch(PATCHES[1]):
+                r1 = send_class_reminders(instance_id, now=t0)
+                r2 = send_class_reminders(instance_id, now=t0 + timedelta(hours=2))
+                r3 = send_class_reminders(instance_id, now=t0 + timedelta(hours=4))
+
+            assert r1 == {"sent": 1, "more_due": True}
+            assert r2 == {"sent": 1, "more_due": True}
+            assert r3 == {"sent": 1, "more_due": False}
+
+
 # ---------------------------------------------------------------------------
 # TestRespondToReminder
 # ---------------------------------------------------------------------------

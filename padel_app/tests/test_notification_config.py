@@ -270,6 +270,51 @@ class TestDefaultReminderTiming:
 
 
 # ===========================================================================
+# Repeat reminder settings — reminderCount / hoursBetweenReminders
+# ===========================================================================
+
+class TestRepeatReminderSettings:
+    """Accessor tests for reminderCount / hoursBetweenReminders.
+
+    These build a real NotificationConfig inside an app context (rather than the
+    ``__new__``-based fixtures used elsewhere in this file) so the SQLAlchemy
+    mapper is instrumented and attribute assignment works.
+    """
+
+    @staticmethod
+    def _cfg(app, reminder_timing):
+        with app.app_context():
+            return NotificationConfig(coach_id=1, reminder_timing=reminder_timing)
+
+    def test_reminder_count_default_when_unset(self, app):
+        assert self._cfg(app, None).get_reminder_count() == 1
+
+    def test_hours_between_default_when_unset(self, app):
+        assert self._cfg(app, None).get_hours_between_reminders() == 24
+
+    def test_reminder_count_reads_stored_value(self, app):
+        cfg = self._cfg(app, {
+            "firstReminder": {"type": "hours_before", "value": 48},
+            "reminderCount": 3,
+            "hoursBetweenReminders": 2,
+        })
+        assert cfg.get_reminder_count() == 3
+        assert cfg.get_hours_between_reminders() == 2
+
+    def test_reminder_count_floored_at_one(self, app):
+        assert self._cfg(app, {"reminderCount": 0}).get_reminder_count() == 1
+
+    def test_reminder_count_handles_bad_value(self, app):
+        assert self._cfg(app, {"reminderCount": "oops"}).get_reminder_count() == 1
+
+    def test_hours_between_rejects_non_positive(self, app):
+        assert self._cfg(app, {"hoursBetweenReminders": 0}).get_hours_between_reminders() == 24
+
+    def test_hours_between_handles_bad_value(self, app):
+        assert self._cfg(app, {"hoursBetweenReminders": None}).get_hours_between_reminders() == 24
+
+
+# ===========================================================================
 # Invitation groups — new column (new_backend)
 # ===========================================================================
 
