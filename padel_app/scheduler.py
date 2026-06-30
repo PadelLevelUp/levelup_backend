@@ -122,6 +122,56 @@ def _compute_invite_start_dt(instance, timing_config: dict) -> datetime | None:
 # (called by APScheduler on its background thread — no app arg, use _app)
 # ---------------------------------------------------------------------------
 
+def _maybe_rearm_reminder(instance, *, func, args, base_job_id, result) -> None:
+    """Schedule a follow-up reminder pass when students still owe reminders.
+
+    Called from a reminder job runner after ``send_class_reminders``. If the
+    service reports ``more_due`` and the class start is still in the future,
+    schedule a one-shot DateTrigger job ``get_hours_between_reminders()`` from
+    now that re-invokes the same runner. The fire time is never at/after the
+    class start. A timestamp-suffixed job id keeps each attempt unique.
+    """
+    if _scheduler is None:
+        return
+    if not (result and result.get("more_due")):
+        return
+
+    from apscheduler.triggers.date import DateTrigger
+    from padel_app.models.Association_CoachLessonInstance import (
+        Association_CoachLessonInstance,
+    )
+    from padel_app.services.notification_service import get_or_create_config
+
+    coach_rel = Association_CoachLessonInstance.query.filter_by(
+        lesson_instance_id=instance.id
+    ).first()
+    if not coach_rel:
+        return
+
+    config = get_or_create_config(coach_rel.coach_id)
+    hours = config.get_hours_between_reminders()
+    next_dt = utcnow_naive() + timedelta(hours=hours)
+
+    # Never fire at/after the class start.
+    if instance.start_datetime is not None and next_dt >= instance.start_datetime:
+        return
+
+    retry_id = f"{base_job_id}_retry_{int(next_dt.timestamp())}"
+    _scheduler.add_job(
+        func=func,
+        args=args,
+        trigger=DateTrigger(run_date=next_dt, timezone="UTC"),
+        id=retry_id,
+        replace_existing=True,
+        misfire_grace_time=300,
+    )
+    if _app is not None:
+        _app.logger.info(
+            "reminder re-armed: %s to fire at %s (hours_between=%s)",
+            retry_id, next_dt, hours,
+        )
+
+
 def _run_reminder_for_lesson_occurrence(lesson_id: int, date_str: str) -> None:
     """Materialize a lesson occurrence (if needed) and send reminders.
 
@@ -156,7 +206,14 @@ def _run_reminder_for_lesson_occurrence(lesson_id: int, date_str: str) -> None:
                     instance.id, instance.status,
                 )
                 return
-            send_class_reminders(instance.id)
+            result = send_class_reminders(instance.id)
+            _maybe_rearm_reminder(
+                instance,
+                func=_run_reminder_for_lesson_occurrence,
+                args=[lesson_id, date_str],
+                base_job_id=f"reminder_lesson_{lesson_id}_{date_str}",
+                result=result,
+            )
             app.logger.info(
                 "reminder_for_lesson_occurrence: lesson=%s date=%s instance=%s — done",
                 lesson_id, date_str, instance.id,
@@ -176,7 +233,17 @@ def _run_send_reminders(instance_id: int) -> None:
     with app.app_context():
         from padel_app.services.notification_service import send_class_reminders
         try:
-            send_class_reminders(instance_id)
+            from padel_app.models import LessonInstance
+            result = send_class_reminders(instance_id)
+            instance = LessonInstance.query.get(instance_id)
+            if instance is not None:
+                _maybe_rearm_reminder(
+                    instance,
+                    func=_run_send_reminders,
+                    args=[instance_id],
+                    base_job_id=f"reminder_{instance_id}",
+                    result=result,
+                )
             app.logger.info("Reminder sent for instance %s", instance_id)
         except Exception as exc:
             app.logger.error("send_class_reminders(%s) failed: %s", instance_id, exc)

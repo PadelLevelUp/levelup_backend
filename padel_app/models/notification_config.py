@@ -65,6 +65,10 @@ DEFAULT_MESSAGE_TEMPLATES = {
 
 DEFAULT_REMINDER_TIMING = {"type": "hours_before", "value": 48}
 DEFAULT_INVITATION_START_TIMING = {"type": "hours_before", "value": 24}
+# How many reminders to send each student, and how far apart, when they
+# don't respond. Stored alongside ``firstReminder`` in the reminder_timing JSON.
+DEFAULT_REMINDER_COUNT = 1
+DEFAULT_HOURS_BETWEEN_REMINDERS = 24
 
 
 class NotificationConfig(db.Model, model.Model):
@@ -131,6 +135,39 @@ class NotificationConfig(db.Model, model.Model):
         if "firstReminder" in self.reminder_timing:
             return self.reminder_timing["firstReminder"]
         return self.reminder_timing  # already flat (legacy / default)
+
+    def get_reminder_count(self):
+        """Number of reminders to send each student (floor 1).
+
+        Read from the ``reminderCount`` key of the reminder_timing JSON, with the
+        same defensive shape handling as ``get_reminder_timing``.
+        """
+        rt = self.reminder_timing
+        if not isinstance(rt, dict):
+            return DEFAULT_REMINDER_COUNT
+        raw = rt.get("reminderCount", DEFAULT_REMINDER_COUNT)
+        try:
+            count = int(raw)
+        except (TypeError, ValueError):
+            return DEFAULT_REMINDER_COUNT
+        return max(1, count)
+
+    def get_hours_between_reminders(self):
+        """Hours to wait between consecutive reminders (must be > 0).
+
+        Read from the ``hoursBetweenReminders`` key of the reminder_timing JSON.
+        """
+        rt = self.reminder_timing
+        if not isinstance(rt, dict):
+            return DEFAULT_HOURS_BETWEEN_REMINDERS
+        raw = rt.get("hoursBetweenReminders", DEFAULT_HOURS_BETWEEN_REMINDERS)
+        try:
+            hours = float(raw)
+        except (TypeError, ValueError):
+            return DEFAULT_HOURS_BETWEEN_REMINDERS
+        if hours <= 0:
+            return DEFAULT_HOURS_BETWEEN_REMINDERS
+        return hours
 
     def get_invitation_start_timing(self):
         # Prefer invitationStart embedded in reminderTiming (set by UI)

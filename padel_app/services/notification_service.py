@@ -707,10 +707,21 @@ def _create_structural_vacancies(instance: LessonInstance, coach_id: int) -> lis
 # Reminder flow
 # ---------------------------------------------------------------------------
 
-def send_class_reminders(instance_id: int, *, now: datetime | None = None) -> None:
+def send_class_reminders(instance_id: int, *, now: datetime | None = None) -> dict:
     """
     Send 'Are you coming?' messages to all enrolled players.
     Called by APScheduler at the configured reminder time.
+
+    Sends up to ``reminderCount`` reminders per student (spaced
+    ``hoursBetweenReminders`` apart — the spacing is enforced by the scheduler
+    re-arming this function). A student is skipped once they have responded
+    (confirmed or declined) or once they have already received the configured
+    number of reminders.
+
+    Returns ``{"sent": <int>, "more_due": <bool>}`` where ``more_due`` is True
+    iff at least one student still has NOT responded AND has received fewer than
+    ``reminderCount`` reminders after this round (i.e. the scheduler should
+    re-arm another reminder pass).
 
     Pass ``now`` in tests to control the current time without waiting for real time to pass.
     """
@@ -720,20 +731,21 @@ def send_class_reminders(instance_id: int, *, now: datetime | None = None) -> No
     _log = current_app.logger if has_app_context() else None
 
     _now = now or utcnow_naive()
+    _no_send = {"sent": 0, "more_due": False}
 
     instance = LessonInstance.query.get(instance_id)
     if not instance:
         if _log:
             _log.warning("send_class_reminders: instance %s not found — skipping", instance_id)
-        return
+        return _no_send
     if instance.status in ("canceled", "completed"):
         if _log:
             _log.info("send_class_reminders: instance %s status=%s — skipping", instance_id, instance.status)
-        return
+        return _no_send
     if instance.start_datetime <= _now:
         if _log:
             _log.info("send_class_reminders: instance %s start_datetime in the past — skipping", instance_id)
-        return
+        return _no_send
 
     player_count = len(list(instance.players_relations))
     if _log:
@@ -745,7 +757,7 @@ def send_class_reminders(instance_id: int, *, now: datetime | None = None) -> No
     if player_count == 0:
         if _log:
             _log.info("send_class_reminders: instance %s has no enrolled players — nothing to send", instance_id)
-        return
+        return _no_send
 
     # Find the coach for this instance
     coach_rel = Association_CoachLessonInstance.query.filter_by(
@@ -754,19 +766,25 @@ def send_class_reminders(instance_id: int, *, now: datetime | None = None) -> No
     if not coach_rel:
         if _log:
             _log.warning("send_class_reminders: instance %s has no coach association — skipping", instance_id)
-        return
+        return _no_send
 
     coach = Coach.query.get(coach_rel.coach_id)
     if not coach:
-        return
+        return _no_send
 
     coach_user_id = coach.user_id
     config = get_or_create_config(coach.id)
     templates = config.get_message_templates()
+    reminder_count = config.get_reminder_count()
 
     level_code = instance.level.code if getattr(instance, "level", None) else "this"
     weekday = instance.start_datetime.strftime("%A") if instance.start_datetime else ""
     time_str = instance.start_datetime.strftime("%H:%M") if instance.start_datetime else ""
+
+    from padel_app.models import Message, Player
+
+    sent_this_round = 0
+    more_due = False
 
     for rel in instance.players_relations:
         player_id = rel.player_id
@@ -780,14 +798,36 @@ def send_class_reminders(instance_id: int, *, now: datetime | None = None) -> No
             lesson_instance_id=instance_id,
         ).first()
         if not existing_presence:
-            Presence(
+            existing_presence = Presence(
                 lesson_instance_id=instance_id,
                 player_id=player_id,
                 invited=True,
                 confirmed=False,
-            ).create()
+            )
+            existing_presence.create()
 
-        from padel_app.models import Player
+        # Stop reminding a student as soon as they have responded.
+        # Both "yes" and "no" responses set ``confirmed`` (see respond_to_reminder).
+        if existing_presence.confirmed:
+            continue
+
+        # Count reminders already sent to THIS player for THIS instance.
+        # DB-portable: load this player's reminder Messages and filter in Python
+        # on msg_metadata (no JSON-column SQL, so SQLite tests and Postgres prod
+        # behave identically).
+        conv = _get_or_create_direct_conversation(coach_user_id, player_user_id)
+        prior_reminders = Message.query.filter_by(
+            conversation_id=conv.id,
+            message_type="notification_reminder",
+        ).all()
+        sent_count = sum(
+            1 for m in prior_reminders
+            if m.msg_metadata and m.msg_metadata.get("instanceId") == instance_id
+        )
+
+        if sent_count >= reminder_count:
+            continue
+
         player = Player.query.get(player_id)
         player_name = (player.user.name if player and player.user else "there").split()[0]
 
@@ -806,9 +846,18 @@ def send_class_reminders(instance_id: int, *, now: datetime | None = None) -> No
             message_type="notification_reminder",
             msg_metadata={
                 "lessonInstanceId": instance_id,
+                "instanceId": instance_id,
+                "reminderNumber": sent_count + 1,
                 "responded": False,
             },
         )
+        sent_this_round += 1
+
+        # If this student still has reminders remaining, the scheduler must re-arm.
+        if (sent_count + 1) < reminder_count:
+            more_due = True
+
+    return {"sent": sent_this_round, "more_due": more_due}
 
 
 def respond_to_reminder(
