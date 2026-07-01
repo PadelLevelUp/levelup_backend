@@ -986,50 +986,150 @@ def import_analyze():
     )
 
 
-@bp.post("/import/confirm")
-@jwt_required()
-def import_confirm():
+def _run_import_confirm(data, coach, club):
+    """Shared bulk-import worker.
+
+    Runs the per-table import loop and yields SSE-shaped progress events so a
+    streaming response can keep the connection alive (avoiding a false gateway
+    504 on large uploads). The final ``done`` event carries the same results
+    dict the JSON endpoint returns.
+
+    Yielded event shapes::
+
+        {"type": "progress", "table": <str|None>, "done": <int>, "total": <int>}
+        {"type": "done", "results": {TableName: {imported, errors, created_ids}}}
+        {"type": "error", "message": <str>}
+
+    Individual ``bulk_create_*`` services already commit per row and collect
+    their own per-row errors, so already-imported rows persist even if a later
+    table fails — matching the previous behaviour.
+    """
     import json
     from padel_app.sql_db import db
     from padel_app.models.bulk_import import BulkImport
 
-    coach = current_coach()
-    club = current_club()
-    data = request.get_json() or {}
     results = {}
     all_created_ids = {}
     summary = {}
 
-    for table_name, fn, needs_club in _TABLE_MAP:
-        rows = data.get(table_name)
-        if not rows:
-            continue
-        print(f"Importing {len(rows)} to {table_name}")
-        result = fn(rows, coach, club) if needs_club else fn(rows, coach)
-        results[table_name] = result
+    tables_to_run = [
+        (name, fn, needs_club)
+        for (name, fn, needs_club) in _TABLE_MAP
+        if data.get(name)
+    ]
+    total = len(tables_to_run)
 
-        # Collect created IDs for tracking
-        if result.get("created_ids"):
-            for key, ids in result["created_ids"].items():
-                all_created_ids.setdefault(key, []).extend(ids)
+    try:
+        for idx, (table_name, fn, needs_club) in enumerate(tables_to_run):
+            rows = data.get(table_name)
+            # Emit progress before each table so bytes flow to the client and
+            # the gateway never idle-times-out mid-import.
+            yield {"type": "progress", "table": table_name, "done": idx, "total": total}
+            print(f"Importing {len(rows)} to {table_name}")
 
-        # Build summary of imported counts
-        if result.get("imported", 0) > 0:
-            summary[table_name] = result["imported"]
+            if needs_club:
+                # Players is the reported slow path — stream row-level progress
+                # from it so a single large player list can't exceed the gateway
+                # timeout on its own.
+                if getattr(fn, "supports_progress", False):
+                    result = None
+                    for step in fn(rows, coach, club, stream=True):
+                        if isinstance(step, dict) and step.get("_progress"):
+                            yield {
+                                "type": "progress",
+                                "table": table_name,
+                                "done": idx,
+                                "total": total,
+                                "rows_done": step["done"],
+                                "rows_total": step["total"],
+                            }
+                        else:
+                            result = step
+                else:
+                    result = fn(rows, coach, club)
+            else:
+                result = fn(rows, coach)
 
-    # Create a BulkImport record if anything was imported
-    if summary:
-        bulk_import = BulkImport(
-            coach_id=coach.id,
-            filename=data.get("_filename"),
-            status="active",
-            summary=json.dumps(summary),
-            record_ids=json.dumps(all_created_ids),
-        )
-        db.session.add(bulk_import)
-        db.session.commit()
+            results[table_name] = result
 
-    return jsonify(results)
+            # Collect created IDs for tracking
+            if result.get("created_ids"):
+                for key, ids in result["created_ids"].items():
+                    all_created_ids.setdefault(key, []).extend(ids)
+
+            # Build summary of imported counts
+            if result.get("imported", 0) > 0:
+                summary[table_name] = result["imported"]
+
+        # Create a BulkImport record if anything was imported
+        if summary:
+            bulk_import = BulkImport(
+                coach_id=coach.id,
+                filename=data.get("_filename"),
+                status="active",
+                summary=json.dumps(summary),
+                record_ids=json.dumps(all_created_ids),
+            )
+            db.session.add(bulk_import)
+            db.session.commit()
+
+        yield {"type": "progress", "table": None, "done": total, "total": total}
+        yield {"type": "done", "results": results}
+
+    except Exception as exc:  # infrastructure-level safety net
+        db.session.rollback()
+        yield {"type": "error", "message": str(exc)}
+
+
+@bp.post("/import/confirm")
+@jwt_required()
+def import_confirm():
+    """JSON import endpoint (kept for API/back-compat).
+
+    Drains the shared worker and returns the same results dict as before.
+    """
+    coach = current_coach()
+    club = current_club()
+    data = request.get_json() or {}
+
+    final = {}
+    for ev in _run_import_confirm(data, coach, club):
+        if ev["type"] == "done":
+            final = ev["results"]
+        elif ev["type"] == "error":
+            return jsonify({"error": ev["message"]}), 500
+
+    return jsonify(final)
+
+
+@bp.post("/import/confirm/stream")
+@jwt_required()
+def import_confirm_stream():
+    """Streaming import endpoint used by the frontend.
+
+    Emits SSE progress events while importing so the connection stays alive and
+    the front gateway never returns a false 504 on large uploads. The terminal
+    ``done`` event carries the same results dict as ``/import/confirm``.
+    """
+    from flask import stream_with_context
+
+    coach = current_coach()
+    if not coach:
+        return jsonify({"error": "Coach not found"}), 404
+    club = current_club()
+    data = request.get_json() or {}
+
+    def gen():
+        # Initial keepalive comment flushes headers immediately.
+        yield ": keepalive\n\n"
+        for ev in _run_import_confirm(data, coach, club):
+            yield f"data: {json.dumps(ev)}\n\n"
+
+    return Response(
+        stream_with_context(gen()),
+        mimetype="text/event-stream",
+        headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
+    )
 
 
 @bp.get("/import/history")
