@@ -1,10 +1,13 @@
+from padel_app.utils.dates import to_utc_iso
+
+
 def serialize_message(message, last_read_at):
     if message.is_deleted:
         return {
             "id": message.id,
             "senderId": message.sender_id,
             "content": None,
-            "timestamp": message.sent_at.isoformat(),
+            "timestamp": to_utc_iso(message.sent_at),
             "conversationId": message.conversation_id,
             "isRead": True,
             "status": "read",
@@ -20,7 +23,7 @@ def serialize_message(message, last_read_at):
         "id": message.id,
         "senderId": message.sender_id,
         "content": message.text,
-        "timestamp": message.sent_at.isoformat(),
+        "timestamp": to_utc_iso(message.sent_at),
         "conversationId": message.conversation_id,
         "isRead": is_read,
         "status": "read" if is_read else "delivered",
