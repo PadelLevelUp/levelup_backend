@@ -1,4 +1,5 @@
 from padel_app.serializers.message import serialize_message
+from padel_app.utils.dates import to_utc_iso
 
 def serialize_conversation(conversation, user_id):
     messages = sorted(conversation.messages, key=lambda m: m.sent_at)
@@ -33,7 +34,7 @@ def serialize_conversation(conversation, user_id):
 
         "lastMessage": last_message.text if last_message else None,
         "lastMessageAt": (
-            last_message.sent_at.isoformat()
+            to_utc_iso(last_message.sent_at)
             if last_message
             else None
         ),
