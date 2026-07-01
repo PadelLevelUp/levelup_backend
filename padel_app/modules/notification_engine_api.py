@@ -18,6 +18,7 @@ from padel_app.services.notification_service import (
     get_waiting_list,
     respond_to_notification,
     respond_to_reminder,
+    cancel_attendance,
     respond_to_waiting_list,
     coach_respond_to_notification,
     get_standing_waiting_list,
@@ -149,6 +150,21 @@ def respond_reminder_endpoint():
     lesson_instance_id = int(data.get("lessonInstanceId"))
     action = data.get("action")  # "yes" | "no"
     result = respond_to_reminder(lesson_instance_id, action, user_id)
+    return jsonify(result)
+
+
+@bp.post("/cancel_attendance")
+@jwt_required()
+def cancel_attendance_endpoint():
+    """Called by the player to cancel a previously-confirmed attendance.
+
+    Allowed only before the class starts. Frees the spot via the same engine
+    path as a reminder decline. Returns 409 if the class has already started.
+    """
+    user_id = int(get_jwt_identity())
+    data = request.get_json() or {}
+    lesson_instance_id = int(data.get("lessonInstanceId"))
+    result = cancel_attendance(lesson_instance_id, user_id)
     return jsonify(result)
 
 
