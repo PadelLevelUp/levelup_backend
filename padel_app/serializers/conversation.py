@@ -29,6 +29,7 @@ def serialize_conversation(conversation, user_id):
         "participantId": participant.id,
         "participantName": participant.name,
         "participantAvatar": getattr(participant, "avatar_url", None),
+        "participantRole": participant.role,
         "isAssistant": participant.username == "levelup-assistant",
 
         "lastMessage": last_message.text if last_message else None,
