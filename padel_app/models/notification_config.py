@@ -60,7 +60,7 @@ DEFAULT_MESSAGE_TEMPLATES = {
     "reminder_decline": "Got it, thanks for letting us know!",
     "waiting_list_offer": "This spot was just taken, but we can put you on the waiting list and notify you if another opens up. Interested?",
     "waiting_list_confirm": "You're on the waiting list! We'll let you know if a spot opens.",
-    "waiting_list_placed": "Good news! A spot opened up in the {level} class on {weekday} at {time} and you've been added. See you there! 🎾",
+    "waiting_list_placed": "Good news {name}! A spot opened up in the {level} class on {weekday} at {time} and you've been added. See you there! 🎾",
 }
 
 DEFAULT_REMINDER_TIMING = {"type": "hours_before", "value": 48}

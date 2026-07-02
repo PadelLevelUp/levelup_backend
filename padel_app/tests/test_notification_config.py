@@ -26,7 +26,7 @@ from padel_app.models.notification_config import (
 @pytest.fixture
 def fresh_config():
     """NotificationConfig with no stored values — all defaults."""
-    cfg = NotificationConfig.__new__(NotificationConfig)
+    cfg = NotificationConfig()
     cfg.id = None
     cfg.coach_id = 1
     cfg.auto_notify_enabled = False
@@ -46,7 +46,7 @@ def fresh_config():
 @pytest.fixture
 def config_with_overrides():
     """NotificationConfig with partial stored values."""
-    cfg = NotificationConfig.__new__(NotificationConfig)
+    cfg = NotificationConfig()
     cfg.id = 1
     cfg.coach_id = 1
     cfg.auto_notify_enabled = True

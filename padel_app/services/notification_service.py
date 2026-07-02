@@ -1821,13 +1821,18 @@ def _fill_from_waiting_list(
     if not player_user_id:
         return
 
+    from padel_app.models import Player
+
     templates = config.get_message_templates()
+    player = Player.query.get(entry.player_id)
+    player_name = (player.user.name if player and player.user else "there").split()[0]
     level_code = instance.level.code if getattr(instance, "level", None) else "this"
     weekday = instance.start_datetime.strftime("%A") if instance.start_datetime else ""
     time_str = instance.start_datetime.strftime("%H:%M") if instance.start_datetime else ""
 
     text = _format_template(
         templates.get("waiting_list_placed", DEFAULT_MESSAGE_TEMPLATES["waiting_list_placed"]),
+        name=player_name,
         level=level_code,
         weekday=weekday,
         time=time_str,
