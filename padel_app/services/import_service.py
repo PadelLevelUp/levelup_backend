@@ -205,7 +205,7 @@ def bulk_create_evaluation_categories(rows, coach):
 # Players
 # ---------------------------------------------------------------------------
 
-def bulk_create_players(rows, coach, club):
+def bulk_create_players(rows, coach, club, stream=False):
     """
     Find-or-create players.
 
@@ -224,14 +224,41 @@ def bulk_create_players(rows, coach, club):
       only the association.
 
     Level is matched by ``level_code`` against the coach's existing levels.
+
+    When ``stream=True`` this becomes a generator that yields periodic progress
+    dicts (``{"_progress": True, "done": i, "total": n}``) every
+    ``_PROGRESS_EVERY`` rows and yields the final result dict last. This lets the
+    confirm endpoint keep the connection alive during a large player import so
+    the front gateway never returns a false 504. When ``stream=False`` (default)
+    it returns the result dict directly, preserving the original API.
     """
+    if stream:
+        return _bulk_create_players_stream(rows, coach, club)
+    # Drain the streaming generator, discarding progress, to reuse one codepath.
+    result = None
+    for step in _bulk_create_players_stream(rows, coach, club):
+        if not (isinstance(step, dict) and step.get("_progress")):
+            result = step
+    return result
+
+
+bulk_create_players.supports_progress = True
+
+# Emit a progress event roughly every N rows during a streamed player import.
+_PROGRESS_EVERY = 5
+
+
+def _bulk_create_players_stream(rows, coach, club):
     imported = 0
     errors = []
     created_ids = {"users": [], "players": [], "coach_players": [], "player_level_history": []}
 
     levels_by_code = {lvl.code: lvl for lvl in coach.levels}
+    total = len(rows)
 
     for i, row in enumerate(rows):
+        if i % _PROGRESS_EVERY == 0:
+            yield {"_progress": True, "done": i, "total": total}
         try:
             email = _resolve_player_email(row, i)
 
@@ -320,7 +347,7 @@ def bulk_create_players(rows, coach, club):
             db.session.rollback()
             errors.append({"row": i, "data": row, "error": str(e)})
 
-    return _ok(imported, errors, created_ids)
+    yield _ok(imported, errors, created_ids)
 
 
 # ---------------------------------------------------------------------------
