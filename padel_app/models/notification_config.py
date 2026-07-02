@@ -20,6 +20,8 @@ DEFAULT_RESTRICTIONS = {
     "maxInvitesPerStudentPerDay": {"enabled": False, "value": 3},
     "quietHours": {"enabled": False},
     "maxInactiveTime": {"enabled": True, "value": 120},
+    "excludedPlayers": {"enabled": False, "playerIds": []},
+    "excludeUnpaidSubscription": {"enabled": False},
 }
 
 DEFAULT_ROUNDS = [
@@ -56,12 +58,36 @@ DEFAULT_MESSAGE_TEMPLATES = {
     "decline": "No problem, see you next time!",
     "spot_filled": "Sorry, this place was filled already! I'll get back to you if something else opens up.",
     "reminder": "Hey {name}, just a reminder that you have the {level} class this {weekday} at {time}. Are you coming?",
-    "reminder_confirm": "Great, see you then! 🎾",
-    "reminder_decline": "Got it, thanks for letting us know!",
+    "reminder_followup": "Hey {name}, still haven't heard back — do you have a spot for the {level} class this {weekday} at {time}?",
+    "reminder_confirmed": "Great, see you then! 🎾",
+    "reminder_declined": "Got it, thanks for letting us know!",
     "waiting_list_offer": "This spot was just taken, but we can put you on the waiting list and notify you if another opens up. Interested?",
     "waiting_list_confirm": "You're on the waiting list! We'll let you know if a spot opens.",
     "waiting_list_placed": "Good news {name}! A spot opened up in the {level} class on {weekday} at {time} and you've been added. See you there! 🎾",
 }
+
+DEFAULT_INVITATION_GROUPS = [
+    {
+        "id": "1",
+        "rules": [
+            {"attribute": "level", "operation": "same_as_vacancy"},
+            {"attribute": "side", "operation": "same_as_vacancy"},
+        ],
+    },
+    {
+        "id": "2",
+        "rules": [{"attribute": "level", "operation": "same_as_vacancy"}],
+    },
+    {"id": "3", "rules": []},
+]
+
+DEFAULT_TIEBREAKERS = [
+    {"id": "unjustified_absences", "label": "Fewest unjustified absences", "enabled": True},
+    {"id": "justified_absences", "label": "Most justified absences", "enabled": True},
+    {"id": "attendance_rate", "label": "Highest attendance rate", "enabled": True},
+    {"id": "playing_side_match", "label": "Matching playing side", "enabled": False},
+    {"id": "subscription_status", "label": "Active subscription", "enabled": False},
+]
 
 DEFAULT_REMINDER_TIMING = {"type": "hours_before", "value": 48}
 DEFAULT_INVITATION_START_TIMING = {"type": "hours_before", "value": 24}
@@ -178,10 +204,10 @@ class NotificationConfig(db.Model, model.Model):
         return DEFAULT_INVITATION_START_TIMING
 
     def get_invitation_groups(self):
-        return self.invitation_groups if self.invitation_groups is not None else []
+        return self.invitation_groups if self.invitation_groups is not None else DEFAULT_INVITATION_GROUPS
 
     def get_tiebreakers(self):
-        return self.tiebreakers if self.tiebreakers is not None else []
+        return self.tiebreakers if self.tiebreakers is not None else DEFAULT_TIEBREAKERS
 
     @classmethod
     def get_create_form(cls):

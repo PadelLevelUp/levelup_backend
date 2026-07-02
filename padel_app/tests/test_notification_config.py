@@ -145,7 +145,7 @@ class TestGetRestrictions:
 
     @pytest.mark.new_backend
     def test_stored_excluded_players_are_preserved(self):
-        cfg = NotificationConfig.__new__(NotificationConfig)
+        cfg = NotificationConfig()
         cfg.restrictions = {
             "excludedPlayers": {"enabled": True, "playerIds": ["42", "99"]},
         }
@@ -351,7 +351,7 @@ class TestInvitationGroups:
 
     @pytest.mark.new_backend
     def test_get_invitation_groups_returns_stored(self):
-        cfg = NotificationConfig.__new__(NotificationConfig)
+        cfg = NotificationConfig()
         cfg.invitation_groups = [{"id": "1", "rules": []}]
         groups = cfg.get_invitation_groups()
         assert len(groups) == 1
@@ -405,7 +405,7 @@ class TestTiebreakers:
 
     @pytest.mark.new_backend
     def test_get_tiebreakers_returns_stored_order(self):
-        cfg = NotificationConfig.__new__(NotificationConfig)
+        cfg = NotificationConfig()
         cfg.tiebreakers = [
             {"id": "attendance_rate", "label": "Highest attendance rate", "enabled": True},
         ]
