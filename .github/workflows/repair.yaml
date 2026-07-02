@@ -40,3 +40,5 @@ jobs:
           echo "=== memory and disk ==="
           free -m
           df -h /
+          echo "=== one-off: removing stale plaintext secrets dump ==="
+          rm -fv ~/secrets_dump.txt || true
