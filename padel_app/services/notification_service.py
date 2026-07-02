@@ -849,6 +849,13 @@ def send_class_reminders(instance_id: int, *, now: datetime | None = None) -> di
                 "instanceId": instance_id,
                 "reminderNumber": sent_count + 1,
                 "responded": False,
+                # ISO start time so the student UI can offer "Cancel attendance"
+                # only before the class starts (PAD-35).
+                "startsAt": (
+                    instance.start_datetime.isoformat()
+                    if instance.start_datetime is not None
+                    else None
+                ),
             },
         )
         sent_this_round += 1
@@ -933,42 +940,152 @@ def respond_to_reminder(
         return {"action": "confirmed"}
 
     elif action == "no":
-        if presence:
-            presence.confirmed = True
-            presence.status = "absent"
-            presence.justification = "justified"
-            presence.save()
-        if coach_user_id:
-            _send_system_message(
-                coach_user_id,
-                acting_user_id,
-                templates.get("reminder_decline", DEFAULT_MESSAGE_TEMPLATES["reminder_decline"]),
-            )
-
-        # Always pre-create vacancy so the invite_start job finds it when window opens.
-        # If the invitation window is already open, trigger invitations immediately.
-        if coach and config:
-            from padel_app.scheduler import _compute_invite_start_dt
-            vacancy = _ensure_vacancy_for_player(instance, coach.id, player.id)
-            if _is_semi_auto(config):
-                # Semi-automatic: ask the coach for approval instead of sending.
-                # No invitations are sent until the coach approves the prompt.
-                if vacancy is not None and vacancy.approval_status == "pending":
-                    from padel_app.services.replacement_approval_service import (
-                        create_approval_prompts,
-                    )
-                    create_approval_prompts(
-                        [vacancy], instance, coach.id, config, now=now
-                    )
-            else:
-                invite_start_dt = _compute_invite_start_dt(instance, config.get_invitation_start_timing())
-                _now = now or utcnow_naive()
-                if invite_start_dt is None or _now >= invite_start_dt:
-                    trigger_invitations(instance, coach.id)
-
+        _free_spot_for_declining_player(
+            instance,
+            presence,
+            player,
+            coach,
+            coach_user_id,
+            acting_user_id,
+            config,
+            templates,
+            now=now,
+        )
         return {"action": "declined"}
 
     return {"action": "unknown"}
+
+
+def _free_spot_for_declining_player(
+    instance: LessonInstance,
+    presence: "Presence | None",
+    player,
+    coach,
+    coach_user_id: int | None,
+    acting_user_id: int,
+    config,
+    templates: dict,
+    *,
+    now: datetime | None = None,
+) -> None:
+    """Revert a player to "not attending" and free their spot.
+
+    This is the single shared path used both when a player declines a reminder
+    (``respond_to_reminder`` with action ``no``) and when a player cancels a
+    previously-confirmed attendance (``cancel_attendance``). It reuses the exact
+    same vacancy-creation and invitation-engine logic — cancellation is NOT a
+    separate fork.
+    """
+    if presence:
+        presence.confirmed = True
+        presence.status = "absent"
+        presence.justification = "justified"
+        presence.save()
+    if coach_user_id:
+        _send_system_message(
+            coach_user_id,
+            acting_user_id,
+            templates.get("reminder_decline", DEFAULT_MESSAGE_TEMPLATES["reminder_decline"]),
+        )
+
+    # Always pre-create vacancy so the invite_start job finds it when window opens.
+    # If the invitation window is already open, trigger invitations immediately.
+    if coach and config:
+        from padel_app.scheduler import _compute_invite_start_dt
+        vacancy = _ensure_vacancy_for_player(instance, coach.id, player.id)
+        if _is_semi_auto(config):
+            # Semi-automatic: ask the coach for approval instead of sending.
+            # No invitations are sent until the coach approves the prompt.
+            if vacancy is not None and vacancy.approval_status == "pending":
+                from padel_app.services.replacement_approval_service import (
+                    create_approval_prompts,
+                )
+                create_approval_prompts(
+                    [vacancy], instance, coach.id, config, now=now
+                )
+        else:
+            invite_start_dt = _compute_invite_start_dt(instance, config.get_invitation_start_timing())
+            _now = now or utcnow_naive()
+            if invite_start_dt is None or _now >= invite_start_dt:
+                trigger_invitations(instance, coach.id)
+
+
+def cancel_attendance(
+    lesson_instance_id: int,
+    acting_user_id: int,
+    *,
+    now: datetime | None = None,
+) -> dict:
+    """Cancel a previously-confirmed attendance for the acting player.
+
+    Allowed only BEFORE the class start time. Reverts the player to
+    "not attending" and frees the spot, reusing the exact same engine path as a
+    reminder decline. After the class has started, raises 409.
+    """
+    from flask import abort
+    from padel_app.models import Coach, Player
+
+    instance = LessonInstance.query.get_or_404(lesson_instance_id)
+
+    _now = now or utcnow_naive()
+    if instance.start_datetime is not None and _now >= instance.start_datetime:
+        abort(409, description="Class has already started; attendance can no longer be cancelled.")
+
+    player = Player.query.filter_by(user_id=acting_user_id).first()
+    if not player:
+        abort(403)
+
+    presence = Presence.query.filter_by(
+        player_id=player.id,
+        lesson_instance_id=lesson_instance_id,
+    ).first()
+
+    coach_rel = Association_CoachLessonInstance.query.filter_by(
+        lesson_instance_id=lesson_instance_id
+    ).first()
+    coach = Coach.query.get(coach_rel.coach_id) if coach_rel else None
+    coach_user_id = coach.user_id if coach else None
+
+    config = get_or_create_config(coach.id) if coach else None
+    templates = config.get_message_templates() if config else DEFAULT_MESSAGE_TEMPLATES
+
+    # Mark the most recent reminder message as responded ("no") so the UI reflects
+    # the cancellation on reload, mirroring respond_to_reminder.
+    if coach_user_id:
+        from padel_app.models import Message
+        from padel_app.serializers.message import serialize_message
+        conv = _get_or_create_direct_conversation(coach_user_id, acting_user_id)
+        recent_reminders = Message.query.filter_by(
+            conversation_id=conv.id,
+            message_type="notification_reminder",
+        ).order_by(Message.id.desc()).all()
+        reminder_msg = next(
+            (m for m in recent_reminders
+             if m.msg_metadata
+             and m.msg_metadata.get("lessonInstanceId") == lesson_instance_id),
+            None,
+        )
+        if reminder_msg:
+            reminder_msg.msg_metadata = {
+                **reminder_msg.msg_metadata,
+                "responded": True,
+                "response": "no",
+            }
+            reminder_msg.save()
+            publish({"type": "message_edited", "payload": serialize_message(reminder_msg, None)})
+
+    _free_spot_for_declining_player(
+        instance,
+        presence,
+        player,
+        coach,
+        coach_user_id,
+        acting_user_id,
+        config,
+        templates,
+        now=now,
+    )
+    return {"action": "declined"}
 
 
 def _trigger_vacancy_for_player(

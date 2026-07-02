@@ -652,3 +652,93 @@ class TestStandingWaitingListCRUD:
 
         assert wl is not None
         assert wl.player_id == ids["student_id"]
+
+
+# ---------------------------------------------------------------------------
+# TestCancelAttendance (PAD-35)
+# ---------------------------------------------------------------------------
+
+class TestCancelAttendance:
+    """Students may cancel a confirmed attendance any time BEFORE the class
+    starts; cancellation reverts the presence to not-attending and frees the
+    spot via the same path as a reminder decline. After start it is a 409."""
+
+    def _confirmed_presence(self, app, instance_id, player_id):
+        from padel_app.models.presences import Presence
+        with app.app_context():
+            presence = Presence(
+                player_id=player_id,
+                lesson_instance_id=instance_id,
+                invited=True,
+                confirmed=True,
+            )
+            db.session.add(presence)
+            db.session.commit()
+            return presence.id
+
+    def test_cancel_before_start_reverts_presence(self, app):
+        from padel_app.services.notification_service import cancel_attendance
+        from padel_app.models.presences import Presence
+
+        ids = _seed_coach_and_student(app)
+        instance_id = _seed_instance(app, ids["coach_id"], ids["student_id"], start_offset_hours=48)
+        self._confirmed_presence(app, instance_id, ids["student_id"])
+
+        with app.app_context():
+            with patch(PATCHES[0]), patch(PATCHES[1]):
+                result = cancel_attendance(instance_id, ids["student_user_id"])
+
+            assert result["action"] == "declined"
+            presence = Presence.query.filter_by(
+                lesson_instance_id=instance_id, player_id=ids["student_id"]
+            ).first()
+            assert presence.status == "absent"
+            assert presence.justification == "justified"
+
+    def test_cancel_before_start_creates_vacancy(self, app):
+        """Cancelling frees the spot — a Vacancy is created for the engine,
+        exactly like a reminder decline (auto mode)."""
+        from padel_app.services.notification_service import cancel_attendance, get_or_create_config
+        from padel_app.models.vacancy import Vacancy
+
+        ids = _seed_coach_and_student(app)
+        instance_id = _seed_instance(app, ids["coach_id"], ids["student_id"], start_offset_hours=48)
+        self._confirmed_presence(app, instance_id, ids["student_id"])
+
+        with app.app_context():
+            # Enable the engine so a vacancy is created.
+            config = get_or_create_config(ids["coach_id"])
+            config.auto_notify_enabled = True
+            db.session.commit()
+
+            with patch(PATCHES[0]), patch(PATCHES[1]):
+                cancel_attendance(instance_id, ids["student_user_id"])
+
+            vacancy = Vacancy.query.filter_by(
+                lesson_instance_id=instance_id,
+                original_player_id=ids["student_id"],
+            ).first()
+            assert vacancy is not None
+
+    def test_cancel_after_start_rejected_409(self, app):
+        from werkzeug.exceptions import Conflict
+        from padel_app.services.notification_service import cancel_attendance
+        from padel_app.models.presences import Presence
+
+        ids = _seed_coach_and_student(app)
+        instance_id = _seed_instance(app, ids["coach_id"], ids["student_id"], start_offset_hours=48)
+        self._confirmed_presence(app, instance_id, ids["student_id"])
+
+        with app.app_context():
+            # now is AFTER the instance start (start is +48h)
+            future_now = datetime.utcnow() + timedelta(hours=72)
+            with patch(PATCHES[0]), patch(PATCHES[1]):
+                with pytest.raises(Conflict):
+                    cancel_attendance(instance_id, ids["student_user_id"], now=future_now)
+
+            # Presence unchanged (still confirmed, no absent status).
+            presence = Presence.query.filter_by(
+                lesson_instance_id=instance_id, player_id=ids["student_id"]
+            ).first()
+            assert presence.confirmed is True
+            assert presence.status is None
