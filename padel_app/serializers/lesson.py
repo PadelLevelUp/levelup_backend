@@ -53,11 +53,21 @@ def serialize_lesson_instance(instance):
     }
 
     
-def serialize_class_instance(obj) -> dict:
+def serialize_class_instance(obj, viewer_player_id=None) -> dict:
     """
     Serialize Lesson or LessonInstance into ClassInstance-specific fields.
     Fields already provided by CalendarEvent are intentionally omitted.
+
+    Role-based visibility (PAD-36):
+    - Coaches (``viewer_player_id`` is None) get the full payload: the complete
+      participant list, everyone's presences, and the full notification
+      (invitation) log.
+    - Students (``viewer_player_id`` set to the requesting player's id) get a
+      restricted payload that only ever exposes their OWN data: no other
+      students appear in ``participants``, ``presences`` or ``invitations``.
     """
+
+    is_student = viewer_player_id is not None
 
     is_instance = obj.model_name == "LessonInstance"
     lesson = obj.lesson if is_instance else obj
@@ -68,6 +78,12 @@ def serialize_class_instance(obj) -> dict:
         else None
     )
 
+    participants = [
+        serialize_player(rel.player)
+        for rel in obj.players_relations
+        if not is_student or rel.player_id == viewer_player_id
+    ]
+
     data = {
         "coachId": str(coach_id) if coach_id else None,
         "name": obj.title,
@@ -76,10 +92,7 @@ def serialize_class_instance(obj) -> dict:
             if lesson.default_level_id
             else None
         ),
-        "participants": [
-            serialize_player(rel.player)
-            for rel in obj.players_relations
-        ],
+        "participants": participants,
         "recurrenceEnd": lesson.recurrence_end.isoformat() if lesson.recurrence_end else None,
         "notificationsEnabled": obj.notifications_enabled if hasattr(obj, "notifications_enabled") else True,
     }
@@ -87,12 +100,25 @@ def serialize_class_instance(obj) -> dict:
     if is_instance:
         from padel_app.models.notification_event import NotificationEvent
         from padel_app.models.lesson_instance_training import LessonInstanceTraining
-        notification_events = NotificationEvent.query.filter_by(
+
+        notification_query = NotificationEvent.query.filter_by(
             lesson_instance_id=obj.id
-        ).all()
+        )
+        if is_student:
+            notification_query = notification_query.filter_by(
+                player_id=viewer_player_id
+            )
+        notification_events = notification_query.all()
+
         training_rows = LessonInstanceTraining.query.filter_by(
             lesson_instance_id=obj.id
         ).all()
+
+        presences = [
+            serialize_presence(p)
+            for p in getattr(obj, "presences", [])
+            if not is_student or p.player_id == viewer_player_id
+        ]
 
         data.update(
             {
@@ -103,10 +129,7 @@ def serialize_class_instance(obj) -> dict:
                     if obj.overridden_fields
                     else []
                 ),
-                "presences": [
-                    serialize_presence(p)
-                    for p in getattr(obj, "presences", [])
-                ],
+                "presences": presences,
                 "invitations": [
                     {
                         "id": ev.id,

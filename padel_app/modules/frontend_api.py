@@ -247,9 +247,18 @@ def calendar():
 
 
 @bp.get("/lesson_instance/<int:instance_id>")
+@jwt_required()
 def lesson_instance_detail(instance_id):
     instance = LessonInstance.query.get_or_404(instance_id)
-    presences = Presence.query.filter_by(lesson_instance_id=instance.id).all()
+
+    presence_query = Presence.query.filter_by(lesson_instance_id=instance.id)
+    # Role-based visibility (PAD-36): a student only sees their own presence.
+    if current_coach() is None:
+        player = current_player()
+        if player is None:
+            abort(403, "Not authorized to view this class")
+        presence_query = presence_query.filter_by(player_id=player.id)
+    presences = presence_query.all()
 
     return jsonify({
         "lessonInstance": serialize_lesson_instance(instance),
@@ -436,8 +445,16 @@ def get_lesson_instances():
 
 
 @bp.get("/lesson_instance/<int:instance_id>/presences")
+@jwt_required()
 def lesson_instance_presences(instance_id):
-    presences = Presence.query.filter_by(lesson_instance_id=instance_id).all()
+    presence_query = Presence.query.filter_by(lesson_instance_id=instance_id)
+    # Role-based visibility (PAD-36): a student only sees their own presence.
+    if current_coach() is None:
+        player = current_player()
+        if player is None:
+            abort(403, "Not authorized to view this class")
+        presence_query = presence_query.filter_by(player_id=player.id)
+    presences = presence_query.all()
     return jsonify([serialize_presence(p) for p in presences])
 
 
@@ -492,7 +509,18 @@ def class_instance():
             if instance is not None:
                 current_class = instance
 
-    return jsonify(serialize_class_instance(current_class))
+    # Role-based visibility (PAD-36): coaches get the full payload; students
+    # only ever see their own participation, presence and notifications.
+    viewer_player_id = None
+    if current_coach() is None:
+        player = current_player()
+        if player is None:
+            abort(403, "Not authorized to view this class")
+        viewer_player_id = player.id
+
+    return jsonify(
+        serialize_class_instance(current_class, viewer_player_id=viewer_player_id)
+    )
 
 
 @bp.get("/player_profile/<int:player_id>")
