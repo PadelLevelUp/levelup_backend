@@ -357,6 +357,16 @@ def _get_eligible_students_for_group(
         and _passes_group_rules(rules, cp, vacancy, coach_id)
     ]
 
+    restrictions = config.get_restrictions()
+    if restrictions["excludedPlayers"]["enabled"]:
+        excluded_player_ids = set(restrictions["excludedPlayers"]["playerIds"])
+        coach_players = [cp for cp in coach_players if str(cp.player_id) not in excluded_player_ids]
+    if restrictions["excludeUnpaidSubscription"]["enabled"]:
+        coach_players = [
+            cp for cp in coach_players
+            if cp.player and cp.player.user and cp.player.user.status == "active"
+        ]
+
     player_stats = {}
     for cp in coach_players:
         att_rate, just_rate = _attendance_stats(cp.player_id)
@@ -399,6 +409,16 @@ def get_eligible_students(
         cp for cp in Association_CoachPlayer.query.filter_by(coach_id=coach_id).all()
         if cp.player_id not in excluded_ids
     ]
+
+    restrictions = config.get_restrictions()
+    if restrictions["excludedPlayers"]["enabled"]:
+        excluded_player_ids = set(restrictions["excludedPlayers"]["playerIds"])
+        coach_players = [cp for cp in coach_players if str(cp.player_id) not in excluded_player_ids]
+    if restrictions["excludeUnpaidSubscription"]["enabled"]:
+        coach_players = [
+            cp for cp in coach_players
+            if cp.player and cp.player.user and cp.player.user.status == "active"
+        ]
 
     # Apply round criteria filters
     rounds = config.get_rounds()
@@ -831,8 +851,9 @@ def send_class_reminders(instance_id: int, *, now: datetime | None = None) -> di
         player = Player.query.get(player_id)
         player_name = (player.user.name if player and player.user else "there").split()[0]
 
+        template_key = "reminder_followup" if sent_count > 0 else "reminder"
         text = _format_template(
-            templates.get("reminder", DEFAULT_MESSAGE_TEMPLATES["reminder"]),
+            templates.get(template_key, DEFAULT_MESSAGE_TEMPLATES[template_key]),
             name=player_name,
             level=level_code,
             weekday=weekday,
@@ -935,7 +956,7 @@ def respond_to_reminder(
             _send_system_message(
                 coach_user_id,
                 acting_user_id,
-                templates.get("reminder_confirm", DEFAULT_MESSAGE_TEMPLATES["reminder_confirm"]),
+                templates.get("reminder_confirmed", DEFAULT_MESSAGE_TEMPLATES["reminder_confirmed"]),
             )
         return {"action": "confirmed"}
 
@@ -985,7 +1006,7 @@ def _free_spot_for_declining_player(
         _send_system_message(
             coach_user_id,
             acting_user_id,
-            templates.get("reminder_decline", DEFAULT_MESSAGE_TEMPLATES["reminder_decline"]),
+            templates.get("reminder_declined", DEFAULT_MESSAGE_TEMPLATES["reminder_declined"]),
         )
 
     # Always pre-create vacancy so the invite_start job finds it when window opens.
