@@ -25,7 +25,7 @@ class Association_CoachPlayer(db.Model, model.Model):
     player = relationship("Player", back_populates="coaches_relations")
     level = relationship("CoachLevel", back_populates="coach_player_relations")
     
-    side = Column(Enum("left", "right", name="player_side"), nullable=True)
+    side = Column(Enum("left", "right", "both", name="player_side"), nullable=True)
     notes = Column(String(255), nullable=True)
     
     notes_list = relationship("CoachPlayerNote", back_populates="coach_player", cascade="all, delete-orphan")
@@ -87,7 +87,7 @@ class Association_CoachPlayer(db.Model, model.Model):
                 get_field("player", "Player", "ManyToOne", related_model="Player"),
                 get_field("level", "CoachLevel", "ManyToOne", related_model="CoachLevel"),
                 get_field("notes", label="Notes", type="Text"),
-                get_field("side", label="Side", type="Select" , options=["left", "right"]),
+                get_field("side", label="Side", type="Select" , options=["left", "right", "both"]),
             ],
         )
         form.add_block(info_block)
