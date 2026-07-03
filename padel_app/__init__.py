@@ -74,6 +74,10 @@ def create_app(test_config=None):
 
     mail.mail.init_app(app)
 
+    from flask_babel import Babel
+    babel = Babel(app)
+    app.babel = babel
+
     try:
         os.makedirs(app.instance_path)
     except OSError:

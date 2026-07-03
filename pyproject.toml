@@ -29,6 +29,7 @@ dependencies = [
 
     # --- Migrations ---
     "Flask-Migrate==4.0.7",
+    "Flask-Babel==4.0.0",
     "alembic==1.13.2",
 
     # --- Sessions / auth / assets / mail ---
