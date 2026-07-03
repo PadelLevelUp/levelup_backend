@@ -32,6 +32,7 @@ Handles reminders, vacancy-based invitations, waiting list, and manual notificat
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timedelta
 
 from padel_app.sql_db import db
@@ -152,6 +153,50 @@ def _level_sort_key(coach_player: Association_CoachPlayer) -> int:
     return 9999
 
 
+# ---------------------------------------------------------------------------
+# Side (court side) matching helpers — PAD-15
+# ---------------------------------------------------------------------------
+# A player's side may be "left", "right", "both", or None.
+# "both" players are eligible for open spots of ANY side, and a "both"-side
+# vacancy (its departing player was "both") accepts players of any side.
+# Eligibility is therefore inclusive/symmetric; exact-side is only PREFERRED,
+# not required, via the playing-side tiebreaker below.
+
+def _side_eligible(player_side, vacancy_side) -> bool:
+    """True when a player is eligible for a vacancy under a 'same side' criterion.
+
+    Inclusive rule: eligible when the vacancy has no side, the sides match, the
+    player plays "both", or the vacancy side is "both". Only a strict
+    left-vs-right mismatch (with neither being "both") is ineligible.
+    """
+    if vacancy_side is None:
+        return True
+    if player_side is None:
+        # Player has no recorded side preference — treat as ineligible for a
+        # side-specific vacancy (unchanged from prior left/right behaviour where
+        # None != "left"/"right").
+        return False
+    if player_side == vacancy_side:
+        return True
+    if player_side == "both" or vacancy_side == "both":
+        return True
+    return False
+
+
+def _side_preference_rank(player_side, vacancy_side) -> int:
+    """Rank for the playing-side tiebreaker: lower is preferred.
+
+    0 = exact side match (or vacancy has no side constraint),
+    1 = "both" fallback (player or vacancy is "both"),
+    2 = anything else (wrong side; only reachable in looser rounds).
+    """
+    if vacancy_side is None or player_side == vacancy_side:
+        return 0
+    if player_side == "both" or vacancy_side == "both":
+        return 1
+    return 2
+
+
 def _attendance_stats(player_id: int) -> tuple[float, float]:
     presences = Presence.query.filter_by(player_id=player_id).all()
     if not presences:
@@ -162,8 +207,9 @@ def _attendance_stats(player_id: int) -> tuple[float, float]:
     return present / total, justified / total
 
 
-def _build_sort_key(criteria: list[dict], player_stats: dict):
+def _build_sort_key(criteria: list[dict], player_stats: dict, vacancy: Vacancy = None):
     enabled = [c["id"] for c in criteria if c.get("enabled")]
+    vacancy_side = getattr(vacancy, "side", None)
 
     def key(cp: Association_CoachPlayer):
         parts = []
@@ -176,7 +222,13 @@ def _build_sort_key(criteria: list[dict], player_stats: dict):
             elif criterion == "attendance":
                 parts.append(-stats.get("attendance_rate", 0.0))
             elif criterion == "playing_side":
-                parts.append(0 if cp.side == "left" else 1)
+                # Prefer an exact-side match first, then "both" players, then any
+                # remaining. When the vacancy has no side, fall back to the legacy
+                # "left first" ordering so behaviour is unchanged for that case.
+                if vacancy_side is not None:
+                    parts.append(_side_preference_rank(cp.side, vacancy_side))
+                else:
+                    parts.append(0 if cp.side == "left" else 1)
             elif criterion == "subscription_status":
                 parts.append(0 if getattr(cp, "player", None) and cp.player.user.status == "active" else 1)
         return tuple(parts)
@@ -294,7 +346,9 @@ def _passes_group_rules(rules: list, cp: Association_CoachPlayer, vacancy: Vacan
         elif attr == "side":
             if vacancy.side is None:
                 continue
-            if op == "same_as_vacancy" and cp.side != vacancy.side:
+            # Inclusive of "both": a "both" player (or a "both" vacancy) is eligible
+            # for any side. Exact-side is preferred via the sort key, not required.
+            if op == "same_as_vacancy" and not _side_eligible(cp.side, vacancy.side):
                 return False
 
         elif attr == "has_makeups":
@@ -377,7 +431,7 @@ def _get_eligible_students_for_group(
         att_rate, just_rate = _attendance_stats(cp.player_id)
         player_stats[cp.player_id] = {"attendance_rate": att_rate, "justified_miss_rate": just_rate}
 
-    sort_key = _build_sort_key(config.get_priority_criteria(), player_stats)
+    sort_key = _build_sort_key(config.get_priority_criteria(), player_stats, vacancy)
     return sorted(coach_players, key=sort_key)
 
 
@@ -446,7 +500,11 @@ def get_eligible_students(
 
         elif criterion == "same_side":
             if vacancy.side is not None:
-                coach_players = [cp for cp in coach_players if cp.side == vacancy.side]
+                # "both" players (and any player for a "both" vacancy) stay eligible;
+                # exact-side is preferred later by the playing-side tiebreaker.
+                coach_players = [
+                    cp for cp in coach_players if _side_eligible(cp.side, vacancy.side)
+                ]
 
         elif criterion == "max_unjustified_absences":
             max_abs = criteria_values.get("max_unjustified_absences", 0)
@@ -464,7 +522,7 @@ def get_eligible_students(
             "justified_miss_rate": just_rate,
         }
 
-    sort_key = _build_sort_key(config.get_priority_criteria(), player_stats)
+    sort_key = _build_sort_key(config.get_priority_criteria(), player_stats, vacancy)
     return sorted(coach_players, key=sort_key)
 
 
@@ -530,7 +588,67 @@ def _check_per_student_daily_limit(
 def _format_template(template: str, **variables) -> str:
     for key, val in variables.items():
         template = template.replace("{" + key + "}", str(val))
-    return template
+    # An empty placeholder (e.g. a level-less class -> empty {level}) can leave a
+    # double space or a space before punctuation; collapse those so the rendered
+    # message stays grammatical.
+    template = re.sub(r"\s{2,}", " ", template)
+    template = re.sub(r"\s+([,.!?;:])", r"\1", template)
+    return template.strip()
+
+
+# Portuguese weekday names, indexed by ``datetime.weekday()`` (Monday == 0).
+# Tactical localization only — full locale-driven i18n is tracked in PAD-39.
+_PT_WEEKDAYS = (
+    "segunda-feira",
+    "terça-feira",
+    "quarta-feira",
+    "quinta-feira",
+    "sexta-feira",
+    "sábado",
+    "domingo",
+)
+
+
+def _weekday_pt(start_datetime) -> str:
+    """Portuguese weekday name for a datetime, or "" when missing.
+
+    Avoids ``strftime("%A")`` which returns the English weekday under the
+    server's default (en) locale — the source of the "esta Wednesday" leak.
+    """
+    if not start_datetime:
+        return ""
+    return _PT_WEEKDAYS[start_datetime.weekday()]
+
+
+def _level_label(instance) -> str:
+    """Class-name / modality for the ``{level}`` placeholder.
+
+    Returns the level code when the instance has a level, otherwise an empty
+    string. The previous ``"this"`` fallback was an English filler word that
+    leaked into pt templates as "aula de this".
+    """
+    level = getattr(instance, "level", None)
+    return level.code if level else ""
+
+
+def _resolve_locale(coach):
+    """Resolve the coach's preferred locale, falling back to Portuguese."""
+    try:
+        lang = getattr(coach.user, "language", None) if coach and coach.user else None
+    except Exception:
+        lang = None
+    return "pt" if not lang else ("pt" if lang.startswith("pt") else "en")
+
+
+def _format_weekday(dt, locale):
+    """Locale-aware full weekday name via Babel (e.g. pt -> 'quarta-feira')."""
+    if not dt:
+        return ""
+    try:
+        from babel.dates import format_date
+        return format_date(dt, format="EEEE", locale=locale)
+    except Exception:
+        return dt.strftime("%A")
 
 
 def _get_or_create_direct_conversation(coach_user_id: int, player_user_id: int):
@@ -804,11 +922,12 @@ def send_class_reminders(instance_id: int, *, now: datetime | None = None) -> di
 
     coach_user_id = coach.user_id
     config = get_or_create_config(coach.id)
-    templates = config.get_message_templates()
+    locale = _resolve_locale(coach)
+    templates = config.get_message_templates(locale)
     reminder_count = config.get_reminder_count()
 
-    level_code = instance.level.code if getattr(instance, "level", None) else "this"
-    weekday = instance.start_datetime.strftime("%A") if instance.start_datetime else ""
+    level_code = instance.level.code if getattr(instance, "level", None) else ""
+    weekday = _format_weekday(instance.start_datetime, locale)
     time_str = instance.start_datetime.strftime("%H:%M") if instance.start_datetime else ""
 
     from padel_app.models import Message, Player
@@ -1211,9 +1330,10 @@ def _send_invitation_batch(
 
     coach_obj = Coach.query.get(coach_id)
     coach_user_id = coach_obj.user_id if coach_obj else None
-    templates = config.get_message_templates()
-    level_code = instance.level.code if getattr(instance, "level", None) else "this"
-    weekday = instance.start_datetime.strftime("%A") if instance.start_datetime else ""
+    locale = _resolve_locale(coach_obj)
+    templates = config.get_message_templates(locale)
+    level_code = instance.level.code if getattr(instance, "level", None) else ""
+    weekday = _format_weekday(instance.start_datetime, locale)
     time_str = instance.start_datetime.strftime("%H:%M") if instance.start_datetime else ""
 
     notified = []
@@ -1682,10 +1802,11 @@ def send_manual_notifications(
     if not instance.notifications_enabled:
         return []
     config = get_or_create_config(coach_id)
-    templates = config.get_message_templates()
 
     coach = Coach.query.get(coach_id)
     coach_user_id = coach.user_id if coach else None
+    locale = _resolve_locale(coach)
+    templates = config.get_message_templates(locale)
 
     events = []
     for player_id in player_ids:
@@ -1704,8 +1825,8 @@ def send_manual_notifications(
         if coach_user_id and player_user_id:
             player = Player.query.get(player_id)
             player_name = (player.user.name if player and player.user else "there").split()[0]
-            level_code = instance.level.code if getattr(instance, "level", None) else "this"
-            weekday = instance.start_datetime.strftime("%A") if instance.start_datetime else ""
+            level_code = instance.level.code if getattr(instance, "level", None) else ""
+            weekday = _format_weekday(instance.start_datetime, locale)
             time_str = instance.start_datetime.strftime("%H:%M") if instance.start_datetime else ""
 
             text = _format_template(
@@ -1904,7 +2025,7 @@ def _check_waiting_list(
                         passes = False
                         break
                 elif criterion == "same_side":
-                    if vacancy.side is not None and cp.side != vacancy.side:
+                    if vacancy.side is not None and not _side_eligible(cp.side, vacancy.side):
                         passes = False
                         break
                 elif criterion == "max_unjustified_absences":
@@ -1927,7 +2048,7 @@ def _check_waiting_list(
             "justified_miss_rate": just_rate,
         }
 
-    sort_key = _build_sort_key(config.get_priority_criteria(), player_stats)
+    sort_key = _build_sort_key(config.get_priority_criteria(), player_stats, vacancy)
     eligible_entries.sort(key=lambda pair: sort_key(pair[1]))
 
     return eligible_entries[0][0]
@@ -1971,11 +2092,12 @@ def _fill_from_waiting_list(
 
     from padel_app.models import Player
 
-    templates = config.get_message_templates()
+    locale = _resolve_locale(coach)
+    templates = config.get_message_templates(locale)
     player = Player.query.get(entry.player_id)
     player_name = (player.user.name if player and player.user else "there").split()[0]
-    level_code = instance.level.code if getattr(instance, "level", None) else "this"
-    weekday = instance.start_datetime.strftime("%A") if instance.start_datetime else ""
+    level_code = instance.level.code if getattr(instance, "level", None) else ""
+    weekday = _format_weekday(instance.start_datetime, locale)
     time_str = instance.start_datetime.strftime("%H:%M") if instance.start_datetime else ""
 
     text = _format_template(

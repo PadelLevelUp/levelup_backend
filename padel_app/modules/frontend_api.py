@@ -67,6 +67,12 @@ from padel_app.services.club_service import (
     revoke_coach_invitation_service,
     list_coach_invitations_service,
 )
+from padel_app.services.player_invitation_service import (
+    create_incomplete_player_service,
+    get_player_invitation_service,
+    accept_player_invitation_service,
+    revoke_player_invitation_service,
+)
 from padel_app.services.coach_service import (
     create_coach_service,
     create_coach_level_service,
@@ -848,6 +854,47 @@ def revoke_coach_invitation(token):
     return jsonify({"success": True})
 
 
+# -------------------------------------------------------------------
+# Player invitations (players.invite-completion)
+# -------------------------------------------------------------------
+
+@bp.post("/incomplete_player")
+def create_incomplete_player():
+    data = request.get_json() or {}
+    invitation = create_incomplete_player_service(data)
+    return jsonify({
+        "token": invitation.token,
+        "inviteLink": f"/invite/player/{invitation.token}",
+        "expiresAt": invitation.expires_at.isoformat(),
+    }), 201
+
+
+@bp.get("/player-invitations/<token>")
+def get_player_invitation(token):
+    invitation = get_player_invitation_service(token)
+    return jsonify({
+        "playerName": invitation.player.user.name,
+        "status": invitation.status,
+    })
+
+
+@bp.post("/player-invitations/<token>/accept")
+def accept_player_invitation(token):
+    data = request.get_json(silent=True) or {}
+    user = accept_player_invitation_service(token, data=data)
+    return jsonify({
+        "accessToken": create_access_token(identity=str(user.id)),
+    })
+
+
+@bp.post("/player-invitations/<token>/revoke")
+@jwt_required()
+def revoke_player_invitation(token):
+    coach = current_coach()
+    revoke_player_invitation_service(token, coach)
+    return jsonify({"success": True})
+
+
 @bp.post("/lesson/<int:lesson_id>")
 def edit_lesson(lesson_id):
     lesson = Lesson.query.get_or_404(lesson_id)
@@ -948,25 +995,91 @@ UNIQUE_FIELD_CHECKS = {
     ("user", "email"),
 }
 
+# Fields that are NOT DB-unique but where we still want to WARN about duplicates
+# (PAD-17). Matching is exact but case-insensitive. These never block the caller —
+# the frontend surfaces them as a non-blocking warning.
+#
+# PAD-17 fix: the name warn-check is scoped to the REQUESTING coach's own roster
+# (Association_CoachPlayer). A globally-unscoped match warned coaches about
+# identically-named players at *other* clubs — a false positive. The warn now
+# only fires when the duplicate name belongs to a player in the caller's roster,
+# which the message reflects.
+WARN_DUPLICATE_CHECKS = {
+    ("user", "name"): "You already have a player with this name",
+}
+
 
 @bp.post("/check_field_available")
 def check_field_available():
-    """Check whether a unique field value is available for any whitelisted model."""
+    """Check whether a field value is available for any whitelisted model.
+
+    Two kinds of checks are supported:
+      * UNIQUE_FIELD_CHECKS  — hard uniqueness (username, email). Exact match,
+        matched GLOBALLY across the table (these are true DB uniqueness rules).
+      * WARN_DUPLICATE_CHECKS — non-unique fields (name) where we only WARN about
+        duplicates. Matched case-insensitively and scoped to the requesting
+        coach's own roster (see below).
+
+    In both cases a duplicate returns HTTP 409 with a human-readable ``message``.
+    The frontend decides whether a 409 blocks submission (unique fields) or is a
+    soft warning (duplicate fields).
+
+    Scoping (name warn-check): the caller must pass a ``scope`` (or ``coach``)
+    field carrying the requesting coach's id. Only players in that coach's
+    ``Association_CoachPlayer`` roster are considered. If no scope is supplied we
+    deliberately skip the warn (return ``available: true``) rather than fall back
+    to a global match, which would resurface the cross-club false positive.
+    """
     data = request.get_json() or {}
     model_key = (data.get("model") or "").strip().lower()
     field = (data.get("field") or "").strip()
     value = (data.get("value") or "").strip()
 
-    if (model_key, field) not in UNIQUE_FIELD_CHECKS:
+    is_unique = (model_key, field) in UNIQUE_FIELD_CHECKS
+    warn_message = WARN_DUPLICATE_CHECKS.get((model_key, field))
+
+    if not is_unique and warn_message is None:
         abort(400, "Check not allowed")
     if not value:
         return jsonify({"available": True})
 
     ModelClass = MODELS[model_key]
-    exists = ModelClass.query.filter_by(**{field: value}).first() is not None
+    column = getattr(ModelClass, field)
+
+    if is_unique:
+        exists = ModelClass.query.filter_by(**{field: value}).first() is not None
+        message = f"This {field} is already taken"
+    else:
+        # Warn-only duplicate field (name): case-insensitive exact match, scoped
+        # to the requesting coach's roster.
+        from sqlalchemy import func
+
+        scope_raw = data.get("scope", data.get("coach"))
+        try:
+            coach_id = int(scope_raw) if scope_raw not in (None, "") else None
+        except (TypeError, ValueError):
+            coach_id = None
+
+        # Without a coach scope we cannot tell whose roster to check, so we skip
+        # the warn entirely rather than emit a false global duplicate.
+        if coach_id is None:
+            return jsonify({"available": True})
+
+        exists = (
+            ModelClass.query
+            .join(Player, Player.user_id == User.id)
+            .join(
+                Association_CoachPlayer,
+                Association_CoachPlayer.player_id == Player.id,
+            )
+            .filter(Association_CoachPlayer.coach_id == coach_id)
+            .filter(func.lower(column) == value.lower())
+            .first()
+        ) is not None
+        message = warn_message
 
     if exists:
-        return jsonify({"available": False, "message": f"This {field} is already taken"}), 409
+        return jsonify({"available": False, "message": message}), 409
     return jsonify({"available": True})
 
 
