@@ -67,6 +67,12 @@ from padel_app.services.club_service import (
     revoke_coach_invitation_service,
     list_coach_invitations_service,
 )
+from padel_app.services.player_invitation_service import (
+    create_incomplete_player_service,
+    get_player_invitation_service,
+    accept_player_invitation_service,
+    revoke_player_invitation_service,
+)
 from padel_app.services.coach_service import (
     create_coach_service,
     create_coach_level_service,
@@ -789,6 +795,47 @@ def accept_coach_invitation(token):
 def revoke_coach_invitation(token):
     coach = current_coach()
     revoke_coach_invitation_service(token, coach)
+    return jsonify({"success": True})
+
+
+# -------------------------------------------------------------------
+# Player invitations (players.invite-completion)
+# -------------------------------------------------------------------
+
+@bp.post("/incomplete_player")
+def create_incomplete_player():
+    data = request.get_json() or {}
+    invitation = create_incomplete_player_service(data)
+    return jsonify({
+        "token": invitation.token,
+        "inviteLink": f"/invite/player/{invitation.token}",
+        "expiresAt": invitation.expires_at.isoformat(),
+    }), 201
+
+
+@bp.get("/player-invitations/<token>")
+def get_player_invitation(token):
+    invitation = get_player_invitation_service(token)
+    return jsonify({
+        "playerName": invitation.player.user.name,
+        "status": invitation.status,
+    })
+
+
+@bp.post("/player-invitations/<token>/accept")
+def accept_player_invitation(token):
+    data = request.get_json(silent=True) or {}
+    user = accept_player_invitation_service(token, data=data)
+    return jsonify({
+        "accessToken": create_access_token(identity=str(user.id)),
+    })
+
+
+@bp.post("/player-invitations/<token>/revoke")
+@jwt_required()
+def revoke_player_invitation(token):
+    coach = current_coach()
+    revoke_player_invitation_service(token, coach)
     return jsonify({"success": True})
 
 
