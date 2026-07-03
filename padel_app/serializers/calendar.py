@@ -21,6 +21,8 @@ def serialize_calendar_block(block):
         "recurrenceRule": recurrence_rule,
         "recurrenceEnd": iso_date(block.recurrence_end),
 
+        "blocksAutoInvitations": bool(getattr(block, "blocks_auto_invitations", False)),
+
         "date": (
             block.start_datetime.date().isoformat()
             if block.start_datetime

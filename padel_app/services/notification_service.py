@@ -367,6 +367,11 @@ def _get_eligible_students_for_group(
             if cp.player and cp.player.user and cp.player.user.status == "active"
         ]
 
+    # PAD-28: drop students who have set an availability blocker overlapping
+    # this class window (AUTO invitations only — manual add is unaffected).
+    from padel_app.services.student_availability_service import filter_blocked_coach_players
+    coach_players = filter_blocked_coach_players(coach_players, instance)
+
     player_stats = {}
     for cp in coach_players:
         att_rate, just_rate = _attendance_stats(cp.player_id)
@@ -425,6 +430,11 @@ def get_eligible_students(
     round_cfg = next((r for r in rounds if r["id"] == round_number), None)
     if round_cfg is None:
         return []
+
+    # PAD-28: drop students who have set an availability blocker overlapping
+    # this class window (AUTO invitations only — manual add is unaffected).
+    from padel_app.services.student_availability_service import filter_blocked_coach_players
+    coach_players = filter_blocked_coach_players(coach_players, instance)
 
     criteria = round_cfg.get("criteria", [])
     criteria_values = round_cfg.get("criteria_values", {})
