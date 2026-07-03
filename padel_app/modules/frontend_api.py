@@ -895,6 +895,12 @@ UNIQUE_FIELD_CHECKS = {
 # Fields that are NOT DB-unique but where we still want to WARN about duplicates
 # (PAD-17). Matching is exact but case-insensitive. These never block the caller —
 # the frontend surfaces them as a non-blocking warning.
+#
+# PAD-17 fix: the name warn-check is scoped to the REQUESTING coach's own roster
+# (Association_CoachPlayer). A globally-unscoped match warned coaches about
+# identically-named players at *other* clubs — a false positive. The warn now
+# only fires when the duplicate name belongs to a player in the caller's roster,
+# which the message reflects.
 WARN_DUPLICATE_CHECKS = {
     ("user", "name"): "You already have a player with this name",
 }
@@ -905,13 +911,21 @@ def check_field_available():
     """Check whether a field value is available for any whitelisted model.
 
     Two kinds of checks are supported:
-      * UNIQUE_FIELD_CHECKS  — hard uniqueness (username, email). Exact match.
+      * UNIQUE_FIELD_CHECKS  — hard uniqueness (username, email). Exact match,
+        matched GLOBALLY across the table (these are true DB uniqueness rules).
       * WARN_DUPLICATE_CHECKS — non-unique fields (name) where we only WARN about
-        duplicates. Matched case-insensitively.
+        duplicates. Matched case-insensitively and scoped to the requesting
+        coach's own roster (see below).
 
     In both cases a duplicate returns HTTP 409 with a human-readable ``message``.
     The frontend decides whether a 409 blocks submission (unique fields) or is a
     soft warning (duplicate fields).
+
+    Scoping (name warn-check): the caller must pass a ``scope`` (or ``coach``)
+    field carrying the requesting coach's id. Only players in that coach's
+    ``Association_CoachPlayer`` roster are considered. If no scope is supplied we
+    deliberately skip the warn (return ``available: true``) rather than fall back
+    to a global match, which would resurface the cross-club false positive.
     """
     data = request.get_json() or {}
     model_key = (data.get("model") or "").strip().lower()
@@ -933,9 +947,32 @@ def check_field_available():
         exists = ModelClass.query.filter_by(**{field: value}).first() is not None
         message = f"This {field} is already taken"
     else:
-        # Case-insensitive exact match for warn-only duplicate fields.
+        # Warn-only duplicate field (name): case-insensitive exact match, scoped
+        # to the requesting coach's roster.
         from sqlalchemy import func
-        exists = ModelClass.query.filter(func.lower(column) == value.lower()).first() is not None
+
+        scope_raw = data.get("scope", data.get("coach"))
+        try:
+            coach_id = int(scope_raw) if scope_raw not in (None, "") else None
+        except (TypeError, ValueError):
+            coach_id = None
+
+        # Without a coach scope we cannot tell whose roster to check, so we skip
+        # the warn entirely rather than emit a false global duplicate.
+        if coach_id is None:
+            return jsonify({"available": True})
+
+        exists = (
+            ModelClass.query
+            .join(Player, Player.user_id == User.id)
+            .join(
+                Association_CoachPlayer,
+                Association_CoachPlayer.player_id == Player.id,
+            )
+            .filter(Association_CoachPlayer.coach_id == coach_id)
+            .filter(func.lower(column) == value.lower())
+            .first()
+        ) is not None
         message = warn_message
 
     if exists:
