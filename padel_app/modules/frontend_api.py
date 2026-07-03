@@ -892,25 +892,54 @@ UNIQUE_FIELD_CHECKS = {
     ("user", "email"),
 }
 
+# Fields that are NOT DB-unique but where we still want to WARN about duplicates
+# (PAD-17). Matching is exact but case-insensitive. These never block the caller —
+# the frontend surfaces them as a non-blocking warning.
+WARN_DUPLICATE_CHECKS = {
+    ("user", "name"): "You already have a player with this name",
+}
+
 
 @bp.post("/check_field_available")
 def check_field_available():
-    """Check whether a unique field value is available for any whitelisted model."""
+    """Check whether a field value is available for any whitelisted model.
+
+    Two kinds of checks are supported:
+      * UNIQUE_FIELD_CHECKS  — hard uniqueness (username, email). Exact match.
+      * WARN_DUPLICATE_CHECKS — non-unique fields (name) where we only WARN about
+        duplicates. Matched case-insensitively.
+
+    In both cases a duplicate returns HTTP 409 with a human-readable ``message``.
+    The frontend decides whether a 409 blocks submission (unique fields) or is a
+    soft warning (duplicate fields).
+    """
     data = request.get_json() or {}
     model_key = (data.get("model") or "").strip().lower()
     field = (data.get("field") or "").strip()
     value = (data.get("value") or "").strip()
 
-    if (model_key, field) not in UNIQUE_FIELD_CHECKS:
+    is_unique = (model_key, field) in UNIQUE_FIELD_CHECKS
+    warn_message = WARN_DUPLICATE_CHECKS.get((model_key, field))
+
+    if not is_unique and warn_message is None:
         abort(400, "Check not allowed")
     if not value:
         return jsonify({"available": True})
 
     ModelClass = MODELS[model_key]
-    exists = ModelClass.query.filter_by(**{field: value}).first() is not None
+    column = getattr(ModelClass, field)
+
+    if is_unique:
+        exists = ModelClass.query.filter_by(**{field: value}).first() is not None
+        message = f"This {field} is already taken"
+    else:
+        # Case-insensitive exact match for warn-only duplicate fields.
+        from sqlalchemy import func
+        exists = ModelClass.query.filter(func.lower(column) == value.lower()).first() is not None
+        message = warn_message
 
     if exists:
-        return jsonify({"available": False, "message": f"This {field} is already taken"}), 409
+        return jsonify({"available": False, "message": message}), 409
     return jsonify({"available": True})
 
 
