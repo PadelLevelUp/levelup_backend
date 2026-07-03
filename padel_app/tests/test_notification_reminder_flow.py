@@ -281,6 +281,139 @@ class TestSendClassRemindersIntegration:
             assert True
 
 
+# ---------------------------------------------------------------------------
+# TestReminderTemplateResolution — PAD-37
+#
+# The scheduled reminder-sending path must render the coach's configured
+# reminder template. It may only fall back to the hardcoded default when the
+# coach has NOT configured a custom template for that key.
+# ---------------------------------------------------------------------------
+
+class TestReminderTemplateResolution:
+
+    def _reminder_texts(self):
+        from padel_app.models.messages import Message
+        msgs = (
+            Message.query.filter_by(message_type="notification_reminder")
+            .order_by(Message.id)
+            .all()
+        )
+        return [m.text for m in msgs]
+
+    def test_uses_coach_custom_reminder_template(self, app):
+        """A configured custom `reminder` template is rendered — not the default."""
+        from padel_app.services.notification_service import (
+            send_class_reminders,
+            update_config,
+        )
+        from padel_app.models.notification_config import DEFAULT_MESSAGE_TEMPLATES
+
+        ids = _seed_coach_and_student(app)
+        instance_id = _seed_instance(
+            app, ids["coach_id"], ids["student_id"], start_offset_hours=48
+        )
+
+        with app.app_context():
+            update_config(
+                ids["coach_id"],
+                {"messageTemplates": {"reminder": "PAD37 custom hi {name}!"}},
+            )
+            now = datetime.utcnow()
+            with patch(PATCHES[0]), patch(PATCHES[1]):
+                send_class_reminders(instance_id, now=now)
+
+            texts = self._reminder_texts()
+            assert len(texts) == 1
+            assert texts[0] == "PAD37 custom hi Test!"
+            # Explicitly assert the default template was NOT used.
+            assert DEFAULT_MESSAGE_TEMPLATES["reminder"] not in texts[0]
+
+    def test_uses_coach_custom_followup_template(self, app):
+        """Repeat reminders render the custom `reminder_followup` template."""
+        from padel_app.services.notification_service import (
+            send_class_reminders,
+            update_config,
+        )
+
+        ids = _seed_coach_and_student(app)
+        instance_id = _seed_instance(
+            app, ids["coach_id"], ids["student_id"], start_offset_hours=48
+        )
+
+        with app.app_context():
+            update_config(
+                ids["coach_id"],
+                {
+                    "messageTemplates": {
+                        "reminder": "FIRST {name}",
+                        "reminder_followup": "FOLLOWUP {name}",
+                    },
+                    "reminderTiming": {
+                        "firstReminder": {"type": "hours_before", "value": 48},
+                        "reminderCount": 2,
+                        "hoursBetweenReminders": 1,
+                    },
+                },
+            )
+            t0 = datetime.utcnow()
+            with patch(PATCHES[0]), patch(PATCHES[1]):
+                send_class_reminders(instance_id, now=t0)
+                send_class_reminders(instance_id, now=t0 + timedelta(hours=2))
+
+            texts = self._reminder_texts()
+            assert texts == ["FIRST Test", "FOLLOWUP Test"]
+
+    def test_falls_back_to_default_only_when_not_configured(self, app):
+        """With no custom `reminder` configured, the default template is used.
+
+        Fallback is correct behaviour ONLY when the coach has not authored a
+        custom template for the key (PAD-37 acceptance criterion).
+        """
+        from padel_app.services.notification_service import send_class_reminders
+        from padel_app.models.notification_config import DEFAULT_MESSAGE_TEMPLATES
+
+        ids = _seed_coach_and_student(app)
+        instance_id = _seed_instance(
+            app, ids["coach_id"], ids["student_id"], start_offset_hours=48
+        )
+
+        with app.app_context():
+            now = datetime.utcnow()
+            with patch(PATCHES[0]), patch(PATCHES[1]):
+                send_class_reminders(instance_id, now=now)
+
+            texts = self._reminder_texts()
+            assert len(texts) == 1
+            # Default template has no unsubstituted {name} placeholder after render.
+            expected_prefix = DEFAULT_MESSAGE_TEMPLATES["reminder"].split("{name}")[0]
+            assert texts[0].startswith(expected_prefix)
+
+    def test_custom_reminder_partial_config_preserves_other_defaults(self, app):
+        """Configuring only `reminder` still renders it (merge keeps custom key)."""
+        from padel_app.services.notification_service import (
+            send_class_reminders,
+            update_config,
+        )
+
+        ids = _seed_coach_and_student(app)
+        instance_id = _seed_instance(
+            app, ids["coach_id"], ids["student_id"], start_offset_hours=48
+        )
+
+        with app.app_context():
+            # Simulate a config that only stores the reminder key (older UI shape).
+            update_config(
+                ids["coach_id"],
+                {"messageTemplates": {"reminder": "ONLY-REMINDER-{name}"}},
+            )
+            now = datetime.utcnow()
+            with patch(PATCHES[0]), patch(PATCHES[1]):
+                send_class_reminders(instance_id, now=now)
+
+            texts = self._reminder_texts()
+            assert texts == ["ONLY-REMINDER-Test"]
+
+
 def _config_with_repeat(app, coach_id, *, count, hours):
     """Persist a NotificationConfig for the coach with repeat-reminder settings."""
     from padel_app.models.notification_config import NotificationConfig

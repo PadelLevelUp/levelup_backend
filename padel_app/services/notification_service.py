@@ -32,6 +32,7 @@ Handles reminders, vacancy-based invitations, waiting list, and manual notificat
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timedelta
 
 from padel_app.sql_db import db
@@ -520,7 +521,47 @@ def _check_per_student_daily_limit(
 def _format_template(template: str, **variables) -> str:
     for key, val in variables.items():
         template = template.replace("{" + key + "}", str(val))
-    return template
+    # An empty placeholder (e.g. a level-less class -> empty {level}) can leave a
+    # double space or a space before punctuation; collapse those so the rendered
+    # message stays grammatical.
+    template = re.sub(r"\s{2,}", " ", template)
+    template = re.sub(r"\s+([,.!?;:])", r"\1", template)
+    return template.strip()
+
+
+# Portuguese weekday names, indexed by ``datetime.weekday()`` (Monday == 0).
+# Tactical localization only — full locale-driven i18n is tracked in PAD-39.
+_PT_WEEKDAYS = (
+    "segunda-feira",
+    "terça-feira",
+    "quarta-feira",
+    "quinta-feira",
+    "sexta-feira",
+    "sábado",
+    "domingo",
+)
+
+
+def _weekday_pt(start_datetime) -> str:
+    """Portuguese weekday name for a datetime, or "" when missing.
+
+    Avoids ``strftime("%A")`` which returns the English weekday under the
+    server's default (en) locale — the source of the "esta Wednesday" leak.
+    """
+    if not start_datetime:
+        return ""
+    return _PT_WEEKDAYS[start_datetime.weekday()]
+
+
+def _level_label(instance) -> str:
+    """Class-name / modality for the ``{level}`` placeholder.
+
+    Returns the level code when the instance has a level, otherwise an empty
+    string. The previous ``"this"`` fallback was an English filler word that
+    leaked into pt templates as "aula de this".
+    """
+    level = getattr(instance, "level", None)
+    return level.code if level else ""
 
 
 def _resolve_locale(coach):
