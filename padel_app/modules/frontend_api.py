@@ -99,6 +99,12 @@ from padel_app.services.calendar_service import (
     reschedule_block_service,
     remove_block_service,
 )
+from padel_app.services.student_availability_service import (
+    list_student_blockers,
+    create_student_blocker,
+    update_student_blocker,
+    delete_student_blocker,
+)
 from padel_app.services.ai_service import stream_import_analysis
 from padel_app.services.import_service import (
     bulk_create_coach_levels,
@@ -672,6 +678,56 @@ def delete_calendar_block(block_id):
 def reschedule_block(block_id):
     data = request.get_json() or {}
     reschedule_block_service(block_id, current_user().id, data)
+    return "", 204
+
+
+# -------------------------------------------------------------------
+# Student availability blockers (PAD-28)
+# Suppress AUTOMATIC class invitations during unavailable windows.
+# Student-scoped: only users with a player profile may manage these.
+# -------------------------------------------------------------------
+
+def _require_student():
+    user = current_user()
+    if not user.player:
+        abort(403, "Availability blockers are only available to students")
+    return user
+
+
+@bp.get("/availability_blockers")
+@jwt_required()
+def get_availability_blockers():
+    user = _require_student()
+    blocks = list_student_blockers(user.id)
+    return jsonify([serialize_calendar_block(b) for b in blocks])
+
+
+@bp.post("/availability_blockers")
+@jwt_required()
+def create_availability_blocker():
+    user = _require_student()
+    data = request.get_json() or {}
+    block = create_student_blocker(user.id, data)
+    return jsonify(serialize_calendar_block(block)), 201
+
+
+@bp.put("/availability_blockers/<int:block_id>")
+@jwt_required()
+def update_availability_blocker(block_id):
+    user = _require_student()
+    data = request.get_json() or {}
+    block = update_student_blocker(block_id, user.id, data)
+    return jsonify(serialize_calendar_block(block))
+
+
+@bp.delete("/availability_blockers/<int:block_id>")
+@jwt_required()
+def delete_availability_blocker(block_id):
+    user = _require_student()
+    data = request.get_json() or {}
+    delete_student_blocker(
+        block_id, user.id, data.get("occDate"), data.get("scope", "all")
+    )
     return "", 204
 
 
