@@ -66,6 +66,24 @@ DEFAULT_MESSAGE_TEMPLATES = {
     "waiting_list_placed": "Good news {name}! A spot opened up in the {level} class on {weekday} at {time} and you've been added. See you there! 🎾",
 }
 
+DEFAULT_MESSAGE_TEMPLATES_PT = {
+    "invite": "Olá {name}, abriu uma vaga na aula de {level} na próxima {weekday} às {time}. Queres vir?",
+    "confirm": "Boa! Conto contigo! Até já 🎾",
+    "decline": "Sem problema, para a próxima!",
+    "spot_filled": "Desculpa, esta vaga já foi preenchida! Aviso-te se abrir outra.",
+    "reminder": "Olá {name}, lembrete: tens a aula de {level} esta {weekday} às {time}. Vens?",
+    "reminder_followup": "Olá {name}, ainda não tive resposta — tens vaga para a aula de {level} esta {weekday} às {time}?",
+    "reminder_confirmed": "Boa, até já! 🎾",
+    "reminder_declined": "Entendido, obrigado por avisares!",
+    "waiting_list_offer": "Esta vaga acabou de ser ocupada, mas podemos pôr-te na lista de espera e avisar-te se abrir outra. Interessa?",
+    "waiting_list_confirm": "Estás na lista de espera! Avisamos-te se abrir uma vaga.",
+    "waiting_list_placed": "Boas notícias {name}! Abriu uma vaga na aula de {level} na {weekday} às {time} e foste adicionado. Até já! 🎾",
+}
+
+
+def default_templates_for_locale(locale):
+    return DEFAULT_MESSAGE_TEMPLATES_PT if (locale or "pt").startswith("pt") else DEFAULT_MESSAGE_TEMPLATES
+
 DEFAULT_INVITATION_GROUPS = [
     {
         "id": "1",
@@ -149,10 +167,11 @@ class NotificationConfig(db.Model, model.Model):
     def get_notification_groups(self):
         return self.notification_groups if self.notification_groups is not None else DEFAULT_NOTIFICATION_GROUPS
 
-    def get_message_templates(self):
+    def get_message_templates(self, locale=None):
+        defaults = default_templates_for_locale(locale)
         if self.message_templates is None:
-            return DEFAULT_MESSAGE_TEMPLATES
-        return {**DEFAULT_MESSAGE_TEMPLATES, **self.message_templates}
+            return dict(defaults)
+        return {**defaults, **self.message_templates}
 
     def get_reminder_timing(self):
         if self.reminder_timing is None:

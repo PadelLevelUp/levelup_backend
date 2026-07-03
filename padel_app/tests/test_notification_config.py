@@ -221,9 +221,11 @@ class TestGetMessageTemplates:
         assert t["invite"] == "Custom invite text"
 
     def test_unset_templates_fall_back_to_defaults(self, config_with_overrides):
+        from padel_app.models.notification_config import default_templates_for_locale
         t = config_with_overrides.get_message_templates()
-        # Only "invite" was stored — all others should fall back
-        assert t["confirm"] == DEFAULT_MESSAGE_TEMPLATES["confirm"]
+        # Only "invite" was stored — all others should fall back to the
+        # locale defaults (no-arg call uses the PT fallback locale).
+        assert t["confirm"] == default_templates_for_locale(None)["confirm"]
 
     @pytest.mark.new_backend
     def test_returns_all_required_keys(self, fresh_config):

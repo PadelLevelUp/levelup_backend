@@ -39,6 +39,11 @@ class Config:
     SESSION_PERMANENT = False
     SESSION_TYPE = "filesystem"
 
+    # i18n / localization (default + fallback locale is Portuguese)
+    BABEL_DEFAULT_LOCALE = "pt"
+    BABEL_DEFAULT_TIMEZONE = "UTC"
+    LANGUAGES = ["pt", "en"]
+
 
 class DevConfig(Config):
     DEBUG = True

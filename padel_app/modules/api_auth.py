@@ -55,4 +55,28 @@ def me():
         "roles": ["coach"] if user.coach else ["player"],
         "coachId": user.coach.id if user.coach else None,
         "isSuperAdmin": user.is_superadmin,
+        "language": getattr(user, "language", "pt") or "pt",
+    })
+
+
+@bp.patch("/me")
+@jwt_required()
+def update_me():
+    user_id = int(get_jwt_identity())
+    user = User.query.get_or_404(user_id)
+    data = request.get_json() or {}
+    lang = data.get("language")
+    if lang is not None:
+        if lang not in ("pt", "en"):
+            return {"error": "Unsupported language"}, 400
+        user.language = lang
+    db.session.commit()
+    return jsonify({
+        "id": user.id,
+        "username": user.username,
+        "name": user.name,
+        "roles": ["coach"] if user.coach else ["player"],
+        "coachId": user.coach.id if user.coach else None,
+        "isSuperAdmin": user.is_superadmin,
+        "language": user.language,
     })
