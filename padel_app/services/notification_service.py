@@ -152,6 +152,50 @@ def _level_sort_key(coach_player: Association_CoachPlayer) -> int:
     return 9999
 
 
+# ---------------------------------------------------------------------------
+# Side (court side) matching helpers — PAD-15
+# ---------------------------------------------------------------------------
+# A player's side may be "left", "right", "both", or None.
+# "both" players are eligible for open spots of ANY side, and a "both"-side
+# vacancy (its departing player was "both") accepts players of any side.
+# Eligibility is therefore inclusive/symmetric; exact-side is only PREFERRED,
+# not required, via the playing-side tiebreaker below.
+
+def _side_eligible(player_side, vacancy_side) -> bool:
+    """True when a player is eligible for a vacancy under a 'same side' criterion.
+
+    Inclusive rule: eligible when the vacancy has no side, the sides match, the
+    player plays "both", or the vacancy side is "both". Only a strict
+    left-vs-right mismatch (with neither being "both") is ineligible.
+    """
+    if vacancy_side is None:
+        return True
+    if player_side is None:
+        # Player has no recorded side preference — treat as ineligible for a
+        # side-specific vacancy (unchanged from prior left/right behaviour where
+        # None != "left"/"right").
+        return False
+    if player_side == vacancy_side:
+        return True
+    if player_side == "both" or vacancy_side == "both":
+        return True
+    return False
+
+
+def _side_preference_rank(player_side, vacancy_side) -> int:
+    """Rank for the playing-side tiebreaker: lower is preferred.
+
+    0 = exact side match (or vacancy has no side constraint),
+    1 = "both" fallback (player or vacancy is "both"),
+    2 = anything else (wrong side; only reachable in looser rounds).
+    """
+    if vacancy_side is None or player_side == vacancy_side:
+        return 0
+    if player_side == "both" or vacancy_side == "both":
+        return 1
+    return 2
+
+
 def _attendance_stats(player_id: int) -> tuple[float, float]:
     presences = Presence.query.filter_by(player_id=player_id).all()
     if not presences:
@@ -162,8 +206,9 @@ def _attendance_stats(player_id: int) -> tuple[float, float]:
     return present / total, justified / total
 
 
-def _build_sort_key(criteria: list[dict], player_stats: dict):
+def _build_sort_key(criteria: list[dict], player_stats: dict, vacancy: Vacancy = None):
     enabled = [c["id"] for c in criteria if c.get("enabled")]
+    vacancy_side = getattr(vacancy, "side", None)
 
     def key(cp: Association_CoachPlayer):
         parts = []
@@ -176,7 +221,13 @@ def _build_sort_key(criteria: list[dict], player_stats: dict):
             elif criterion == "attendance":
                 parts.append(-stats.get("attendance_rate", 0.0))
             elif criterion == "playing_side":
-                parts.append(0 if cp.side == "left" else 1)
+                # Prefer an exact-side match first, then "both" players, then any
+                # remaining. When the vacancy has no side, fall back to the legacy
+                # "left first" ordering so behaviour is unchanged for that case.
+                if vacancy_side is not None:
+                    parts.append(_side_preference_rank(cp.side, vacancy_side))
+                else:
+                    parts.append(0 if cp.side == "left" else 1)
             elif criterion == "subscription_status":
                 parts.append(0 if getattr(cp, "player", None) and cp.player.user.status == "active" else 1)
         return tuple(parts)
@@ -294,7 +345,9 @@ def _passes_group_rules(rules: list, cp: Association_CoachPlayer, vacancy: Vacan
         elif attr == "side":
             if vacancy.side is None:
                 continue
-            if op == "same_as_vacancy" and cp.side != vacancy.side:
+            # Inclusive of "both": a "both" player (or a "both" vacancy) is eligible
+            # for any side. Exact-side is preferred via the sort key, not required.
+            if op == "same_as_vacancy" and not _side_eligible(cp.side, vacancy.side):
                 return False
 
         elif attr == "has_makeups":
@@ -372,7 +425,7 @@ def _get_eligible_students_for_group(
         att_rate, just_rate = _attendance_stats(cp.player_id)
         player_stats[cp.player_id] = {"attendance_rate": att_rate, "justified_miss_rate": just_rate}
 
-    sort_key = _build_sort_key(config.get_priority_criteria(), player_stats)
+    sort_key = _build_sort_key(config.get_priority_criteria(), player_stats, vacancy)
     return sorted(coach_players, key=sort_key)
 
 
@@ -436,7 +489,11 @@ def get_eligible_students(
 
         elif criterion == "same_side":
             if vacancy.side is not None:
-                coach_players = [cp for cp in coach_players if cp.side == vacancy.side]
+                # "both" players (and any player for a "both" vacancy) stay eligible;
+                # exact-side is preferred later by the playing-side tiebreaker.
+                coach_players = [
+                    cp for cp in coach_players if _side_eligible(cp.side, vacancy.side)
+                ]
 
         elif criterion == "max_unjustified_absences":
             max_abs = criteria_values.get("max_unjustified_absences", 0)
@@ -454,7 +511,7 @@ def get_eligible_students(
             "justified_miss_rate": just_rate,
         }
 
-    sort_key = _build_sort_key(config.get_priority_criteria(), player_stats)
+    sort_key = _build_sort_key(config.get_priority_criteria(), player_stats, vacancy)
     return sorted(coach_players, key=sort_key)
 
 
@@ -1894,7 +1951,7 @@ def _check_waiting_list(
                         passes = False
                         break
                 elif criterion == "same_side":
-                    if vacancy.side is not None and cp.side != vacancy.side:
+                    if vacancy.side is not None and not _side_eligible(cp.side, vacancy.side):
                         passes = False
                         break
                 elif criterion == "max_unjustified_absences":
@@ -1917,7 +1974,7 @@ def _check_waiting_list(
             "justified_miss_rate": just_rate,
         }
 
-    sort_key = _build_sort_key(config.get_priority_criteria(), player_stats)
+    sort_key = _build_sort_key(config.get_priority_criteria(), player_stats, vacancy)
     eligible_entries.sort(key=lambda pair: sort_key(pair[1]))
 
     return eligible_entries[0][0]

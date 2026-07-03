@@ -27,7 +27,7 @@ class Vacancy(db.Model, model.Model):
         Integer, ForeignKey("players.id", ondelete="SET NULL"), nullable=True
     )
     # Snapshotted from the departing player's Association_CoachPlayer at creation time
-    side = Column(Enum("left", "right", name="vacancy_side"), nullable=True)
+    side = Column(Enum("left", "right", "both", name="vacancy_side"), nullable=True)
     level_id = Column(Integer, ForeignKey("coach_levels.id"), nullable=True)
 
     status = Column(
