@@ -370,7 +370,11 @@ class TestReminderTemplateResolution:
         custom template for the key (PAD-37 acceptance criterion).
         """
         from padel_app.services.notification_service import send_class_reminders
-        from padel_app.models.notification_config import DEFAULT_MESSAGE_TEMPLATES
+        # PAD-39 made notifications locale-aware; a coach with no explicit
+        # language resolves to Portuguese, so the default reminder is the pt
+        # variant. Assert against that default (still the "no custom template"
+        # fallback the PAD-37 criterion cares about).
+        from padel_app.models.notification_config import DEFAULT_MESSAGE_TEMPLATES_PT
 
         ids = _seed_coach_and_student(app)
         instance_id = _seed_instance(
@@ -385,7 +389,7 @@ class TestReminderTemplateResolution:
             texts = self._reminder_texts()
             assert len(texts) == 1
             # Default template has no unsubstituted {name} placeholder after render.
-            expected_prefix = DEFAULT_MESSAGE_TEMPLATES["reminder"].split("{name}")[0]
+            expected_prefix = DEFAULT_MESSAGE_TEMPLATES_PT["reminder"].split("{name}")[0]
             assert texts[0].startswith(expected_prefix)
 
     def test_custom_reminder_partial_config_preserves_other_defaults(self, app):
