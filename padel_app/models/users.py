@@ -43,7 +43,14 @@ class User(db.Model, model.Model, UserMixin):
         nullable=False,
         server_default="inactive",
     )
-    
+
+    language = Column(
+        String(2),
+        nullable=False,
+        server_default="pt",
+        default="pt",
+    )
+
     #TODO: RETHINK THIS FUNCTION
     @property
     def role(self):

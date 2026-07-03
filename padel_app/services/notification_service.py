@@ -32,6 +32,7 @@ Handles reminders, vacancy-based invitations, waiting list, and manual notificat
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timedelta
 
 from padel_app.sql_db import db
@@ -577,7 +578,67 @@ def _check_per_student_daily_limit(
 def _format_template(template: str, **variables) -> str:
     for key, val in variables.items():
         template = template.replace("{" + key + "}", str(val))
-    return template
+    # An empty placeholder (e.g. a level-less class -> empty {level}) can leave a
+    # double space or a space before punctuation; collapse those so the rendered
+    # message stays grammatical.
+    template = re.sub(r"\s{2,}", " ", template)
+    template = re.sub(r"\s+([,.!?;:])", r"\1", template)
+    return template.strip()
+
+
+# Portuguese weekday names, indexed by ``datetime.weekday()`` (Monday == 0).
+# Tactical localization only — full locale-driven i18n is tracked in PAD-39.
+_PT_WEEKDAYS = (
+    "segunda-feira",
+    "terça-feira",
+    "quarta-feira",
+    "quinta-feira",
+    "sexta-feira",
+    "sábado",
+    "domingo",
+)
+
+
+def _weekday_pt(start_datetime) -> str:
+    """Portuguese weekday name for a datetime, or "" when missing.
+
+    Avoids ``strftime("%A")`` which returns the English weekday under the
+    server's default (en) locale — the source of the "esta Wednesday" leak.
+    """
+    if not start_datetime:
+        return ""
+    return _PT_WEEKDAYS[start_datetime.weekday()]
+
+
+def _level_label(instance) -> str:
+    """Class-name / modality for the ``{level}`` placeholder.
+
+    Returns the level code when the instance has a level, otherwise an empty
+    string. The previous ``"this"`` fallback was an English filler word that
+    leaked into pt templates as "aula de this".
+    """
+    level = getattr(instance, "level", None)
+    return level.code if level else ""
+
+
+def _resolve_locale(coach):
+    """Resolve the coach's preferred locale, falling back to Portuguese."""
+    try:
+        lang = getattr(coach.user, "language", None) if coach and coach.user else None
+    except Exception:
+        lang = None
+    return "pt" if not lang else ("pt" if lang.startswith("pt") else "en")
+
+
+def _format_weekday(dt, locale):
+    """Locale-aware full weekday name via Babel (e.g. pt -> 'quarta-feira')."""
+    if not dt:
+        return ""
+    try:
+        from babel.dates import format_date
+        return format_date(dt, format="EEEE", locale=locale)
+    except Exception:
+        return dt.strftime("%A")
 
 
 def _get_or_create_direct_conversation(coach_user_id: int, player_user_id: int):
@@ -851,11 +912,12 @@ def send_class_reminders(instance_id: int, *, now: datetime | None = None) -> di
 
     coach_user_id = coach.user_id
     config = get_or_create_config(coach.id)
-    templates = config.get_message_templates()
+    locale = _resolve_locale(coach)
+    templates = config.get_message_templates(locale)
     reminder_count = config.get_reminder_count()
 
-    level_code = instance.level.code if getattr(instance, "level", None) else "this"
-    weekday = instance.start_datetime.strftime("%A") if instance.start_datetime else ""
+    level_code = instance.level.code if getattr(instance, "level", None) else ""
+    weekday = _format_weekday(instance.start_datetime, locale)
     time_str = instance.start_datetime.strftime("%H:%M") if instance.start_datetime else ""
 
     from padel_app.models import Message, Player
@@ -1258,9 +1320,10 @@ def _send_invitation_batch(
 
     coach_obj = Coach.query.get(coach_id)
     coach_user_id = coach_obj.user_id if coach_obj else None
-    templates = config.get_message_templates()
-    level_code = instance.level.code if getattr(instance, "level", None) else "this"
-    weekday = instance.start_datetime.strftime("%A") if instance.start_datetime else ""
+    locale = _resolve_locale(coach_obj)
+    templates = config.get_message_templates(locale)
+    level_code = instance.level.code if getattr(instance, "level", None) else ""
+    weekday = _format_weekday(instance.start_datetime, locale)
     time_str = instance.start_datetime.strftime("%H:%M") if instance.start_datetime else ""
 
     notified = []
@@ -1729,10 +1792,11 @@ def send_manual_notifications(
     if not instance.notifications_enabled:
         return []
     config = get_or_create_config(coach_id)
-    templates = config.get_message_templates()
 
     coach = Coach.query.get(coach_id)
     coach_user_id = coach.user_id if coach else None
+    locale = _resolve_locale(coach)
+    templates = config.get_message_templates(locale)
 
     events = []
     for player_id in player_ids:
@@ -1751,8 +1815,8 @@ def send_manual_notifications(
         if coach_user_id and player_user_id:
             player = Player.query.get(player_id)
             player_name = (player.user.name if player and player.user else "there").split()[0]
-            level_code = instance.level.code if getattr(instance, "level", None) else "this"
-            weekday = instance.start_datetime.strftime("%A") if instance.start_datetime else ""
+            level_code = instance.level.code if getattr(instance, "level", None) else ""
+            weekday = _format_weekday(instance.start_datetime, locale)
             time_str = instance.start_datetime.strftime("%H:%M") if instance.start_datetime else ""
 
             text = _format_template(
@@ -2018,11 +2082,12 @@ def _fill_from_waiting_list(
 
     from padel_app.models import Player
 
-    templates = config.get_message_templates()
+    locale = _resolve_locale(coach)
+    templates = config.get_message_templates(locale)
     player = Player.query.get(entry.player_id)
     player_name = (player.user.name if player and player.user else "there").split()[0]
-    level_code = instance.level.code if getattr(instance, "level", None) else "this"
-    weekday = instance.start_datetime.strftime("%A") if instance.start_datetime else ""
+    level_code = instance.level.code if getattr(instance, "level", None) else ""
+    weekday = _format_weekday(instance.start_datetime, locale)
     time_str = instance.start_datetime.strftime("%H:%M") if instance.start_datetime else ""
 
     text = _format_template(
