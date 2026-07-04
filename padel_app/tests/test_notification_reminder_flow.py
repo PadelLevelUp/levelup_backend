@@ -879,3 +879,110 @@ class TestCancelAttendance:
             ).first()
             assert presence.confirmed is True
             assert presence.status is None
+            # And it is not flagged as a late cancellation.
+            assert presence.late_cancellation is False
+
+    def test_cancel_before_deadline_not_flagged_and_spot_freed(self, app):
+        """Cancelling well before the deadline (start 48h away, default 24h
+        deadline): succeeds, late_cancellation stays False, spot is freed."""
+        from padel_app.services.notification_service import (
+            cancel_attendance,
+            get_or_create_config,
+        )
+        from padel_app.models.presences import Presence
+        from padel_app.models.vacancy import Vacancy
+
+        ids = _seed_coach_and_student(app)
+        instance_id = _seed_instance(app, ids["coach_id"], ids["student_id"], start_offset_hours=48)
+        self._confirmed_presence(app, instance_id, ids["student_id"])
+
+        with app.app_context():
+            # Enable the engine so a vacancy is created when the spot is freed.
+            config = get_or_create_config(ids["coach_id"])
+            config.auto_notify_enabled = True
+            db.session.commit()
+
+            with patch(PATCHES[0]), patch(PATCHES[1]):
+                # now = current time → start is ~48h away → 24h before the
+                # deadline → NOT late.
+                result = cancel_attendance(instance_id, ids["student_user_id"])
+
+            assert result["action"] == "declined"
+            presence = Presence.query.filter_by(
+                lesson_instance_id=instance_id, player_id=ids["student_id"]
+            ).first()
+            assert presence.status == "absent"
+            assert presence.justification == "justified"
+            assert presence.late_cancellation is False
+
+            vacancy = Vacancy.query.filter_by(
+                lesson_instance_id=instance_id,
+                original_player_id=ids["student_id"],
+            ).first()
+            assert vacancy is not None
+
+    def test_cancel_after_deadline_before_start_is_flagged_late(self, app):
+        """Cancelling inside the deadline window (start 48h away, now +30h →
+        18h before start, deadline is 24h before): still allowed, but
+        late_cancellation=True and the spot is still freed."""
+        from padel_app.services.notification_service import (
+            cancel_attendance,
+            get_or_create_config,
+        )
+        from padel_app.models.presences import Presence
+        from padel_app.models.vacancy import Vacancy
+
+        ids = _seed_coach_and_student(app)
+        instance_id = _seed_instance(app, ids["coach_id"], ids["student_id"], start_offset_hours=48)
+        self._confirmed_presence(app, instance_id, ids["student_id"])
+
+        with app.app_context():
+            config = get_or_create_config(ids["coach_id"])
+            config.auto_notify_enabled = True
+            db.session.commit()
+
+            # now = +30h → start is 18h away → past the 24h deadline but before start.
+            now = datetime.utcnow() + timedelta(hours=30)
+            with patch(PATCHES[0]), patch(PATCHES[1]):
+                result = cancel_attendance(
+                    instance_id, ids["student_user_id"], now=now
+                )
+
+            assert result["action"] == "declined"
+            presence = Presence.query.filter_by(
+                lesson_instance_id=instance_id, player_id=ids["student_id"]
+            ).first()
+            assert presence.status == "absent"
+            assert presence.justification == "justified"
+            assert presence.late_cancellation is True
+
+            # Spot still freed.
+            vacancy = Vacancy.query.filter_by(
+                lesson_instance_id=instance_id,
+                original_player_id=ids["student_id"],
+            ).first()
+            assert vacancy is not None
+
+    def test_cancellation_deadline_hours_defaults_to_24_and_round_trips(self, app):
+        """cancellationDeadlineHours defaults to 24 and round-trips through
+        get_config_dict / update_config (the GET|POST /notify/config path)."""
+        from padel_app.services.notification_service import (
+            get_config_dict,
+            update_config,
+        )
+
+        ids = _seed_coach_and_student(app)
+
+        with app.app_context():
+            # Default: 24 (GET /notify/config → get_config_dict).
+            cfg = get_config_dict(ids["coach_id"])
+            assert cfg["restrictions"]["cancellationDeadlineHours"] == 24
+
+            # POST /notify/config → update_config with a new value.
+            restrictions = dict(cfg["restrictions"])
+            restrictions["cancellationDeadlineHours"] = 12
+            update_config(ids["coach_id"], {"restrictions": restrictions})
+
+            # Round-trips back on the next GET.
+            cfg2 = get_config_dict(ids["coach_id"])
+            assert cfg2["restrictions"]["cancellationDeadlineHours"] == 12

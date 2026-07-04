@@ -98,8 +98,13 @@ def serialize_class_instance(obj, viewer_player_id=None) -> dict:
     }
 
     if is_instance:
+        from datetime import timedelta
         from padel_app.models.notification_event import NotificationEvent
         from padel_app.models.lesson_instance_training import LessonInstanceTraining
+        from padel_app.models.notification_config import (
+            NotificationConfig,
+            DEFAULT_CANCELLATION_DEADLINE_HOURS,
+        )
 
         notification_query = NotificationEvent.query.filter_by(
             lesson_instance_id=obj.id
@@ -119,6 +124,20 @@ def serialize_class_instance(obj, viewer_player_id=None) -> dict:
             for p in getattr(obj, "presences", [])
             if not is_student or p.player_id == viewer_player_id
         ]
+
+        # Effective cancellation deadline for this instance (PAD-43) so the
+        # frontend can render deadline UX. Falls back to the default when the
+        # coach has no config.
+        deadline_hours = DEFAULT_CANCELLATION_DEADLINE_HOURS
+        if coach_id is not None:
+            config = NotificationConfig.query.filter_by(coach_id=coach_id).first()
+            if config is not None:
+                deadline_hours = config.get_cancellation_deadline_hours()
+        cancellation_deadline = None
+        if obj.start_datetime is not None:
+            cancellation_deadline = (
+                obj.start_datetime - timedelta(hours=deadline_hours)
+            ).isoformat()
 
         data.update(
             {
@@ -144,6 +163,8 @@ def serialize_class_instance(obj, viewer_player_id=None) -> dict:
                     for ev in notification_events
                 ],
                 "plannedExerciseIds": [str(t.exercise_id) for t in training_rows],
+                "cancellationDeadlineHours": deadline_hours,
+                "cancellationDeadline": cancellation_deadline,
             }
         )
         data["levelId"] = str(obj.level_id) if obj.level_id else data["levelId"]

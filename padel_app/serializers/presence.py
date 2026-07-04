@@ -8,4 +8,5 @@ def serialize_presence(presence):
         "invited": presence.invited,
         "confirmed": presence.confirmed,
         "validated": presence.validated,
+        "lateCancellation": presence.late_cancellation,
     }
