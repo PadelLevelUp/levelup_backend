@@ -20,6 +20,7 @@ from .coach_invitation import CoachInvitation
 from .player_invitation import PlayerInvitation
 from .evaluation_category import EvaluationCategory
 from .evaluation_entry import EvaluationEntry
+from .seasons import Season
 from .exercise import Exercise, ExerciseGroup
 from .Association_CoachClub import Association_CoachClub
 from .Association_CoachLesson import Association_CoachLesson
@@ -61,6 +62,7 @@ MODELS = {
     "playerinvitation": PlayerInvitation,
     "evaluationcategory": EvaluationCategory,
     "evaluationentry": EvaluationEntry,
+    "season": Season,
     "exercise": Exercise,
     "exercisegroup": ExerciseGroup,
     "conversation_participant": ConversationParticipant,

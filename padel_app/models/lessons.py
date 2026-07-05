@@ -24,6 +24,9 @@ class Lesson(db.Model, model.Model):
     is_recurring = Column(Boolean, default=False, nullable=False)
     recurrence_rule = Column(Text, nullable=True)
     recurrence_end = Column(Date, nullable=True)
+    recurs_until_season_end = Column(
+        Boolean, default=False, nullable=False, server_default="0"
+    )
     
     type = Column(Enum("academy", "private", name="lesson_type"), nullable=False)
 
@@ -115,6 +118,7 @@ class Lesson(db.Model, model.Model):
                 get_field("is_recurring", type="Boolean", label="Is Recurring"),
                 get_field("recurrence_rule", type="Text", label="Recurrence Rule"),
                 get_field("recurrence_end", type="Date", label="Recurrence End"),
+                get_field("recurs_until_season_end", type="Boolean", label="Recurs Until Season End"),
                 get_field(
                     "coaches_relations",
                     "OneToMany",

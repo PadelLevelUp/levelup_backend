@@ -349,6 +349,7 @@ def duplicate_lesson_helper(old_lesson):
         is_recurring=old_lesson.is_recurring,
         recurrence_rule=old_lesson.recurrence_rule,
         recurrence_end=old_lesson.recurrence_end,
+        recurs_until_season_end=old_lesson.recurs_until_season_end,
         start_datetime=old_lesson.start_datetime,
         end_datetime=old_lesson.end_datetime,
         club_id=old_lesson.club_id,
@@ -468,7 +469,20 @@ def add_class_service(data, coach, club):
         lesson_payload["recurrence_rule"] = json.dumps(data.get("recurrenceRule"))
         lesson_payload["recurrence_end"] = data.get("endDate")
 
+        if data.get("recursUntilSeasonEnd"):
+            from padel_app.services import season_service
+
+            lesson_payload["recurs_until_season_end"] = True
+            start_date = datetime.strptime(data["date"], "%Y-%m-%d").date()
+            season_end = season_service.resolve_season_end_for_coach(coach, start_date)
+            if season_end is not None:
+                lesson_payload["recurrence_end"] = season_end
+
     lesson = create_lesson_helper(lesson_payload)
+
+    if lesson_payload.get("recurs_until_season_end"):
+        lesson.recurs_until_season_end = True
+        lesson.save()
 
     if data.get("notificationsEnabled") is not None:
         lesson.notifications_enabled = data["notificationsEnabled"]

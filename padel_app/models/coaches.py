@@ -24,6 +24,8 @@ class Coach(db.Model, model.Model):
     )
     
     evaluation_categories = relationship("EvaluationCategory", back_populates="coach", cascade="all, delete-orphan")
+
+    seasons = relationship("Season", back_populates="coach", cascade="all, delete-orphan")
     
     @property
     def name(self):

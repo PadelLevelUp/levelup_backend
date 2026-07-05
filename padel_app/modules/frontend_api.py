@@ -20,6 +20,13 @@ from padel_app.serializers.calendar import serialize_calendar_block
 from padel_app.serializers.message import serialize_message
 from padel_app.serializers.conversation import serialize_conversation_detail, serialize_conversation
 from padel_app.serializers.coach_level import serialize_coach_level
+from padel_app.serializers.season import serialize_season
+from padel_app.services.season_service import (
+    list_seasons,
+    upsert_seasons,
+    delete_season,
+    regenerate_future_instances_for_season,
+)
 
 from padel_app.helpers.calendar_helpers import (
     load_lessons_for_coach,
@@ -418,6 +425,13 @@ def get_coach_levels():
     return jsonify([serialize_coach_level(l) for l in coach.levels])
 
 
+@bp.get("/seasons")
+@jwt_required()
+def get_seasons():
+    coach = current_coach()
+    return jsonify([serialize_season(s) for s in list_seasons(coach)])
+
+
 @bp.get("/lessons")
 def get_lessons():
     return jsonify([serialize_lesson(lesson) for lesson in Lesson.query.all()])
@@ -737,6 +751,31 @@ def add_coach_level():
     data = request.get_json() or {}
     upsert_coach_levels(current_coach(), data)
     return jsonify(data)
+
+
+@bp.post("/add_seasons")
+@jwt_required()
+def add_seasons():
+    data = request.get_json() or []
+    coach = current_coach()
+    try:
+        upsert_seasons(coach, data)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+    seasons = list_seasons(coach)
+    for season in seasons:
+        regenerate_future_instances_for_season(season)
+
+    return jsonify([serialize_season(s) for s in list_seasons(coach)])
+
+
+@bp.post("/delete/season")
+@jwt_required()
+def delete_season_route():
+    data = request.get_json() or {}
+    delete_season(current_coach(), data["id"])
+    return jsonify({"status": "Removed season"}), 200
 
 
 @bp.post("/add_evaluation_categories")
