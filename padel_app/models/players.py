@@ -153,5 +153,9 @@ class Player(db.Model, model.Model):
             "username": self.user.username,
             "side": rel.side,
             "userId": self.user_id,
-            "isActive": self.user.status == 'active' 
+            "isActive": self.user.status == 'active',
+            # PAD-30: profile-completion signal (password set via PAD-32
+            # self-service registration). Distinct from isActive, which a
+            # coach-disabled player would fail while still being validated.
+            "validated": self.user.password is not None,
         }

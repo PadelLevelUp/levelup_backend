@@ -131,6 +131,11 @@ def _serialize_coach_player_relation(rel):
         "side": rel.side,
         "userId": player.user_id if player else None,
         "isActive": user.status == "active" if user else False,
+        # PAD-30: a player who has completed self-service registration
+        # (PAD-32) has a password set. Coach-disabled players keep their
+        # password, so this is a precise "profile complete" signal that does
+        # not conflate with isActive.
+        "validated": (user.password is not None) if user else False,
     }
     if level:
         result["level"] = {

@@ -121,3 +121,31 @@ def test_player_without_level_serializes_none(app):
         player = Player.query.get(player_id)
         info = player.coach_player_info(coach_id)
         assert info["levelId"] is None
+
+
+def test_validated_reflects_password_completion(app):
+    """PAD-30: `validated` is True only once a password is set (PAD-32
+    self-service completion), independent of the active/status flag."""
+    coach_id = make_coach(app)
+
+    with app.app_context():
+        from padel_app.services.player_service import get_coach_players_list
+        from padel_app.models import Player
+        from padel_app.models.coaches import Coach
+
+        player_id, _ = _make_player_with_relation(coach_id, username="unvalidated")
+
+        coach = Coach.query.get(coach_id)
+        row = get_coach_players_list(coach)[0]
+        # No password yet -> not validated, even though status is "active".
+        assert row["validated"] is False
+        player = Player.query.get(player_id)
+        assert player.coach_player_info(coach_id)["validated"] is False
+
+        # Simulate completing self-service registration (password set).
+        player.user.password = "hashed-pw"
+        db.session.commit()
+
+        row = get_coach_players_list(coach)[0]
+        assert row["validated"] is True
+        assert player.coach_player_info(coach_id)["validated"] is True
