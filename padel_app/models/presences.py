@@ -34,6 +34,11 @@ class Presence(db.Model, model.Model):
     invited = Column(Boolean, default=False)
     confirmed = Column(Boolean, default=False)
     validated = Column(Boolean, default=False)
+    # Set when a student cancels their attendance at or after the coach's
+    # configured cancellation deadline (but before the class starts). PAD-43.
+    late_cancellation = Column(
+        Boolean, default=False, server_default="false", nullable=False
+    )
     
     @property
     def name(self):
@@ -72,6 +77,7 @@ class Presence(db.Model, model.Model):
                 get_field("invited", "Invited", "Boolean"),
                 get_field("confirmed", "Confirmed", "Boolean"),
                 get_field("validated", "Validated", "Boolean"),
+                get_field("late_cancellation", "Late cancellation", "Boolean"),
             ],
         )
         form.add_block(info_block)

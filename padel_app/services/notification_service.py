@@ -1171,6 +1171,10 @@ def cancel_attendance(
     Allowed only BEFORE the class start time. Reverts the player to
     "not attending" and frees the spot, reusing the exact same engine path as a
     reminder decline. After the class has started, raises 409.
+
+    Cancellations at or after the coach's configured cancellation deadline
+    (``cancellationDeadlineHours`` before start, default 24) are still allowed
+    and still free the spot, but flag the Presence with ``late_cancellation``.
     """
     from flask import abort
     from padel_app.models import Coach, Player
@@ -1198,6 +1202,23 @@ def cancel_attendance(
 
     config = get_or_create_config(coach.id) if coach else None
     templates = config.get_message_templates() if config else DEFAULT_MESSAGE_TEMPLATES
+
+    # Flag late cancellations: at/after the deadline (start - cancellationDeadlineHours)
+    # but still before start. The spot is freed either way.
+    if presence is not None:
+        from padel_app.models.notification_config import (
+            DEFAULT_CANCELLATION_DEADLINE_HOURS,
+        )
+        deadline_hours = (
+            config.get_cancellation_deadline_hours()
+            if config
+            else DEFAULT_CANCELLATION_DEADLINE_HOURS
+        )
+        is_late = False
+        if instance.start_datetime is not None:
+            deadline = instance.start_datetime - timedelta(hours=deadline_hours)
+            is_late = _now >= deadline
+        presence.late_cancellation = is_late
 
     # Mark the most recent reminder message as responded ("no") so the UI reflects
     # the cancellation on reload, mirroring respond_to_reminder.

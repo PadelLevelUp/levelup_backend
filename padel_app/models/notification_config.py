@@ -22,6 +22,9 @@ DEFAULT_RESTRICTIONS = {
     "maxInactiveTime": {"enabled": True, "value": 120},
     "excludedPlayers": {"enabled": False, "playerIds": []},
     "excludeUnpaidSubscription": {"enabled": False},
+    # Hours before class start after which a student cancellation is flagged
+    # as a late cancellation (spot is still freed). Plain scalar (hours).
+    "cancellationDeadlineHours": 24,
 }
 
 DEFAULT_ROUNDS = [
@@ -107,6 +110,12 @@ DEFAULT_TIEBREAKERS = [
     {"id": "subscription_status", "label": "Active subscription", "enabled": False},
 ]
 
+# Hours before a class start after which a student cancellation is flagged as a
+# late cancellation. Students may still cancel (and the spot is still freed), but
+# the resulting Presence is marked late_cancellation=True. Stored in the
+# ``restrictions`` JSON under ``cancellationDeadlineHours``. Default 24h.
+DEFAULT_CANCELLATION_DEADLINE_HOURS = 24
+
 DEFAULT_REMINDER_TIMING = {"type": "hours_before", "value": 48}
 DEFAULT_INVITATION_START_TIMING = {"type": "hours_before", "value": 24}
 # How many reminders to send each student, and how far apart, when they
@@ -160,6 +169,24 @@ class NotificationConfig(db.Model, model.Model):
             return DEFAULT_RESTRICTIONS
         # Merge stored restrictions with defaults so new keys are always present
         return {**DEFAULT_RESTRICTIONS, **self.restrictions}
+
+    def get_cancellation_deadline_hours(self):
+        """Hours before class start after which a cancellation is flagged late.
+
+        Read from the ``cancellationDeadlineHours`` key of the restrictions JSON,
+        defaulting to ``DEFAULT_CANCELLATION_DEADLINE_HOURS`` (24) when unset or
+        invalid.
+        """
+        raw = self.get_restrictions().get(
+            "cancellationDeadlineHours", DEFAULT_CANCELLATION_DEADLINE_HOURS
+        )
+        try:
+            hours = float(raw)
+        except (TypeError, ValueError):
+            return DEFAULT_CANCELLATION_DEADLINE_HOURS
+        if hours < 0:
+            return DEFAULT_CANCELLATION_DEADLINE_HOURS
+        return hours
 
     def get_rounds(self):
         return self.rounds if self.rounds is not None else DEFAULT_ROUNDS
