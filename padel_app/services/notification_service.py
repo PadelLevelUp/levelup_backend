@@ -698,6 +698,84 @@ def _send_system_message(
     return msg
 
 
+def _notify_coach_of_cancellation(
+    coach_user_id: int,
+    player_user_id: int,
+    instance: LessonInstance,
+    player,
+    *,
+    is_late: bool,
+    locale: str = "en",
+) -> "object | None":
+    """Create a single COACH-facing notification when a student cancels.
+
+    Unlike ``_send_system_message`` (which pushes to the *player*), this reuses the
+    same coach↔player direct conversation but sends the message *from the student*
+    (``sender_id=player_user_id``) and directs the push notification at the
+    ``coach_user_id`` — so the coach is the one who actually gets notified.
+
+    Emitted from ``cancel_attendance`` only (the single path that computes
+    lateness), so it fires exactly once per cancellation. The human-readable text
+    reflects lateness, and ``msg_metadata`` carries a machine-readable
+    ``lateCancellation`` marker plus the ``lessonInstanceId``.
+    """
+    from padel_app.models import Message
+    from padel_app.serializers.message import serialize_message
+
+    if not coach_user_id or not player_user_id:
+        return None
+
+    player_name = player.user.name if player and player.user else "A player"
+    class_title = instance.title or "the class"
+    when = _format_class_when(instance, locale)
+
+    if is_late:
+        text = (
+            f"{player_name} cancelled (LATE) for {class_title}{when}."
+        )
+    else:
+        text = f"{player_name} cancelled for {class_title}{when}."
+
+    conv = _get_or_create_direct_conversation(coach_user_id, player_user_id)
+    msg = Message(
+        text=text,
+        sender_id=player_user_id,
+        conversation_id=conv.id,
+        message_type="text",
+        msg_metadata={
+            "cancellation": True,
+            "lateCancellation": bool(is_late),
+            "lessonInstanceId": instance.id,
+        },
+    )
+    msg.create()
+
+    publish({
+        "type": "message_created",
+        "payload": serialize_message(msg, None),
+    })
+
+    send_push_notification(
+        user_id=coach_user_id,
+        title="Late cancellation" if is_late else "Cancellation",
+        body=text[:100],
+        url=f"/messages/{conv.id}",
+    )
+
+    return msg
+
+
+def _format_class_when(instance: LessonInstance, locale: str = "en") -> str:
+    """Human-readable ' on <weekday> at <time>' suffix for a class instance."""
+    if instance.start_datetime is None:
+        return ""
+    weekday = _format_weekday(instance.start_datetime, locale)
+    time_str = instance.start_datetime.strftime("%H:%M")
+    if weekday:
+        return f" on {weekday} at {time_str}"
+    return f" at {time_str}"
+
+
 def _user_id_for_player(player_id: int) -> int | None:
     from padel_app.models import Player
     player = Player.query.get(player_id)
@@ -1205,6 +1283,7 @@ def cancel_attendance(
 
     # Flag late cancellations: at/after the deadline (start - cancellationDeadlineHours)
     # but still before start. The spot is freed either way.
+    is_late = False
     if presence is not None:
         from padel_app.models.notification_config import (
             DEFAULT_CANCELLATION_DEADLINE_HOURS,
@@ -1214,11 +1293,26 @@ def cancel_attendance(
             if config
             else DEFAULT_CANCELLATION_DEADLINE_HOURS
         )
-        is_late = False
         if instance.start_datetime is not None:
             deadline = instance.start_datetime - timedelta(hours=deadline_hours)
             is_late = _now >= deadline
         presence.late_cancellation = is_late
+
+    # PAD-44: notify the COACH of the cancellation exactly once, flagging late
+    # cancellations. This is emitted HERE (not in the shared
+    # _free_spot_for_declining_player) because cancel_attendance is the only path
+    # that computes lateness — keeping a single emission point avoids duplicates and
+    # a false "late" flag on plain reminder declines.
+    if coach_user_id:
+        locale = _resolve_locale(coach)
+        _notify_coach_of_cancellation(
+            coach_user_id,
+            acting_user_id,
+            instance,
+            player,
+            is_late=is_late,
+            locale=locale,
+        )
 
     # Mark the most recent reminder message as responded ("no") so the UI reflects
     # the cancellation on reload, mirroring respond_to_reminder.

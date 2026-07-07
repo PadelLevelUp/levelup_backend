@@ -963,6 +963,100 @@ class TestCancelAttendance:
             ).first()
             assert vacancy is not None
 
+    def _coach_cancellation_messages(self, app, coach_user_id, student_user_id, instance_id):
+        """Return coach-facing cancellation messages: text ones carrying the
+        PAD-44 ``cancellation`` metadata marker for this instance."""
+        from padel_app.models.messages import Message
+        return [
+            m for m in Message.query.all()
+            if m.msg_metadata
+            and m.msg_metadata.get("cancellation") is True
+            and m.msg_metadata.get("lessonInstanceId") == instance_id
+        ]
+
+    def test_cancel_before_deadline_notifies_coach_not_late(self, app):
+        """PAD-44: a non-late cancel produces exactly one coach-facing
+        notification identifying the student + class, not marked late, with the
+        push directed at the coach."""
+        from padel_app.services.notification_service import (
+            cancel_attendance,
+            get_or_create_config,
+        )
+
+        ids = _seed_coach_and_student(app)
+        instance_id = _seed_instance(app, ids["coach_id"], ids["student_id"], start_offset_hours=48)
+        self._confirmed_presence(app, instance_id, ids["student_id"])
+
+        with app.app_context():
+            config = get_or_create_config(ids["coach_id"])
+            config.auto_notify_enabled = True
+            db.session.commit()
+
+            with patch(PATCHES[0]), patch(PATCHES[1]) as mock_push:
+                cancel_attendance(instance_id, ids["student_user_id"])
+
+            # Exactly one coach-facing cancellation message.
+            msgs = self._coach_cancellation_messages(
+                app, ids["coach_user_id"], ids["student_user_id"], instance_id
+            )
+            assert len(msgs) == 1
+            msg = msgs[0]
+            # Not marked late.
+            assert msg.msg_metadata.get("lateCancellation") is False
+            # Identifies the student and the class instance.
+            assert "Test Student" in msg.text
+            assert "Test Class" in msg.text
+            assert "late" not in msg.text.lower()
+            # Sent from the student into the coach<->student conversation.
+            assert msg.sender_id == ids["student_user_id"]
+
+            # Exactly one push, directed at the COACH.
+            coach_pushes = [
+                c for c in mock_push.call_args_list
+                if c.kwargs.get("user_id") == ids["coach_user_id"]
+            ]
+            assert len(coach_pushes) == 1
+
+    def test_cancel_after_deadline_notifies_coach_marked_late(self, app):
+        """PAD-44: a late cancel produces exactly one coach-facing notification
+        MARKED as a late cancellation (text + metadata), no duplicate."""
+        from padel_app.services.notification_service import (
+            cancel_attendance,
+            get_or_create_config,
+        )
+
+        ids = _seed_coach_and_student(app)
+        instance_id = _seed_instance(app, ids["coach_id"], ids["student_id"], start_offset_hours=48)
+        self._confirmed_presence(app, instance_id, ids["student_id"])
+
+        with app.app_context():
+            config = get_or_create_config(ids["coach_id"])
+            config.auto_notify_enabled = True
+            db.session.commit()
+
+            # now = +30h → 18h before start → past the 24h deadline → late.
+            now = datetime.utcnow() + timedelta(hours=30)
+            with patch(PATCHES[0]), patch(PATCHES[1]) as mock_push:
+                cancel_attendance(instance_id, ids["student_user_id"], now=now)
+
+            msgs = self._coach_cancellation_messages(
+                app, ids["coach_user_id"], ids["student_user_id"], instance_id
+            )
+            assert len(msgs) == 1
+            msg = msgs[0]
+            # Marked late in metadata AND text.
+            assert msg.msg_metadata.get("lateCancellation") is True
+            assert "late" in msg.text.lower()
+            assert "Test Student" in msg.text
+            assert "Test Class" in msg.text
+
+            # Exactly one coach-directed push (no duplicate).
+            coach_pushes = [
+                c for c in mock_push.call_args_list
+                if c.kwargs.get("user_id") == ids["coach_user_id"]
+            ]
+            assert len(coach_pushes) == 1
+
     def test_cancellation_deadline_hours_defaults_to_24_and_round_trips(self, app):
         """cancellationDeadlineHours defaults to 24 and round-trips through
         get_config_dict / update_config (the GET|POST /notify/config path)."""
