@@ -1067,6 +1067,23 @@ def send_class_reminders(instance_id: int, *, now: datetime | None = None) -> di
             time=time_str,
         )
 
+        # PAD-49: Supersede older un-actioned reminders for THIS (player, instance)
+        # before sending the new one. Only the latest reminder should stay
+        # actionable; older reminders the student never responded to are marked
+        # superseded so the frontend renders them disabled/"expired". Reminders the
+        # player already responded to are left untouched (they keep their badge).
+        from padel_app.serializers.message import serialize_message
+        for m in prior_reminders:
+            if (
+                m.msg_metadata
+                and m.msg_metadata.get("instanceId") == instance_id
+                and not m.msg_metadata.get("responded")
+                and not m.msg_metadata.get("superseded")
+            ):
+                m.msg_metadata = {**m.msg_metadata, "superseded": True}
+                m.save()
+                publish({"type": "message_edited", "payload": serialize_message(m, None)})
+
         _send_system_message(
             coach_user_id=coach_user_id,
             player_user_id=player_user_id,
@@ -1142,7 +1159,8 @@ def respond_to_reminder(
             (m for m in recent_reminders
              if m.msg_metadata
              and m.msg_metadata.get("lessonInstanceId") == lesson_instance_id
-             and not m.msg_metadata.get("responded")),
+             and not m.msg_metadata.get("responded")
+             and not m.msg_metadata.get("superseded")),
             None,
         )
         if reminder_msg:
