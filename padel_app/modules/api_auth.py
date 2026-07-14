@@ -4,6 +4,7 @@ from werkzeug.security import check_password_hash
 
 from padel_app.models import User, TokenBlocklist
 from padel_app.sql_db import db
+from padel_app.services.account_service import delete_account_service
 
 bp = Blueprint("auth_api", __name__, url_prefix="/api/auth")
 
@@ -57,6 +58,14 @@ def me():
         "isSuperAdmin": user.is_superadmin,
         "language": getattr(user, "language", "pt") or "pt",
     })
+
+
+@bp.delete("/me")
+@jwt_required()
+def delete_me():
+    user_id = int(get_jwt_identity())
+    delete_account_service(user_id)
+    return jsonify({"message": "Account deleted"}), 200
 
 
 @bp.patch("/me")

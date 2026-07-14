@@ -18,7 +18,26 @@ def register_jwt_handlers(jwt):
     @jwt.token_in_blocklist_loader
     def check_if_token_revoked(jwt_header, jwt_payload):
         jti = jwt_payload["jti"]
-        return TokenBlocklist.query.filter_by(jti=jti).first() is not None
+        if TokenBlocklist.query.filter_by(jti=jti).first() is not None:
+            return True
+
+        # Session kill for deleted/disabled accounts: reject any token
+        # belonging to a user whose status is "disabled", regardless of
+        # which device/jti issued it. This invalidates all sessions at
+        # once without per-token tracking.
+        identity = jwt_payload.get("sub")
+        if identity is not None:
+            try:
+                user_id = int(identity)
+            except (TypeError, ValueError):
+                user_id = None
+
+            if user_id is not None:
+                user = User.query.get(user_id)
+                if user is not None and user.status == "disabled":
+                    return True
+
+        return False
 
 
 def setup_login_manager(login_manager):
