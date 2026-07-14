@@ -3,20 +3,130 @@ from datetime import datetime, timezone
 from padel_app.utils.dates import utcnow_naive
 
 from flask import abort
-from sqlalchemy import func, nullslast
+from sqlalchemy import func, nullslast, or_, and_
 
 from padel_app.sql_db import db
 from padel_app.models import (
     Message,
     MessageReaction,
+    MessageReport,
+    BlockedUser,
     Conversation,
     ConversationParticipant,
     User,
+    Coach,
 )
 from padel_app.tools.request_adapter import JsonRequestAdapter
 from padel_app.realtime import publish
 from padel_app.serializers.message import serialize_message
 from padel_app.utils.push_notifications import send_push_notification
+
+
+def _is_blocked_either_way(user_a_id, user_b_id):
+    """True if either user has blocked the other."""
+    return (
+        db.session.query(BlockedUser.id)
+        .filter(
+            or_(
+                and_(BlockedUser.blocker_id == user_a_id, BlockedUser.blocked_id == user_b_id),
+                and_(BlockedUser.blocker_id == user_b_id, BlockedUser.blocked_id == user_a_id),
+            )
+        )
+        .first()
+        is not None
+    )
+
+
+def _messageable_target_ids_for(user):
+    """The set of user ids `user` is allowed to START a new conversation with.
+
+    Coach -> players belonging to any club the coach is in.
+    Everyone else (student/player) -> any coach.
+    """
+    coach = getattr(user, "coach", None)
+    if coach:
+        return {
+            player.user_id
+            for club in coach.clubs
+            for player in club.players
+        }
+
+    return {
+        row.user_id
+        for row in (
+            Coach.query.join(User, Coach.user_id == User.id)
+            .filter(User.status == "active")
+            .all()
+        )
+    }
+
+
+def _assert_messageable(user, target_id):
+    if target_id not in _messageable_target_ids_for(user):
+        abort(403, "You are not allowed to message this user")
+
+
+def block_user_service(blocker_id, blocked_id):
+    """Block a user. Idempotent."""
+    if blocker_id == blocked_id:
+        abort(400, "Cannot block yourself")
+    existing = BlockedUser.query.filter_by(blocker_id=blocker_id, blocked_id=blocked_id).first()
+    if not existing:
+        BlockedUser(blocker_id=blocker_id, blocked_id=blocked_id).create()
+
+
+def unblock_user_service(blocker_id, blocked_id):
+    """Unblock a user. Idempotent."""
+    existing = BlockedUser.query.filter_by(blocker_id=blocker_id, blocked_id=blocked_id).first()
+    if existing:
+        existing.delete()
+
+
+def get_blocked_users_service(user_id):
+    """Users that `user_id` has blocked."""
+    rows = BlockedUser.query.filter_by(blocker_id=user_id).all()
+    return [row.blocked for row in rows]
+
+
+def get_messageable_users_service(user):
+    """Users `user` may start a new conversation with, excluding blocks either way."""
+    target_ids = _messageable_target_ids_for(user)
+    target_ids.discard(user.id)
+    if not target_ids:
+        return []
+
+    blocked_rows = BlockedUser.query.filter(
+        or_(
+            and_(BlockedUser.blocker_id == user.id, BlockedUser.blocked_id.in_(target_ids)),
+            and_(BlockedUser.blocked_id == user.id, BlockedUser.blocker_id.in_(target_ids)),
+        )
+    ).all()
+    blocked_ids = {
+        row.blocked_id if row.blocker_id == user.id else row.blocker_id
+        for row in blocked_rows
+    }
+
+    return (
+        User.query.filter(User.id.in_(target_ids - blocked_ids), User.status == "active")
+        .all()
+    )
+
+
+def report_message_service(reporter_id, message_id, reason=None):
+    """Report a message. Only participants of that message's conversation may report it."""
+    message = Message.query.get_or_404(message_id)
+    is_participant = (
+        ConversationParticipant.query.filter_by(
+            conversation_id=message.conversation_id, user_id=reporter_id
+        ).first()
+        is not None
+    )
+    if not is_participant:
+        abort(403, "You cannot report a message outside your conversations")
+
+    report = MessageReport(reporter_id=reporter_id, message_id=message_id, reason=reason)
+    report.create()
+    return report
 
 
 def get_unread_count(user_id):
@@ -40,6 +150,15 @@ def get_unread_count(user_id):
 
 def create_message_service(data, user_id):
     """Creates a message and publishes a real-time event."""
+    recipient_participants = ConversationParticipant.query.filter(
+        ConversationParticipant.conversation_id == data["conversationId"],
+        ConversationParticipant.user_id != user_id,
+    ).all()
+
+    for participant in recipient_participants:
+        if _is_blocked_either_way(user_id, participant.user_id):
+            abort(403, "Cannot message a blocked user")
+
     payload = {
         "text": data["text"],
         "conversation": data["conversationId"],
@@ -58,10 +177,6 @@ def create_message_service(data, user_id):
     message.create()
 
     sender = User.query.get(user_id)
-    recipient_participants = ConversationParticipant.query.filter(
-        ConversationParticipant.conversation_id == message.conversation_id,
-        ConversationParticipant.user_id != user_id,
-    ).all()
 
     sender_name = sender.name if sender else "Someone"
     for participant in recipient_participants:
@@ -161,6 +276,12 @@ def create_conversation_service(data, user):
     conversation = Conversation.query.filter_by(participant_key=key).first()
 
     if not conversation:
+        other_ids = [p for p in participants if p != user.id]
+        for other_id in other_ids:
+            if _is_blocked_either_way(user.id, other_id):
+                abort(403, "Cannot start a conversation with a blocked user")
+            _assert_messageable(user, other_id)
+
         payload = {
             "is_group": len(participants) >= 2 or False,
             "participant_ids": participants,

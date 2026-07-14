@@ -97,6 +97,11 @@ from padel_app.services.messaging_service import (
     get_user_conversations,
     create_conversation_service,
     mark_conversation_read_service,
+    block_user_service,
+    unblock_user_service,
+    get_blocked_users_service,
+    get_messageable_users_service,
+    report_message_service,
 )
 from padel_app.services.calendar_service import (
     create_calendar_block_service,
@@ -330,6 +335,9 @@ def get_conversations():
 def conversation_detail(conversation_id):
     user = current_user()
     conversation = Conversation.query.get_or_404(conversation_id)
+    is_participant = any(p.user_id == user.id for p in conversation.participants)
+    if not is_participant:
+        abort(403, "Not a participant of this conversation")
     return jsonify(serialize_conversation_detail(conversation, user.id))
 
 
@@ -377,6 +385,47 @@ def get_players():
 def get_users():
     users = User.query.filter_by(status="active").all()
     return jsonify([serialize_user(u) for u in users])
+
+
+@bp.get("/messageable-users")
+@jwt_required()
+def get_messageable_users():
+    user = current_user()
+    users = get_messageable_users_service(user)
+    return jsonify([serialize_user(u) for u in users])
+
+
+@bp.post("/users/<int:user_id>/block")
+@jwt_required()
+def block_user(user_id):
+    user = current_user()
+    block_user_service(user.id, user_id)
+    return jsonify({"ok": True})
+
+
+@bp.delete("/users/<int:user_id>/block")
+@jwt_required()
+def unblock_user(user_id):
+    user = current_user()
+    unblock_user_service(user.id, user_id)
+    return jsonify({"ok": True})
+
+
+@bp.get("/blocked-users")
+@jwt_required()
+def get_blocked_users():
+    user = current_user()
+    blocked = get_blocked_users_service(user.id)
+    return jsonify([{"id": u.id, "name": u.name} for u in blocked])
+
+
+@bp.post("/messages/<int:message_id>/report")
+@jwt_required()
+def report_message(message_id):
+    user = current_user()
+    data = request.get_json(silent=True) or {}
+    report_message_service(user.id, message_id, data.get("reason"))
+    return jsonify({"ok": True}), 201
 
 
 @bp.get("/coach_players")

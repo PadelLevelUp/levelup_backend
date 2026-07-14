@@ -7,6 +7,8 @@ from .lesson_instances import LessonInstance
 from .lessons import Lesson
 from .messages import Message
 from .message_reaction import MessageReaction
+from .message_report import MessageReport
+from .blocked_user import BlockedUser
 from .push_subscriptions import PushSubscription
 from .player_level_history import PlayerLevelHistory
 from .players import Player
@@ -50,6 +52,8 @@ MODELS = {
     "lesson": Lesson,
     "lessage": Message,
     "messagereaction": MessageReaction,
+    "messagereport": MessageReport,
+    "blockeduser": BlockedUser,
     "pushsubscription": PushSubscription,
     "playerlevelhistory": PlayerLevelHistory,
     "player": Player,
