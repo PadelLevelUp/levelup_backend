@@ -153,7 +153,7 @@ def get_user_conversations(user, page=1, limit=20):
 
 def create_conversation_service(data, user):
     """Finds or creates a conversation for the given participants."""
-    participants = data['otherParticipants']
+    participants = [int(p) for p in data['otherParticipants']]
     participants.append(user.id)
 
     key = Conversation.build_participant_key(participants)
