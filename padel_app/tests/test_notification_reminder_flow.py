@@ -536,6 +536,115 @@ class TestRepeatReminders:
 
 
 # ---------------------------------------------------------------------------
+# TestReminderSupersede — PAD-49
+#
+# When a NEW reminder is sent for a (player, instance), any PRIOR un-actioned
+# reminders for that same (player, instance) must be marked
+# msg_metadata["superseded"] = True so the frontend renders them disabled.
+# Reminders the player already responded to keep their badge (not superseded).
+# ---------------------------------------------------------------------------
+
+class TestReminderSupersede:
+
+    def test_prior_reminder_superseded_by_new_one(self, app):
+        """Sending a second reminder supersedes the first (un-actioned) one;
+        the latest reminder stays actionable (no superseded flag)."""
+        from padel_app.services.notification_service import send_class_reminders
+        from padel_app.models.messages import Message
+
+        ids = _seed_coach_and_student(app)
+        instance_id = _seed_instance(app, ids["coach_id"], ids["student_id"], start_offset_hours=72)
+        _config_with_repeat(app, ids["coach_id"], count=2, hours=1)
+
+        with app.app_context():
+            t0 = datetime.utcnow()
+            with patch(PATCHES[0]), patch(PATCHES[1]):
+                send_class_reminders(instance_id, now=t0)
+                send_class_reminders(instance_id, now=t0 + timedelta(hours=1))
+
+            msgs = (
+                Message.query.filter_by(message_type="notification_reminder")
+                .order_by(Message.id)
+                .all()
+            )
+            assert len(msgs) == 2
+            first, second = msgs[0], msgs[1]
+
+            # First (older) reminder is superseded but NOT responded.
+            assert first.msg_metadata.get("superseded") is True
+            assert not first.msg_metadata.get("responded")
+
+            # Second (latest) reminder stays actionable — no superseded flag, not responded.
+            assert not second.msg_metadata.get("superseded")
+            assert not second.msg_metadata.get("responded")
+
+    def test_responded_reminder_not_superseded(self, app):
+        """A reminder the player already responded to keeps its badge and is
+        NOT marked superseded when a new reminder is sent."""
+        from padel_app.services.notification_service import (
+            send_class_reminders,
+            respond_to_reminder,
+        )
+        from padel_app.models.messages import Message
+
+        ids = _seed_coach_and_student(app)
+        instance_id = _seed_instance(app, ids["coach_id"], ids["student_id"], start_offset_hours=72)
+        _config_with_repeat(app, ids["coach_id"], count=2, hours=1)
+
+        with app.app_context():
+            t0 = datetime.utcnow()
+            with patch(PATCHES[0]), patch(PATCHES[1]):
+                # First reminder, then the student responds "no" to it.
+                send_class_reminders(instance_id, now=t0)
+                respond_to_reminder(instance_id, "no", ids["student_user_id"], now=t0)
+
+                # Manually clear the presence confirmation so a second reminder is
+                # still sent (a real second send only supersedes un-actioned msgs).
+                from padel_app.models.presences import Presence
+                presence = Presence.query.filter_by(
+                    lesson_instance_id=instance_id, player_id=ids["student_id"]
+                ).first()
+                presence.confirmed = False
+                presence.save()
+
+                send_class_reminders(instance_id, now=t0 + timedelta(hours=1))
+
+            msgs = (
+                Message.query.filter_by(message_type="notification_reminder")
+                .order_by(Message.id)
+                .all()
+            )
+            assert len(msgs) == 2
+            responded_msg = msgs[0]
+
+            # The responded reminder keeps its badge and is NOT superseded.
+            assert responded_msg.msg_metadata.get("responded") is True
+            assert not responded_msg.msg_metadata.get("superseded")
+
+    def test_supersede_only_touches_unresponded_messages(self, app):
+        """Superseding only sets the flag on responded-falsy reminders."""
+        from padel_app.services.notification_service import send_class_reminders
+        from padel_app.models.messages import Message
+
+        ids = _seed_coach_and_student(app)
+        instance_id = _seed_instance(app, ids["coach_id"], ids["student_id"], start_offset_hours=72)
+        _config_with_repeat(app, ids["coach_id"], count=2, hours=1)
+
+        with app.app_context():
+            t0 = datetime.utcnow()
+            with patch(PATCHES[0]), patch(PATCHES[1]):
+                send_class_reminders(instance_id, now=t0)
+                send_class_reminders(instance_id, now=t0 + timedelta(hours=1))
+
+            superseded = [
+                m for m in Message.query.filter_by(message_type="notification_reminder").all()
+                if m.msg_metadata.get("superseded")
+            ]
+            # Every superseded message must be responded-falsy.
+            assert all(not m.msg_metadata.get("responded") for m in superseded)
+
+
+# ---------------------------------------------------------------------------
 # TestRespondToReminder
 # ---------------------------------------------------------------------------
 
