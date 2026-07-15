@@ -20,6 +20,7 @@ from padel_app.tools.request_adapter import JsonRequestAdapter
 from padel_app.realtime import publish
 from padel_app.serializers.message import serialize_message
 from padel_app.utils.push_notifications import send_push_notification
+from padel_app.utils.expo_push import send_expo_push_to_user
 
 
 def _is_blocked_either_way(user_a_id, user_b_id):
@@ -187,6 +188,12 @@ def create_message_service(data, user_id):
             title=sender_name,
             body=body,
             url=f"/messages/{message.conversation_id}",
+        )
+        send_expo_push_to_user(
+            participant.user_id,
+            title=sender_name,
+            body=body,
+            data={"type": "message", "conversationId": message.conversation_id},
         )
 
     publish({

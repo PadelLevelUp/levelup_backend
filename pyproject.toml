@@ -52,6 +52,7 @@ dependencies = [
     "python-dotenv>=1.0.1",
     "python-dateutil==2.9.0",
     "pywebpush>=2.0.3",
+    "requests>=2.32.3",
 
     # --- Scheduler ---
     "APScheduler>=3.10,<4",

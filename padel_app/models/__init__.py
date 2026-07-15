@@ -10,6 +10,7 @@ from .message_reaction import MessageReaction
 from .message_report import MessageReport
 from .blocked_user import BlockedUser
 from .push_subscriptions import PushSubscription
+from .device_token import DeviceToken
 from .player_level_history import PlayerLevelHistory
 from .players import Player
 from .users import User
@@ -55,6 +56,7 @@ MODELS = {
     "messagereport": MessageReport,
     "blockeduser": BlockedUser,
     "pushsubscription": PushSubscription,
+    "devicetoken": DeviceToken,
     "playerlevelhistory": PlayerLevelHistory,
     "player": Player,
     "user": User,

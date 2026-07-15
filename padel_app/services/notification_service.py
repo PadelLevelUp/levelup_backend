@@ -669,9 +669,11 @@ def _send_system_message(
     text: str,
     message_type: str = "text",
     msg_metadata: dict | None = None,
+    class_instance_id: int | None = None,
 ):
     from padel_app.models import Message
     from padel_app.serializers.message import serialize_message
+    from padel_app.utils.expo_push import send_expo_push_to_user
 
     conv = _get_or_create_direct_conversation(coach_user_id, player_user_id)
     msg = Message(
@@ -694,6 +696,22 @@ def _send_system_message(
         body=text[:100],
         url=f"/messages/{conv.id}",
     )
+
+    # Native (Expo) push — additive, best-effort. Every _send_system_message call
+    # in this module is a class/notification-engine event (reminder, invite,
+    # spot-filled, waiting list, etc.), so it always carries a lesson instance id
+    # for mobile tap-routing to class/[id]. Falls back to msg_metadata's
+    # lessonInstanceId/instanceId when the caller didn't pass it explicitly.
+    resolved_instance_id = class_instance_id
+    if resolved_instance_id is None and msg_metadata:
+        resolved_instance_id = msg_metadata.get("lessonInstanceId") or msg_metadata.get("instanceId")
+    if resolved_instance_id is not None:
+        send_expo_push_to_user(
+            player_user_id,
+            title="New message",
+            body=text[:100],
+            data={"type": "class", "classInstanceId": resolved_instance_id},
+        )
 
     return msg
 
@@ -760,6 +778,14 @@ def _notify_coach_of_cancellation(
         title="Late cancellation" if is_late else "Cancellation",
         body=text[:100],
         url=f"/messages/{conv.id}",
+    )
+
+    from padel_app.utils.expo_push import send_expo_push_to_user
+    send_expo_push_to_user(
+        coach_user_id,
+        title="Late cancellation" if is_late else "Cancellation",
+        body=text[:100],
+        data={"type": "class", "classInstanceId": instance.id},
     )
 
     return msg
@@ -855,7 +881,10 @@ def _broadcast_spot_filled(
                 invite_msg.save()
                 publish({"type": "message_edited", "payload": serialize_message(invite_msg, None)})
 
-        _send_system_message(coach_user_id, other_player_user_id, spot_filled_text)
+        _send_system_message(
+            coach_user_id, other_player_user_id, spot_filled_text,
+            class_instance_id=instance.id,
+        )
         other_event.status = "expired"
         other_event.save()
         publish({
@@ -1182,6 +1211,7 @@ def respond_to_reminder(
                 coach_user_id,
                 acting_user_id,
                 templates.get("reminder_confirmed", DEFAULT_MESSAGE_TEMPLATES["reminder_confirmed"]),
+                class_instance_id=instance.id,
             )
         return {"action": "confirmed"}
 
@@ -1232,6 +1262,7 @@ def _free_spot_for_declining_player(
             coach_user_id,
             acting_user_id,
             templates.get("reminder_declined", DEFAULT_MESSAGE_TEMPLATES["reminder_declined"]),
+            class_instance_id=instance.id,
         )
 
     # Always pre-create vacancy so the invite_start job finds it when window opens.
@@ -1774,6 +1805,7 @@ def respond_to_notification(notification_event_id: int, action: str, acting_user
                 coach_user_id,
                 player_user_id,
                 templates.get("decline", DEFAULT_MESSAGE_TEMPLATES["decline"]),
+                class_instance_id=instance.id,
             )
 
         publish({
@@ -1796,6 +1828,7 @@ def respond_to_notification(notification_event_id: int, action: str, acting_user
                     coach_user_id,
                     player_user_id,
                     templates.get("spot_filled", DEFAULT_MESSAGE_TEMPLATES["spot_filled"]),
+                    class_instance_id=instance.id,
                 )
             _offer_waiting_list(event.player_id, instance, event.coach_id, templates)
             publish({
@@ -1817,6 +1850,7 @@ def respond_to_notification(notification_event_id: int, action: str, acting_user
                     coach_user_id,
                     player_user_id,
                     templates.get("spot_filled", DEFAULT_MESSAGE_TEMPLATES["spot_filled"]),
+                    class_instance_id=instance.id,
                 )
             _offer_waiting_list(event.player_id, instance, event.coach_id, templates)
             publish({
@@ -1845,6 +1879,7 @@ def respond_to_notification(notification_event_id: int, action: str, acting_user
                 coach_user_id,
                 player_user_id,
                 templates.get("confirm", DEFAULT_MESSAGE_TEMPLATES["confirm"]),
+                class_instance_id=instance.id,
             )
             _broadcast_spot_filled(
                 instance,
@@ -2075,6 +2110,7 @@ def respond_to_waiting_list(
                 coach_user_id=coach.user_id,
                 player_user_id=acting_user_id,
                 text=templates.get("waiting_list_confirm", DEFAULT_MESSAGE_TEMPLATES["waiting_list_confirm"]),
+                class_instance_id=instance.id,
             )
         return {"action": "added_to_waiting_list"}
 
@@ -2245,6 +2281,7 @@ def _fill_from_waiting_list(
         player_user_id=player_user_id,
         text=text,
         message_type="waiting_list_placed",
+        class_instance_id=instance.id,
     )
 
     publish({
