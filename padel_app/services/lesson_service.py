@@ -497,13 +497,46 @@ def add_class_service(data, coach, club):
 
 
 def confirm_presences_service(class_instance_data, presences_data):
-    """Materialises an instance if needed and records presences."""
-    if 'parentClassId' in class_instance_data.keys():
-        # Already a materialized LessonInstance — originalId is the instance ID
-        instance = LessonInstance.query.get_or_404(class_instance_data.get('originalId'))
+    """Materialises an instance if needed and records presences.
+
+    ``originalId`` lives in two different id-spaces depending on the event:
+    for a materialized ``LessonInstance`` it is the *instance* id, for a
+    (recurring or single) ``Lesson`` occurrence it is the *lesson* id. The
+    field that reliably distinguishes the two is the calendar-event ``id`` —
+    ``"lessoninstance-<id>"`` for a materialized instance vs
+    ``"lesson-<id>-<date>"`` for a projected lesson occurrence (see
+    ``build_lesson_events`` / ``serialize_calendar_event``). When a caller
+    omits ``id`` (legacy/synthetic payloads), a truthy ``parentClassId`` is
+    used as the fallback signal that ``originalId`` is an instance id.
+
+    The previous check — ``'parentClassId' in class_instance_data.keys()`` —
+    was wrong: ``parentClassId`` is added by ``serialize_class_instance``
+    whenever the detail endpoint resolves to an *instance*, even when the
+    frontend's event (and therefore ``originalId``) is still a recurring
+    *Lesson* (e.g. a stale calendar whose occurrence was materialized after
+    it loaded). That sent a Lesson id into ``LessonInstance.get_or_404`` →
+    404 "Failed to save attendance". Branching on the event id prefix always
+    routes a lesson occurrence through materialization instead.
+    """
+    original_id = class_instance_data.get('originalId')
+    event_id = str(class_instance_data.get('id') or '')
+
+    if event_id.startswith('lessoninstance-'):
+        is_instance = True
+    elif event_id.startswith('lesson-'):
+        is_instance = False
     else:
-        # Non-materialized recurring Lesson — materialize for the given date
-        lesson = Lesson.query.get_or_404(class_instance_data.get('originalId'))
+        # Legacy/synthetic payloads without a calendar-event id: a truthy
+        # parentClassId means originalId is a materialized LessonInstance id.
+        is_instance = bool(class_instance_data.get('parentClassId'))
+
+    if is_instance:
+        # Already a materialized LessonInstance — originalId is the instance ID
+        instance = LessonInstance.query.get_or_404(original_id)
+    else:
+        # Recurring or single Lesson occurrence — originalId is the Lesson ID.
+        # Materialize (or reuse) the instance for the occurrence's date.
+        lesson = Lesson.query.get_or_404(original_id)
         from datetime import datetime as _dt
         date = _dt.strptime(class_instance_data['date'], '%Y-%m-%d').date()
         instance = get_or_materialize_instance(lesson, date)
