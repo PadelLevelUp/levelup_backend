@@ -395,7 +395,12 @@ def split_lesson(lesson, date, remove_current_date=False):
 
     new_lesson = duplicate_lesson_helper(lesson)
 
-    lesson.recurrence_end = date
+    # recurrence_end is INCLUSIVE — a bare date is coerced to end-of-day
+    # (ensure_utc → time.max), so an occurrence on that date is still
+    # projected. When the current date is being removed, the "before" lesson
+    # must end the day BEFORE it, otherwise the occurrence resurrects on
+    # reload (PAD-65). When splitting for an edit (date stays), end on `date`.
+    lesson.recurrence_end = (date - timedelta(days=1)) if remove_current_date else date
 
     new_lesson.start_datetime = new_start
     new_lesson.end_datetime = new_end
@@ -755,8 +760,21 @@ def remove_class_service(data):
 
     if model_name == "LessonInstance":
         if scope == "single" or not scope:
+            parent_lesson = obj.lesson
+            # The date this instance overrides in the parent recurrence — the
+            # ORIGINAL occurrence date, not the (possibly edited) instance date.
+            occ_date = obj.original_lesson_occurence_date or obj.start_datetime.date()
             _maybe_cancel_instance(obj.id)
             obj.delete()
+            # When the instance overrides a recurring parent, deleting it is not
+            # enough: the parent series would re-project that occurrence (with
+            # its pre-edit values) on reload. Exclude the date from the parent
+            # recurrence, mirroring the Lesson scope="single" path (PAD-65).
+            if parent_lesson is not None and parent_lesson.recurrence_rule:
+                _remove_single_occurrence_from_lesson(
+                    lesson=parent_lesson, date=occ_date
+                )
+                return {"status": "single_removed"}, 200
             return {"status": "deleted"}, 200
 
         if scope == "future":
