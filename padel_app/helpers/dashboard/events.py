@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlencode
 
 from padel_app.helpers.calendar_helpers import (
     build_lesson_events,
@@ -95,6 +96,20 @@ def _missing_seats(e: Dict[str, Any]) -> int:
     return _safe_int(e.get("maxPlayers"), 0) - _safe_int(e.get("participantCount"), 0)
 
 
+def _calendar_href(e: Dict[str, Any]) -> str:
+    """
+    Deep link into the calendar for one specific occurrence (dashboard.navigation rule 8).
+
+    Both params are required: `classId` is the calendar event id (so the calendar can open
+    the right ClassDetailSheet), and `date` is the occurrence date. The date cannot be
+    derived from the id — a materialized instance id is just `lessoninstance-<pk>` — and the
+    calendar needs it to select the week the class falls in, which is often not the week it
+    shows by default.
+    """
+    params = {"classId": str(e.get("id") or ""), "date": str(e.get("date") or "")}
+    return f"/calendar?{urlencode(params)}"
+
+
 def _to_list_item(e: Dict[str, Any], *, with_missing_badge: bool) -> Dict[str, Any]:
     count = _safe_int(e.get("participantCount"), 0)
     max_players = _safe_int(e.get("maxPlayers"), 0)
@@ -108,5 +123,5 @@ def _to_list_item(e: Dict[str, Any], *, with_missing_badge: bool) -> Dict[str, A
         "color": e.get("color"),
         "rightLabel": f"{count}/{max_players}" if max_players else None,
         "badge": f"Missing {missing}" if with_missing_badge and missing > 0 else None,
-        "href": f"/calendar?classId={e.get('id')}",
+        "href": _calendar_href(e),
     }
