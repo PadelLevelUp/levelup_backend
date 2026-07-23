@@ -84,8 +84,52 @@ DEFAULT_MESSAGE_TEMPLATES_PT = {
 }
 
 
+# App-wide fallback locale — the last link in every locale chain.
+DEFAULT_LOCALE = "pt"
+
+SUPPORTED_TEMPLATE_LOCALES = ("pt", "en")
+
+
+def normalize_locale(locale) -> "str | None":
+    """Map any language tag to a supported locale, or ``None`` when unset.
+
+    Accepts whatever the callers have on hand: ``User.language`` ("pt"/"en", the
+    column ``PATCH /api/auth/me`` writes), a fuller tag like "pt-PT", or junk.
+    Returning ``None`` (rather than a default) for missing/blank input is what
+    lets callers chain fallbacks — recipient → coach → :data:`DEFAULT_LOCALE`.
+    """
+    if not isinstance(locale, str):
+        return None
+    tag = locale.strip().lower()
+    if not tag:
+        return None
+    return "pt" if tag.startswith("pt") else "en"
+
+
 def default_templates_for_locale(locale):
-    return DEFAULT_MESSAGE_TEMPLATES_PT if (locale or "pt").startswith("pt") else DEFAULT_MESSAGE_TEMPLATES
+    return (
+        DEFAULT_MESSAGE_TEMPLATES_PT
+        if (normalize_locale(locale) or DEFAULT_LOCALE) == "pt"
+        else DEFAULT_MESSAGE_TEMPLATES
+    )
+
+
+class ResolvedTemplate(str):
+    """Template text plus the locale its wording is actually in.
+
+    Subclasses ``str`` so every call site (and ``_format_template``) keeps
+    treating it as plain text, while callers that also render locale-aware
+    placeholders — ``{weekday}`` is formatted through Babel — can read
+    ``.locale`` and stay consistent with the sentence around it. Without this a
+    default resolved into English could end up carrying a Portuguese weekday.
+    """
+
+    __slots__ = ("locale",)
+
+    def __new__(cls, text: str, locale: str):
+        obj = super().__new__(cls, text)
+        obj.locale = locale
+        return obj
 
 
 def _is_blank_template(value) -> bool:
@@ -98,23 +142,47 @@ def _is_blank_template(value) -> bool:
     return not isinstance(value, str) or not value.strip()
 
 
-def resolve_message_template(templates, key, locale=None) -> str:
-    """Resolve one template key to non-empty text (PAD-67).
+def resolve_message_template(
+    templates, key, locale=None, *, recipient_locale=None
+) -> ResolvedTemplate:
+    """Resolve one template key to non-empty text in the right language.
 
-    ``templates`` is whatever the caller has on hand — normally the dict from
-    :meth:`NotificationConfig.get_message_templates`, but call sites also pass a
-    raw defaults dict. Whenever the stored value is missing or blank/whitespace-
-    only, fall back to the built-in default for ``locale`` so an automatic
-    message is never delivered empty.
+    This is the ONE place that decides both *what* text an automatic message
+    carries and *which* language it is in.
+
+    ``templates`` holds the coach's own customisations — normally
+    :meth:`NotificationConfig.get_custom_message_templates`. ``locale`` is the
+    coach's configured locale (the language their prose is written in);
+    ``recipient_locale`` is the language of the person the message is addressed
+    to.
+
+    Two rules, deliberately different:
+
+    * **A coach's custom template is their prose.** It is delivered verbatim, in
+      whatever language they typed it, to every recipient. It is never
+      translated (PAD-67 follow-up: no translation API, no LLM call).
+    * **A built-in default is ours**, so it renders in the *recipient's*
+      language. An English student of a Portuguese coach gets the English
+      default, and vice versa.
+
+    Fallback chain when a default is used: ``recipient_locale`` →  ``locale``
+    (the coach's) → :data:`DEFAULT_LOCALE`. A recipient with no language set
+    simply contributes ``None`` and the chain moves on.
+
+    Returns a :class:`ResolvedTemplate` — a ``str`` that also reports the locale
+    its wording is in, so placeholders like ``{weekday}`` can be formatted to
+    match.
     """
+    author_locale = normalize_locale(locale)
     value = (templates or {}).get(key)
     if not _is_blank_template(value):
-        return value
-    fallback = default_templates_for_locale(locale).get(key)
+        return ResolvedTemplate(value, author_locale or DEFAULT_LOCALE)
+    target = normalize_locale(recipient_locale) or author_locale or DEFAULT_LOCALE
+    fallback = default_templates_for_locale(target).get(key)
     if not _is_blank_template(fallback):
-        return fallback
+        return ResolvedTemplate(fallback, target)
     # Unknown key with no built-in default — the caller must not send anything.
-    return ""
+    return ResolvedTemplate("", target)
 
 
 DEFAULT_INVITATION_GROUPS = [
@@ -224,6 +292,25 @@ class NotificationConfig(db.Model, model.Model):
     def get_notification_groups(self):
         return self.notification_groups if self.notification_groups is not None else DEFAULT_NOTIFICATION_GROUPS
 
+    def get_custom_message_templates(self) -> dict:
+        """Only the keys this coach actually customised, with usable text.
+
+        This — not :meth:`get_message_templates` — is what the message engine
+        must send with. A key absent here has no coach prose behind it, which
+        leaves :func:`resolve_message_template` free to pick the built-in
+        default in the *recipient's* language. ``get_message_templates``
+        pre-merges the defaults at the *coach's* locale and so erases the
+        "customised vs default" distinction; using it for sending is what made
+        an English student of a Portuguese coach receive Portuguese defaults.
+
+        Blank/whitespace-only/non-string values are dropped for the same reason
+        they are ignored in the merge (PAD-67): they cannot produce a body.
+        """
+        stored = self.message_templates
+        if not isinstance(stored, dict):
+            return {}
+        return {k: v for k, v in stored.items() if not _is_blank_template(v)}
+
     def get_message_templates(self, locale=None):
         """Coach templates merged over the locale defaults, never blank (PAD-67).
 
@@ -231,6 +318,11 @@ class NotificationConfig(db.Model, model.Model):
         only does NOT override the default — otherwise the engine would render
         and deliver an empty message body. Customisations that carry actual text
         always win, and unknown extra keys are preserved as-is.
+
+        This is the *coach-facing* view (Settings → Message templates, served by
+        ``get_config_dict``): the defaults it fills in are shown in the coach's
+        own language. Do NOT use it to render an outgoing message — see
+        :meth:`get_custom_message_templates`.
         """
         defaults = default_templates_for_locale(locale)
         stored = self.message_templates

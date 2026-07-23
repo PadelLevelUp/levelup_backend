@@ -1,10 +1,16 @@
 """
 Integration tests for locale-aware notification rendering (PAD-39).
 
-These exercise the full send_class_reminders path with a coach whose
-user.language is set to "pt" or "en", asserting the weekday name and default
-template are rendered in the coach's locale. Also verifies the persisted
+These exercise the full send_class_reminders path with a coach and a student
+whose user.language is set to "pt" or "en", asserting the weekday name and
+default template are rendered in that locale. Also verifies the persisted
 default language and the missing-level filler fix (PAD-38).
+
+PAD-67 follow-up: a *default* template is now resolved against the RECIPIENT's
+language, not the sender's — a reminder is student-facing, so the student's
+language is what drives it. These tests therefore seed both users with the
+locale under test (previously only the coach carried it and the student rode
+along on the column default).
 
 Run:
     pytest padel_app/tests/test_notification_i18n.py -v
@@ -26,8 +32,13 @@ PATCHES = [
 # Seed helpers (adapted from test_notification_reminder_flow.py)
 # ---------------------------------------------------------------------------
 
-def _seed_coach_and_student(app, language="pt"):
-    """Create and persist a coach user (with language), coach, student user, player."""
+def _seed_coach_and_student(app, language="pt", student_language=None):
+    """Create and persist a coach user (with language), coach, student user, player.
+
+    ``student_language`` defaults to ``language`` so a test that asks for a "pt
+    reminder" gets a pt-speaking student too; pass it explicitly to model a
+    coach and student who do not share a language.
+    """
     from padel_app.models.users import User
     from padel_app.models.coaches import Coach
     from padel_app.models.players import Player
@@ -49,6 +60,7 @@ def _seed_coach_and_student(app, language="pt"):
             email="i18n-student@test.com",
             password="hashed",
             status="active",
+            language=student_language if student_language is not None else language,
         )
         db.session.add(student_user)
         db.session.flush()
@@ -153,7 +165,7 @@ def _reminder_text(app):
 # ---------------------------------------------------------------------------
 
 def test_reminder_weekday_portuguese(app):
-    """A PT coach's reminder renders the weekday name in Portuguese and no
+    """A reminder to a PT student renders the weekday name in Portuguese and no
     English weekday / 'this' filler."""
     from babel.dates import format_date
     from padel_app.services.notification_service import send_class_reminders
@@ -176,7 +188,7 @@ def test_reminder_weekday_portuguese(app):
 
 
 def test_reminder_weekday_english(app):
-    """An EN coach's reminder renders the English weekday name."""
+    """A reminder to an EN student renders the English weekday name."""
     from babel.dates import format_date
     from padel_app.services.notification_service import send_class_reminders
 

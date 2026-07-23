@@ -54,7 +54,8 @@ from padel_app.models.notification_config import (
     DEFAULT_PRIORITY_CRITERIA,
     DEFAULT_RESTRICTIONS,
     DEFAULT_ROUNDS,
-    default_templates_for_locale,
+    DEFAULT_LOCALE,
+    normalize_locale,
     resolve_message_template,
 )
 from padel_app.realtime import publish
@@ -641,7 +642,32 @@ def _resolve_locale(coach):
         lang = getattr(coach.user, "language", None) if coach and coach.user else None
     except Exception:
         lang = None
-    return "pt" if not lang else ("pt" if lang.startswith("pt") else "en")
+    return normalize_locale(lang) or DEFAULT_LOCALE
+
+
+def _recipient_locale(user_id, coach_locale=None) -> str:
+    """Locale for a message *addressed to* ``user_id``.
+
+    Built-in default templates are ours, so they must reach the recipient in the
+    recipient's own language rather than the sender's. The chain is:
+
+        recipient's ``User.language`` (what ``PATCH /api/auth/me`` writes)
+        → ``coach_locale`` (the coach's configured locale)
+        → :data:`DEFAULT_LOCALE`
+
+    A recipient with no language set (null/blank/legacy row) contributes nothing
+    and the chain simply moves to the next link — never to an arbitrary value.
+    """
+    from padel_app.models import User
+
+    lang = None
+    if user_id:
+        try:
+            user = User.query.get(user_id)
+            lang = getattr(user, "language", None) if user else None
+        except Exception:
+            lang = None
+    return normalize_locale(lang) or normalize_locale(coach_locale) or DEFAULT_LOCALE
 
 
 def _format_weekday(dt, locale):
@@ -867,11 +893,12 @@ def _broadcast_spot_filled(
     """
     Mark all other 'sent' events as expired, update their invite messages,
     and send the spot-filled message. Scoped to vacancy_id when provided.
+
+    ``templates`` holds the coach's customisations only (see
+    ``get_custom_message_templates``); ``locale`` is the coach's own locale.
     """
     from padel_app.models import Message
     from padel_app.serializers.message import serialize_message
-
-    spot_filled_text = resolve_message_template(templates, "spot_filled", locale)
 
     query = NotificationEvent.query.filter(
         NotificationEvent.status == "sent",
@@ -900,8 +927,17 @@ def _broadcast_spot_filled(
                 invite_msg.save()
                 publish({"type": "message_edited", "payload": serialize_message(invite_msg, None)})
 
+        # Recipient differs on every iteration, so the default is resolved
+        # per-player rather than once up front.
         _send_system_message(
-            coach_user_id, other_player_user_id, spot_filled_text,
+            coach_user_id,
+            other_player_user_id,
+            resolve_message_template(
+                templates,
+                "spot_filled",
+                locale,
+                recipient_locale=_recipient_locale(other_player_user_id, locale),
+            ),
             class_instance_id=instance.id,
         )
         other_event.status = "expired"
@@ -1049,11 +1085,10 @@ def send_class_reminders(instance_id: int, *, now: datetime | None = None) -> di
     coach_user_id = coach.user_id
     config = get_or_create_config(coach.id)
     locale = _resolve_locale(coach)
-    templates = config.get_message_templates(locale)
+    templates = config.get_custom_message_templates()
     reminder_count = config.get_reminder_count()
 
     level_code = instance.level.code if getattr(instance, "level", None) else ""
-    weekday = _format_weekday(instance.start_datetime, locale)
     time_str = instance.start_datetime.strftime("%H:%M") if instance.start_datetime else ""
 
     from padel_app.models import Message, Player
@@ -1107,11 +1142,19 @@ def send_class_reminders(instance_id: int, *, now: datetime | None = None) -> di
         player_name = (player.user.name if player and player.user else "there").split()[0]
 
         template_key = "reminder_followup" if sent_count > 0 else "reminder"
+        template = resolve_message_template(
+            templates,
+            template_key,
+            locale,
+            recipient_locale=_recipient_locale(player_user_id, locale),
+        )
         text = _format_template(
-            resolve_message_template(templates, template_key, locale),
+            template,
             name=player_name,
             level=level_code,
-            weekday=weekday,
+            # Weekday follows the language the sentence is actually in, so an
+            # English default never carries a Portuguese weekday (or vice versa).
+            weekday=_format_weekday(instance.start_datetime, template.locale),
             time=time_str,
         )
 
@@ -1193,11 +1236,9 @@ def respond_to_reminder(
 
     config = get_or_create_config(coach.id) if coach else None
     locale = _resolve_locale(coach)
-    templates = (
-        config.get_message_templates(locale)
-        if config
-        else dict(default_templates_for_locale(locale))
-    )
+    templates = config.get_custom_message_templates() if config else {}
+    # Recipient of every message below is the responding student.
+    student_locale = _recipient_locale(acting_user_id, locale)
 
     # Mark the reminder message as responded so the frontend shows the badge on reload
     if coach_user_id:
@@ -1234,7 +1275,12 @@ def respond_to_reminder(
             _send_system_message(
                 coach_user_id,
                 acting_user_id,
-                resolve_message_template(templates, "reminder_confirmed", locale),
+                resolve_message_template(
+                    templates,
+                    "reminder_confirmed",
+                    locale,
+                    recipient_locale=student_locale,
+                ),
                 class_instance_id=instance.id,
             )
         return {"action": "confirmed"}
@@ -1287,7 +1333,13 @@ def _free_spot_for_declining_player(
         _send_system_message(
             coach_user_id,
             acting_user_id,
-            resolve_message_template(templates, "reminder_declined", locale),
+            resolve_message_template(
+                templates,
+                "reminder_declined",
+                locale,
+                # Recipient is the declining student, not the coach.
+                recipient_locale=_recipient_locale(acting_user_id, locale),
+            ),
             class_instance_id=instance.id,
         )
 
@@ -1355,11 +1407,7 @@ def cancel_attendance(
 
     config = get_or_create_config(coach.id) if coach else None
     locale = _resolve_locale(coach)
-    templates = (
-        config.get_message_templates(locale)
-        if config
-        else dict(default_templates_for_locale(locale))
-    )
+    templates = config.get_custom_message_templates() if config else {}
 
     # Flag late cancellations: at/after the deadline (start - cancellationDeadlineHours)
     # but still before start. The spot is freed either way.
@@ -1526,9 +1574,8 @@ def _send_invitation_batch(
     coach_obj = Coach.query.get(coach_id)
     coach_user_id = coach_obj.user_id if coach_obj else None
     locale = _resolve_locale(coach_obj)
-    templates = config.get_message_templates(locale)
+    templates = config.get_custom_message_templates()
     level_code = instance.level.code if getattr(instance, "level", None) else ""
-    weekday = _format_weekday(instance.start_datetime, locale)
     time_str = instance.start_datetime.strftime("%H:%M") if instance.start_datetime else ""
 
     notified = []
@@ -1553,11 +1600,17 @@ def _send_invitation_batch(
         )
         event.create()
 
+        template = resolve_message_template(
+            templates,
+            "invite",
+            locale,
+            recipient_locale=_recipient_locale(player_user_id, locale),
+        )
         text = _format_template(
-            resolve_message_template(templates, "invite", locale),
+            template,
             name=player_name,
             level=level_code,
-            weekday=weekday,
+            weekday=_format_weekday(instance.start_datetime, template.locale),
             time=time_str,
         )
         msg = _send_system_message(
@@ -1806,9 +1859,11 @@ def respond_to_notification(notification_event_id: int, action: str, acting_user
 
     coach = Coach.query.get(event.coach_id)
     locale = _resolve_locale(coach)
-    templates = config.get_message_templates(locale)
+    templates = config.get_custom_message_templates()
     coach_user_id = coach.user_id if coach else None
     player_user_id = acting_user_id
+    # Every message emitted below is addressed to the responding student.
+    student_locale = _recipient_locale(player_user_id, locale)
 
     # Mark original invite message as responded
     if event.message_id:
@@ -1839,7 +1894,9 @@ def respond_to_notification(notification_event_id: int, action: str, acting_user
             _send_system_message(
                 coach_user_id,
                 player_user_id,
-                resolve_message_template(templates, "decline", locale),
+                resolve_message_template(
+                    templates, "decline", locale, recipient_locale=student_locale
+                ),
                 class_instance_id=instance.id,
             )
 
@@ -1862,7 +1919,9 @@ def respond_to_notification(notification_event_id: int, action: str, acting_user
                 _send_system_message(
                     coach_user_id,
                     player_user_id,
-                    resolve_message_template(templates, "spot_filled", locale),
+                    resolve_message_template(
+                        templates, "spot_filled", locale, recipient_locale=student_locale
+                    ),
                     class_instance_id=instance.id,
                 )
             _offer_waiting_list(event.player_id, instance, event.coach_id, templates, locale)
@@ -1884,7 +1943,9 @@ def respond_to_notification(notification_event_id: int, action: str, acting_user
                 _send_system_message(
                     coach_user_id,
                     player_user_id,
-                    resolve_message_template(templates, "spot_filled", locale),
+                    resolve_message_template(
+                        templates, "spot_filled", locale, recipient_locale=student_locale
+                    ),
                     class_instance_id=instance.id,
                 )
             _offer_waiting_list(event.player_id, instance, event.coach_id, templates, locale)
@@ -1913,7 +1974,9 @@ def respond_to_notification(notification_event_id: int, action: str, acting_user
             _send_system_message(
                 coach_user_id,
                 player_user_id,
-                resolve_message_template(templates, "confirm", locale),
+                resolve_message_template(
+                    templates, "confirm", locale, recipient_locale=student_locale
+                ),
                 class_instance_id=instance.id,
             )
             _broadcast_spot_filled(
@@ -2010,7 +2073,7 @@ def send_manual_notifications(
     coach = Coach.query.get(coach_id)
     coach_user_id = coach.user_id if coach else None
     locale = _resolve_locale(coach)
-    templates = config.get_message_templates(locale)
+    templates = config.get_custom_message_templates()
 
     events = []
     for player_id in player_ids:
@@ -2030,14 +2093,19 @@ def send_manual_notifications(
             player = Player.query.get(player_id)
             player_name = (player.user.name if player and player.user else "there").split()[0]
             level_code = instance.level.code if getattr(instance, "level", None) else ""
-            weekday = _format_weekday(instance.start_datetime, locale)
             time_str = instance.start_datetime.strftime("%H:%M") if instance.start_datetime else ""
 
+            template = resolve_message_template(
+                templates,
+                "invite",
+                locale,
+                recipient_locale=_recipient_locale(player_user_id, locale),
+            )
             text = _format_template(
-                resolve_message_template(templates, "invite", locale),
+                template,
                 name=player_name,
                 level=level_code,
-                weekday=weekday,
+                weekday=_format_weekday(instance.start_datetime, template.locale),
                 time=time_str,
             )
 
@@ -2081,7 +2149,11 @@ def _offer_waiting_list(
     templates: dict,
     locale: str | None = None,
 ) -> None:
-    """Send a waiting-list offer message to the player."""
+    """Send a waiting-list offer message to the player.
+
+    ``templates`` holds the coach's customisations only; the built-in default
+    is resolved into the offered player's language.
+    """
     from padel_app.models import Coach
     coach = Coach.query.get(coach_id)
     if not coach:
@@ -2090,7 +2162,12 @@ def _offer_waiting_list(
     if not player_user_id:
         return
 
-    text = resolve_message_template(templates, "waiting_list_offer", locale)
+    text = resolve_message_template(
+        templates,
+        "waiting_list_offer",
+        locale,
+        recipient_locale=_recipient_locale(player_user_id, locale),
+    )
     _send_system_message(
         coach_user_id=coach.user_id,
         player_user_id=player_user_id,
@@ -2126,7 +2203,7 @@ def respond_to_waiting_list(
 
     config = get_or_create_config(coach.id)
     locale = _resolve_locale(coach)
-    templates = config.get_message_templates(locale)
+    templates = config.get_custom_message_templates()
 
     if action == "yes":
         # Upsert waiting list entry
@@ -2148,7 +2225,13 @@ def respond_to_waiting_list(
             _send_system_message(
                 coach_user_id=coach.user_id,
                 player_user_id=acting_user_id,
-                text=resolve_message_template(templates, "waiting_list_confirm", locale),
+                text=resolve_message_template(
+                    templates,
+                    "waiting_list_confirm",
+                    locale,
+                    # Recipient is the student who joined the waiting list.
+                    recipient_locale=_recipient_locale(acting_user_id, locale),
+                ),
                 class_instance_id=instance.id,
             )
         return {"action": "added_to_waiting_list"}
@@ -2301,18 +2384,23 @@ def _fill_from_waiting_list(
     from padel_app.models import Player
 
     locale = _resolve_locale(coach)
-    templates = config.get_message_templates(locale)
+    templates = config.get_custom_message_templates()
     player = Player.query.get(entry.player_id)
     player_name = (player.user.name if player and player.user else "there").split()[0]
     level_code = instance.level.code if getattr(instance, "level", None) else ""
-    weekday = _format_weekday(instance.start_datetime, locale)
     time_str = instance.start_datetime.strftime("%H:%M") if instance.start_datetime else ""
 
+    template = resolve_message_template(
+        templates,
+        "waiting_list_placed",
+        locale,
+        recipient_locale=_recipient_locale(player_user_id, locale),
+    )
     text = _format_template(
-        resolve_message_template(templates, "waiting_list_placed", locale),
+        template,
         name=player_name,
         level=level_code,
-        weekday=weekday,
+        weekday=_format_weekday(instance.start_datetime, template.locale),
         time=time_str,
     )
     _send_system_message(
