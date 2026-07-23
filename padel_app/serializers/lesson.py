@@ -3,6 +3,60 @@ from padel_app.tools.tools import iso_date
 from padel_app.serializers.player import serialize_player
 from padel_app.serializers.presence import serialize_presence
 
+
+# How "meaningful" each invitation status is when a student ends up with more
+# than one NotificationEvent for the same class instance (PAD-72). An actual
+# response always beats a still-pending invite:
+#   confirmed  — the student said yes
+#   expired    — the student said no / the invite lapsed (rendered "declined")
+#   sent       — delivered, awaiting an answer
+#   queued     — not delivered yet (semi-automatic mode, batching)
+_INVITATION_STATUS_RANK = {
+    "confirmed": 3,
+    "expired": 2,
+    "sent": 1,
+    "queued": 0,
+}
+
+
+def _invitation_precedence(event):
+    """Sort key for picking the surviving NotificationEvent of a student.
+
+    Highest wins: most meaningful status first, then the most recent record
+    (later round, then later row).
+    """
+    return (
+        _INVITATION_STATUS_RANK.get(event.status, -1),
+        event.round_number or 0,
+        event.id or 0,
+    )
+
+
+def dedupe_invitation_events(events):
+    """Collapse NotificationEvents to at most one per student (PAD-72).
+
+    The invitation engine legitimately writes one row per invite SENT — a
+    student can be invited across several rounds, receive a manual invite on
+    top of an automatic one, or be re-invited after declining. The coach's
+    guest list is keyed by STUDENT, so only the most meaningful record per
+    player survives (see ``_invitation_precedence``); its own ``id`` is kept so
+    coach response actions still target a real NotificationEvent.
+
+    Order is stable: students keep the position of their FIRST invite record,
+    so the list still reads chronologically.
+    """
+    winners = {}
+    order = []
+    for event in events:
+        player_id = event.player_id
+        if player_id not in winners:
+            winners[player_id] = event
+            order.append(player_id)
+        elif _invitation_precedence(event) > _invitation_precedence(winners[player_id]):
+            winners[player_id] = event
+    return [winners[player_id] for player_id in order]
+
+
 def serialize_lesson(lesson):
     recurrence_rule = None
     if lesson.recurrence_rule:
@@ -113,7 +167,10 @@ def serialize_class_instance(obj, viewer_player_id=None) -> dict:
             notification_query = notification_query.filter_by(
                 player_id=viewer_player_id
             )
-        notification_events = notification_query.all()
+        # One row per STUDENT, not per invite record (PAD-72).
+        notification_events = dedupe_invitation_events(
+            notification_query.order_by(NotificationEvent.id).all()
+        )
 
         training_rows = LessonInstanceTraining.query.filter_by(
             lesson_instance_id=obj.id
