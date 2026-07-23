@@ -407,3 +407,363 @@ class TestRespondToNotification:
                 result = respond_to_notification(event_id, "yes", su.id)
 
         assert result["action"] == "spot_filled_waiting_list_offered"
+
+
+# ---------------------------------------------------------------------------
+# TestPastClassInvitationExpiry — PAD-68 follow-up
+#
+# The first PAD-68 pass retired stale *reminders* and refused to *send* new
+# invitations for a class that is over. Pending invitations that were already
+# out there stayed live: the NotificationEvent kept status "sent" and the invite
+# message kept its Yes/No buttons, so a student could still take a spot in a
+# class that already happened.
+#
+# Every un-actioned invitation must be retired once the class is over —
+# started, canceled or completed — and a late answer must record nothing.
+# ---------------------------------------------------------------------------
+
+def _create_coach_player(coach, player, level=None):
+    from padel_app.models.Association_CoachPlayer import Association_CoachPlayer
+    cp = Association_CoachPlayer(
+        coach_id=coach.id,
+        player_id=player.id,
+        level_id=level.id if level else None,
+    )
+    db.session.add(cp)
+    db.session.flush()
+    return cp
+
+
+class TestPastClassInvitationExpiry:
+
+    def _seed_pending_invite(self, *, suffix, start_offset_hours=24, then_set_status=None):
+        """Send one real invitation for a future class.
+
+        Returns a dict of ids plus the vacancy/event/message the send produced.
+        Everything goes through ``_send_invitation_batch`` so the fixture is the
+        genuine article — a NotificationEvent in "sent" and an invite message
+        with ``responded: False`` in the candidate's chat.
+
+        ``then_set_status`` flips the instance to canceled/completed *after* the
+        invite went out, which is exactly how it happens in production: the class
+        is live when invitations are sent and is closed afterwards.
+        """
+        from padel_app.services.notification_service import (
+            _send_invitation_batch,
+            get_or_create_config,
+        )
+        from padel_app.models.vacancy import Vacancy
+
+        cu = _create_user("Coach", f"coach-{suffix}")
+        cand_u = _create_user("Candidate", f"cand-{suffix}")
+        coach = _create_coach(cu)
+        candidate = _create_player(cand_u)
+        level = _create_level(coach)
+        _create_coach_player(coach, candidate, level)
+        instance = _create_instance(
+            coach, level, enrolled_players=[], max_players=4,
+            start_offset_hours=start_offset_hours,
+        )
+        _seed_notification_config(coach.id, auto_notify=True)
+
+        vacancy = Vacancy(
+            lesson_instance_id=instance.id,
+            coach_id=coach.id,
+            status="open",
+            approval_status="not_required",
+        )
+        vacancy.create()
+
+        config = get_or_create_config(coach.id)
+        with patch(PATCHES[0]), patch(PATCHES[1]):
+            notified = _send_invitation_batch(
+                vacancy, instance, config, coach.id, max_sim_override=1,
+            )
+        assert notified, "fixture must produce a live invitation to retire"
+
+        from padel_app.models.notification_event import NotificationEvent
+        event = NotificationEvent.query.filter_by(
+            lesson_instance_id=instance.id, player_id=candidate.id
+        ).first()
+        assert event is not None and event.status == "sent"
+        assert event.message_id is not None
+
+        if then_set_status is not None:
+            instance.status = then_set_status
+            db.session.commit()
+
+        return {
+            "coach": coach,
+            "coach_id": coach.id,
+            "candidate": candidate,
+            "candidate_id": candidate.id,
+            "candidate_user_id": cand_u.id,
+            "instance": instance,
+            "instance_id": instance.id,
+            "vacancy_id": vacancy.id,
+            "event_id": event.id,
+            "message_id": event.message_id,
+        }
+
+    def _assert_retired(self, ids):
+        """The event is terminal and the message no longer offers Yes/No."""
+        from padel_app.models.messages import Message
+        from padel_app.models.notification_event import NotificationEvent
+        from padel_app.models.vacancy import Vacancy
+
+        event = NotificationEvent.query.get(ids["event_id"])
+        assert event.status == "expired"
+
+        msg = Message.query.get(ids["message_id"])
+        # ``responded`` is what both clients key the Yes/No buttons off, so
+        # setting it is what actually deactivates the invite — no client change.
+        assert msg.msg_metadata.get("responded") is True
+        assert msg.msg_metadata.get("response") == "expired"
+
+        assert Vacancy.query.get(ids["vacancy_id"]).status == "expired"
+
+    # -- scheduled sweep ----------------------------------------------------
+
+    def test_scheduled_sweep_retires_pending_invite_for_past_class(self, app):
+        """Nobody has to touch anything: the recurring batch pass retires invites
+        for a class that came and went unanswered."""
+        from padel_app.services.notification_service import process_invitation_batches
+
+        with app.app_context():
+            ids = self._seed_pending_invite(suffix="sweep")
+            with patch(PATCHES[0]), patch(PATCHES[1]):
+                process_invitation_batches(now=datetime.utcnow() + timedelta(days=3))
+            self._assert_retired(ids)
+
+    def test_sweep_retires_canceled_class_invite_before_its_start_time(self, app):
+        """A canceled class is over even though its start time has not passed."""
+        from padel_app.services.notification_service import process_invitation_batches
+
+        with app.app_context():
+            ids = self._seed_pending_invite(suffix="cancelled", then_set_status="canceled")
+            with patch(PATCHES[0]), patch(PATCHES[1]):
+                process_invitation_batches(now=datetime.utcnow())
+            self._assert_retired(ids)
+
+    def test_sweep_retires_completed_class_invite(self, app):
+        """Same for a class the coach already marked completed."""
+        from padel_app.services.notification_service import process_invitation_batches
+
+        with app.app_context():
+            ids = self._seed_pending_invite(suffix="completed", then_set_status="completed")
+            with patch(PATCHES[0]), patch(PATCHES[1]):
+                process_invitation_batches(now=datetime.utcnow())
+            self._assert_retired(ids)
+
+    def test_sweep_retires_manual_invite_with_no_vacancy(self, app):
+        """Manual notifications carry no vacancy, so a vacancy-driven cleanup
+        would miss them. The sweep is driven off NotificationEvent instead."""
+        from padel_app.services.notification_service import (
+            process_invitation_batches,
+            send_manual_notifications,
+        )
+        from padel_app.models.messages import Message
+        from padel_app.models.notification_event import NotificationEvent
+
+        with app.app_context():
+            cu = _create_user("Coach", "coach-manual-stale")
+            su = _create_user("Student", "student-manual-stale")
+            coach = _create_coach(cu)
+            student = _create_player(su)
+            level = _create_level(coach)
+            _create_coach_player(coach, student, level)
+            instance = _create_instance(coach, level, enrolled_players=[], max_players=4)
+            _seed_notification_config(coach.id, auto_notify=True)
+
+            with patch(PATCHES[0]), patch(PATCHES[1]):
+                events = send_manual_notifications(instance.id, [student.id], coach.id)
+                event_id = events[0].id
+                message_id = events[0].message_id
+                assert NotificationEvent.query.get(event_id).status == "sent"
+                assert message_id is not None
+
+                process_invitation_batches(now=datetime.utcnow() + timedelta(days=3))
+
+            assert NotificationEvent.query.get(event_id).status == "expired"
+            assert Message.query.get(message_id).msg_metadata.get("responded") is True
+
+    # -- the negative case: do not over-expire -------------------------------
+
+    def test_sweep_leaves_future_class_invites_alone(self, app):
+        """The important guard rail: a pending invite for a class that has NOT
+        happened yet stays live and actionable."""
+        from padel_app.services.notification_service import process_invitation_batches
+        from padel_app.models.messages import Message
+        from padel_app.models.notification_event import NotificationEvent
+        from padel_app.models.vacancy import Vacancy
+
+        with app.app_context():
+            ids = self._seed_pending_invite(suffix="future", start_offset_hours=24)
+            with patch(PATCHES[0]), patch(PATCHES[1]):
+                process_invitation_batches(now=datetime.utcnow() + timedelta(hours=1))
+
+            assert NotificationEvent.query.get(ids["event_id"]).status == "sent"
+            msg = Message.query.get(ids["message_id"])
+            assert msg.msg_metadata.get("responded") is False
+            assert "response" not in msg.msg_metadata
+            assert Vacancy.query.get(ids["vacancy_id"]).status == "open"
+
+    def test_timely_yes_still_confirms(self, app):
+        """And a normal, in-time acceptance is unaffected."""
+        from padel_app.services.notification_service import respond_to_notification
+        from padel_app.models.Association_PlayerLessonInstance import (
+            Association_PlayerLessonInstance,
+        )
+        from padel_app.models.notification_event import NotificationEvent
+
+        with app.app_context():
+            ids = self._seed_pending_invite(suffix="timely", start_offset_hours=24)
+            with patch(PATCHES[0]), patch(PATCHES[1]):
+                result = respond_to_notification(
+                    ids["event_id"], "yes", ids["candidate_user_id"],
+                    now=datetime.utcnow() + timedelta(hours=1),
+                )
+
+            assert result["action"] == "confirmed"
+            assert NotificationEvent.query.get(ids["event_id"]).status == "confirmed"
+            assert Association_PlayerLessonInstance.query.filter_by(
+                player_id=ids["candidate_id"], lesson_instance_id=ids["instance_id"]
+            ).first() is not None
+
+    # -- late responses ------------------------------------------------------
+
+    def test_late_yes_on_stale_invite_enrols_nobody(self, app):
+        """A late 'I'll take it' records nothing and puts nobody in a class that
+        already happened."""
+        from padel_app.services.notification_service import respond_to_notification
+        from padel_app.models.Association_PlayerLessonInstance import (
+            Association_PlayerLessonInstance,
+        )
+
+        with app.app_context():
+            ids = self._seed_pending_invite(suffix="lateyes")
+            with patch(PATCHES[0]), patch(PATCHES[1]):
+                result = respond_to_notification(
+                    ids["event_id"], "yes", ids["candidate_user_id"],
+                    now=datetime.utcnow() + timedelta(days=3),
+                )
+
+            assert result == {"action": "expired"}
+            assert Association_PlayerLessonInstance.query.filter_by(
+                player_id=ids["candidate_id"], lesson_instance_id=ids["instance_id"]
+            ).first() is None
+            self._assert_retired(ids)
+
+    def test_late_no_on_stale_invite_sends_no_replacement(self, app):
+        """A late decline must not kick off another invitation round either."""
+        from padel_app.services.notification_service import respond_to_notification
+        from padel_app.models.notification_event import NotificationEvent
+
+        with app.app_context():
+            ids = self._seed_pending_invite(suffix="lateno")
+            # A second candidate who must never be invited.
+            other_u = _create_user("Other", "other-lateno")
+            other = _create_player(other_u)
+            _create_coach_player(ids["coach"], other)
+            db.session.commit()
+
+            with patch(PATCHES[0]), patch(PATCHES[1]):
+                result = respond_to_notification(
+                    ids["event_id"], "no", ids["candidate_user_id"],
+                    now=datetime.utcnow() + timedelta(days=3),
+                )
+
+            assert result == {"action": "expired"}
+            assert NotificationEvent.query.filter_by(player_id=other.id).count() == 0
+            self._assert_retired(ids)
+
+    def test_late_coach_recorded_yes_enrols_nobody(self, app):
+        """The coach's manual 'they said yes' path is gated by the same rule."""
+        from padel_app.services.notification_service import coach_respond_to_notification
+        from padel_app.models.Association_PlayerLessonInstance import (
+            Association_PlayerLessonInstance,
+        )
+
+        with app.app_context():
+            ids = self._seed_pending_invite(suffix="coachlate")
+            with patch(PATCHES[0]), patch(PATCHES[1]):
+                result = coach_respond_to_notification(
+                    ids["event_id"], "yes", ids["coach_id"],
+                    now=datetime.utcnow() + timedelta(days=3),
+                )
+
+            assert result == {"action": "expired"}
+            assert Association_PlayerLessonInstance.query.filter_by(
+                player_id=ids["candidate_id"], lesson_instance_id=ids["instance_id"]
+            ).first() is None
+            self._assert_retired(ids)
+
+    def test_late_waiting_list_yes_creates_no_entry(self, app):
+        """Joining the waiting list for a class that already happened is a no-op."""
+        from padel_app.services.notification_service import respond_to_waiting_list
+        from padel_app.models.waiting_list_entry import WaitingListEntry
+
+        with app.app_context():
+            ids = self._seed_pending_invite(suffix="latewl")
+            with patch(PATCHES[0]), patch(PATCHES[1]):
+                result = respond_to_waiting_list(
+                    ids["instance_id"], "yes", ids["candidate_user_id"],
+                    now=datetime.utcnow() + timedelta(days=3),
+                )
+
+            assert result == {"action": "expired"}
+            assert WaitingListEntry.query.filter_by(
+                lesson_instance_id=ids["instance_id"]
+            ).count() == 0
+            self._assert_retired(ids)
+
+    def test_late_reminder_answer_also_retires_pending_invites(self, app):
+        """The student's own late reminder tap retires the invites the class had
+        outstanding — the lazy counterpart to the scheduled sweep."""
+        from padel_app.services.notification_service import respond_to_reminder
+        from padel_app.models.Association_PlayerLessonInstance import (
+            Association_PlayerLessonInstance,
+        )
+
+        with app.app_context():
+            ids = self._seed_pending_invite(suffix="latereminder")
+            # An enrolled student who will answer their reminder days late.
+            su = _create_user("Student", "student-latereminder")
+            student = _create_player(su)
+            _create_coach_player(ids["coach"], student)
+            db.session.add(Association_PlayerLessonInstance(
+                player_id=student.id, lesson_instance_id=ids["instance_id"],
+            ))
+            db.session.commit()
+
+            with patch(PATCHES[0]), patch(PATCHES[1]):
+                result = respond_to_reminder(
+                    ids["instance_id"], "no", su.id,
+                    now=datetime.utcnow() + timedelta(days=3),
+                )
+
+            assert result == {"action": "expired"}
+            self._assert_retired(ids)
+
+    def test_retirement_is_idempotent(self, app):
+        """Repeated late taps converge — nothing is double-retired or re-sent."""
+        from padel_app.services.notification_service import (
+            process_invitation_batches,
+            respond_to_notification,
+        )
+        from padel_app.models.notification_event import NotificationEvent
+
+        with app.app_context():
+            ids = self._seed_pending_invite(suffix="idem")
+            late = datetime.utcnow() + timedelta(days=3)
+            with patch(PATCHES[0]), patch(PATCHES[1]):
+                for _ in range(3):
+                    assert respond_to_notification(
+                        ids["event_id"], "no", ids["candidate_user_id"], now=late,
+                    ) == {"action": "expired"}
+                process_invitation_batches(now=late)
+
+            assert NotificationEvent.query.filter_by(
+                lesson_instance_id=ids["instance_id"]
+            ).count() == 1
+            self._assert_retired(ids)
