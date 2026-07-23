@@ -74,6 +74,23 @@ class LessonInstance(db.Model, model.Model):
     def players(self):
         return [rel.player for rel in self.players_relations]
 
+    @property
+    def effective_filled_spots(self) -> int:
+        """Spots actually taken on this instance (PAD-71).
+
+        SINGLE SOURCE OF TRUTH for "how full is this class". Enrolled players
+        minus everyone who has declined / cancelled (``Presence.status ==
+        "absent"``), floored at 0. Players who have not answered their invite
+        yet still occupy their spot and DO count.
+
+        Consumed by the calendar event payload (``participantCount``), the
+        class-detail "capacity" field, and the invitation engine's capacity
+        checks — none of those may recompute this independently.
+        """
+        enrolled = len(self.players_relations)
+        declined = sum(1 for p in self.presences if p.status == "absent")
+        return max(0, enrolled - declined)
+
     def __repr__(self):
         return f"<LessonInstance {self.id} {self.title} {self.start_datetime.strftime('%Y-%m-%d %H:%M')}>"
 

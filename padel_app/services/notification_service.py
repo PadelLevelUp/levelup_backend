@@ -809,9 +809,10 @@ def _user_id_for_player(player_id: int) -> int | None:
 
 
 def _effective_filled_spots(instance: LessonInstance) -> int:
-    enrolled = len(instance.players_relations)
-    absent = sum(1 for p in instance.presences if p.status == "absent")
-    return max(0, enrolled - absent)
+    # Delegates to the single source of truth on the model (PAD-71) so the
+    # invitation engine, the calendar payload and the class-detail capacity
+    # field can never drift apart.
+    return instance.effective_filled_spots
 
 
 def _add_player_to_instance(player_id: int, instance: LessonInstance) -> None:
