@@ -164,7 +164,12 @@ def create_message_service(data, user_id):
         "text": data["text"],
         "conversation": data["conversationId"],
         "sender": user_id,
-        "sent_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+        # UTC, to match last_read_at (mark_conversation_read_service uses
+        # utcnow_naive) and the unread query `sent_at > last_read_at`. Using
+        # local time here stamped fresh messages ~1h in the future under a +1
+        # offset, so a just-read message stayed "unread" until UTC caught up
+        # (PAD-66).
+        "sent_at": utcnow_naive().strftime("%Y-%m-%dT%H:%M:%S"),
     }
 
     message = Message()
