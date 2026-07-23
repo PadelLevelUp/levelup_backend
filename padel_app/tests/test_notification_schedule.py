@@ -319,6 +319,21 @@ class TestSendClassRemindersGuard:
 
 class TestProcessInvitationBatches:
 
+    @pytest.fixture(autouse=True)
+    def _stub_stale_sweep(self):
+        """PAD-68: process_invitation_batches also sweeps stale invitations now.
+
+        These are pure unit tests — the ORM is mocked out and there is no app
+        context — so the sweep (which runs real NotificationEvent queries) is
+        stubbed here. It has its own DB-backed coverage in
+        test_notification_integration.py::TestPastClassInvitationExpiry.
+        """
+        with patch(
+            "padel_app.services.notification_service.expire_stale_invitations",
+            return_value=0,
+        ):
+            yield
+
     def _make_vacancy(
         self,
         instance_start: datetime,

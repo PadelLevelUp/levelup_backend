@@ -53,7 +53,10 @@ def serialize_calendar_event(obj, *, override_id: str | None = None, override_da
             {
                 "type": "class",
                 "classType": lesson.type,
-                "participantCount": len(obj.players_relations),
+                # PAD-71: effective filled spots (enrolled minus declined), the
+                # same value the class-detail "capacity" field shows. Declined
+                # students free their spot and must not be counted here.
+                "participantCount": obj.effective_filled_spots,
                 "maxPlayers": obj.max_players,
                 "color": lesson.color,
                 "levelId": obj.level_id or lesson.default_level_id,
@@ -70,6 +73,9 @@ def serialize_calendar_event(obj, *, override_id: str | None = None, override_da
                 "type": "class",
                 "classType": obj.type,
                 "maxPlayers": obj.max_players,
+                # A Lesson template has no presences (nobody can have declined a
+                # class that was never materialized), so enrolment IS the
+                # effective filled count here. See LessonInstance.effective_filled_spots.
                 "participantCount": len(obj.players_relations),
                 "color": obj.color,
                 "levelId": obj.default_level_id,

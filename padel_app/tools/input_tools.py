@@ -142,8 +142,29 @@ class Field:
         self.value = None
         return False
 
+    # Strings the HTML editor forms and JSON clients may send for "true".
+    TRUTHY_STRINGS = frozenset({"true", "1", "yes", "on", "y", "t"})
+
     def set_boolean_value(self, request):
-        self.value = True if request.form[self.name] == "true" else False
+        # CRITICAL: this must accept *real* Python booleans. JSON payloads
+        # arrive through JsonRequestAdapter, which puts native `True`/`False`
+        # into request.form. The previous implementation compared against the
+        # string "true", so `True == "true"` was False and every JSON boolean
+        # was silently written as False — see PAD-69 (attendance confirmation
+        # wiping Presence.confirmed and re-triggering reminders).
+        #
+        # HTML form semantics are preserved exactly: the Jinja editor always
+        # submits a hidden input holding "true"/"false"/"" for each checkbox,
+        # and a missing key (or an empty value) still means False. `.get()` is
+        # used instead of indexing so a genuinely absent checkbox cannot raise
+        # a BadRequestKeyError.
+        raw = request.form.get(self.name)
+        if isinstance(raw, bool):
+            self.value = raw
+        elif raw is None:
+            self.value = False
+        else:
+            self.value = str(raw).strip().lower() in self.TRUTHY_STRINGS
         return True
 
     def set_password_value(self, request):

@@ -11,7 +11,7 @@ def serialize_user(user):
         "isActive": user.status == 'active',
         "language": getattr(user, "language", "pt") or "pt",
         "avatarUrl": user.user_image_url,
-        "abbreviation": "".join(
-            [part[0] for part in user.name.split()[:2]]
-        ).upper(),
+        # PAD-81: the coach's saved abbreviation wins; otherwise fall back to the
+        # initials derived from their name (the previous, always-derived behaviour).
+        "abbreviation": user.abbreviation_display,
     }

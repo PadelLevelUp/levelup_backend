@@ -6,9 +6,18 @@ from padel_app.models import (
     EvaluationEntry,
     Association_CoachPlayer,
 )
+from padel_app.services.level_ladder import (
+    get_level_ladder,
+    is_unordered,
+    next_display_order,
+    normalize_display_orders,
+)
 from padel_app.sql_db import db
 from padel_app.tools.request_adapter import JsonRequestAdapter
 
+# Ordering convention (specs/levels/spec.md rule 3): lower display_order =
+# STRONGER level, so the first entry here is the top of a new coach's ladder.
+# These are placeholders the coach renames and reorders in Settings.
 DEFAULT_COACH_LEVELS = [
     {"code": "L1", "label": "Level 1", "display_order": 1},
     {"code": "L2", "label": "Level 2", "display_order": 2},
@@ -58,7 +67,32 @@ def create_coach_service(data):
     return coach
 
 
+def _coach_id_from_payload(data):
+    raw = data.get("coach") or data.get("coach_id") or data.get("coachId")
+    if isinstance(raw, (list, tuple)):
+        raw = raw[0] if raw else None
+    if isinstance(raw, CoachLevel):  # defensive; never expected
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return getattr(raw, "id", None)
+
+
 def create_coach_level_service(data):
+    data = dict(data or {})
+
+    # PAD-70: a level created without an explicit position must be APPENDED to
+    # the bottom of the ladder. The column default is 0, which the notification
+    # engine would otherwise read as the coach's strongest level. Resolved
+    # before the form runs — building the object first would attach it to the
+    # session and make the lookup query autoflush a half-built row.
+    order = data.get("display_order", data.get("displayOrder"))
+    if is_unordered(order):
+        coach_id = _coach_id_from_payload(data)
+        if coach_id:
+            data["display_order"] = next_display_order(coach_id)
+
     coach_level = CoachLevel()
     form = coach_level.get_create_form()
 
@@ -71,13 +105,23 @@ def create_coach_level_service(data):
 
 
 def upsert_coach_levels(coach, data):
-    """Batch upsert coach levels from a list of entries."""
-    for entry in data:
+    """Batch upsert coach levels from a list of entries.
+
+    The submitted list IS the coach's ladder, top (strongest) first. Entries may
+    carry an explicit ``displayOrder``; when they don't, their position in the
+    list is used. Afterwards the whole ladder is renumbered to a contiguous
+    ``1..N`` so gaps, duplicates and unset orders can never reach the
+    notification engine (PAD-70).
+    """
+    for position, entry in enumerate(data, start=1):
+        display_order = entry.get("displayOrder")
+        if is_unordered(display_order):
+            display_order = position
         payload = {
             "code": entry.get("code"),
             "label": entry.get("label"),
             "coach": coach.id,
-            "display_order": entry.get("displayOrder"),
+            "display_order": display_order,
         }
         coach_level = (
             CoachLevel.query
@@ -92,6 +136,9 @@ def upsert_coach_levels(coach, data):
             coach_level = CoachLevel()
             _apply_form(coach_level.get_create_form(), payload, coach_level)
             coach_level.create()
+
+    normalize_display_orders(coach.id)
+    db.session.commit()
 
 
 def upsert_evaluation_categories(coach, data):
@@ -199,21 +246,23 @@ def add_evaluation_entry_service(coach, data):
     return {"status": "ok", "playerId": player_id}
 
 
-def get_coach_levels(coach_id: int) -> list[dict]:
-    """Fetch the coach's existing levels from the database.
+def get_coach_levels(coach_id: int) -> list:
+    """Fetch the coach's existing levels, ordered strongest → weakest.
 
-    Returns a list of dicts, each with:
-        - code (str): unique level identifier, e.g. "INI", "INT", "ADV"
-        - label (str): display name, e.g. "Iniciacao", "Intermedio", "Avancado"
-        - display_order (int): sort order
+    Each ``CoachLevel`` carries:
+        - code (str): unique level identifier, e.g. "COMP", "ADV", "INT"
+        - label (str): display name, e.g. "Competicao", "Avancado", "Intermedio"
+        - display_order (int): ladder position — **lower = stronger**
+          (specs/levels/spec.md rule 3), so ``display_order`` 1 is the coach's
+          top level, not their beginners.
 
-    Example return value:
+    Example ladder:
         [
-            {"code": "INI", "label": "Iniciacao", "display_order": 1},
-            {"code": "INT", "label": "Intermedio", "display_order": 2},
-            {"code": "ADV", "label": "Avancado", "display_order": 3},
-            {"code": "COMP", "label": "Competicao", "display_order": 4},
+            {"code": "COMP", "label": "Competicao", "display_order": 1},
+            {"code": "ADV", "label": "Avancado", "display_order": 2},
+            {"code": "INT", "label": "Intermedio", "display_order": 3},
+            {"code": "INI", "label": "Iniciacao", "display_order": 4},
         ]
     """
 
-    return CoachLevel.query.filter_by(coach_id=coach_id).all()
+    return get_level_ladder(coach_id)

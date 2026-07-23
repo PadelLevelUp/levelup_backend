@@ -31,17 +31,20 @@ def build_player_dashboard_blocks(*, player) -> List[Dict[str, Any]]:
             "type": "kpi_grid",
             "data": {
                 "items": [
+                    # NOTE (PAD-76): `href` is only set when a matching frontend
+                    # route actually exists. There is no attendance-history page
+                    # (`/presences`) nor an invites page (`/invites`) yet, so
+                    # those KPIs ship without a link and render as inert cards
+                    # instead of dropping the player on the 404 page.
                     {
                         "label": "Attended",
                         "value": int(kpis.lessons_attended),
                         "icon": "check_circle",
-                        "href": "/presences?status=present",
                     },
                     {
                         "label": "Missed",
                         "value": int(kpis.lessons_missed),
                         "icon": "x_circle",
-                        "href": "/presences?status=absent",
                     },
                     {
                         "label": "Upcoming lessons",
@@ -53,7 +56,6 @@ def build_player_dashboard_blocks(*, player) -> List[Dict[str, Any]]:
                         "label": "Invites",
                         "value": int(kpis.invites_to_confirm),
                         "icon": "mail",
-                        "href": "/invites",
                     },
                 ]
             },

@@ -17,6 +17,11 @@ import re
 from psycopg2.errors import UniqueViolation
 from sqlalchemy.exc import IntegrityError
 
+from padel_app.services.level_ladder import (
+    is_unordered,
+    next_display_order,
+    normalize_display_orders,
+)
 from padel_app.sql_db import db
 from padel_app.models import (
     CoachLevel,
@@ -118,7 +123,13 @@ def _coerce_import_datetime(value):
 # ---------------------------------------------------------------------------
 
 def bulk_create_coach_levels(rows, coach):
-    """Find-or-create coach levels. Uniqueness key: (coach, code)."""
+    """Find-or-create coach levels. Uniqueness key: (coach, code).
+
+    Imported spreadsheets frequently have no ``display_order`` column. PAD-70:
+    such rows must be appended to the bottom of the ladder in row order — the
+    column default of 0 would otherwise make every imported level outrank the
+    coach's explicitly ordered ones in the notification engine.
+    """
     imported = 0
     errors = []
     created_ids = {"coach_levels": []}
@@ -138,11 +149,15 @@ def bulk_create_coach_levels(rows, coach):
             if existing:
                 continue
 
+            display_order = row.get("display_order")
+            if is_unordered(display_order):
+                display_order = next_display_order(coach.id)
+
             payload = {
                 "code": code,
                 "label": row.get("label"),
                 "coach": coach.id,
-                "display_order": row.get("display_order"),
+                "display_order": display_order,
             }
             level = CoachLevel()
             _apply_form(level.get_create_form(), payload, level)
@@ -153,6 +168,10 @@ def bulk_create_coach_levels(rows, coach):
         except Exception as e:
             db.session.rollback()
             errors.append({"row": i, "data": row, "error": str(e)})
+
+    if imported:
+        normalize_display_orders(coach.id)
+        db.session.commit()
 
     return _ok(imported, errors, created_ids)
 

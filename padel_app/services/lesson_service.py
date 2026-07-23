@@ -222,14 +222,15 @@ def add_presences(lesson_instance, payload):
             player_id=player_id,
         ).first()
 
-        # Preserve invited/confirmed from the reminder flow; only set them on
-        # brand-new presences where no reminder was ever sent.
+        # Attendance marking only owns status/justification. The reminder-flow
+        # flags (invited/confirmed) and late_cancellation are deliberately NOT
+        # routed through the form layer: every Boolean form field is written on
+        # every submit, so a payload that merely omits them — or a coercion bug
+        # like PAD-69 — would silently reset the student's reminder answer.
+        # They are left exactly as the reminder flow set them.
         data = {
             "status": item.get('status'),
             "justification": item.get('justification'),
-            "invited": existing.invited if existing else False,
-            "confirmed": existing.confirmed if existing else False,
-            "validated": True,
         }
 
         if existing:
@@ -244,6 +245,11 @@ def add_presences(lesson_instance, payload):
 
         fake_request = JsonRequestAdapter(data, form)
         values = form.set_values(fake_request)
+
+        for reminder_flag in ("invited", "confirmed", "late_cancellation"):
+            values.pop(reminder_flag, None)
+        # Attendance was explicitly recorded by the coach.
+        values["validated"] = True
 
         presence_obj.update_with_dict(values)
 
@@ -395,7 +401,12 @@ def split_lesson(lesson, date, remove_current_date=False):
 
     new_lesson = duplicate_lesson_helper(lesson)
 
-    lesson.recurrence_end = date
+    # recurrence_end is INCLUSIVE — a bare date is coerced to end-of-day
+    # (ensure_utc → time.max), so an occurrence on that date is still
+    # projected. When the current date is being removed, the "before" lesson
+    # must end the day BEFORE it, otherwise the occurrence resurrects on
+    # reload (PAD-65). When splitting for an edit (date stays), end on `date`.
+    lesson.recurrence_end = (date - timedelta(days=1)) if remove_current_date else date
 
     new_lesson.start_datetime = new_start
     new_lesson.end_datetime = new_end
@@ -497,13 +508,46 @@ def add_class_service(data, coach, club):
 
 
 def confirm_presences_service(class_instance_data, presences_data):
-    """Materialises an instance if needed and records presences."""
-    if 'parentClassId' in class_instance_data.keys():
-        # Already a materialized LessonInstance — originalId is the instance ID
-        instance = LessonInstance.query.get_or_404(class_instance_data.get('originalId'))
+    """Materialises an instance if needed and records presences.
+
+    ``originalId`` lives in two different id-spaces depending on the event:
+    for a materialized ``LessonInstance`` it is the *instance* id, for a
+    (recurring or single) ``Lesson`` occurrence it is the *lesson* id. The
+    field that reliably distinguishes the two is the calendar-event ``id`` —
+    ``"lessoninstance-<id>"`` for a materialized instance vs
+    ``"lesson-<id>-<date>"`` for a projected lesson occurrence (see
+    ``build_lesson_events`` / ``serialize_calendar_event``). When a caller
+    omits ``id`` (legacy/synthetic payloads), a truthy ``parentClassId`` is
+    used as the fallback signal that ``originalId`` is an instance id.
+
+    The previous check — ``'parentClassId' in class_instance_data.keys()`` —
+    was wrong: ``parentClassId`` is added by ``serialize_class_instance``
+    whenever the detail endpoint resolves to an *instance*, even when the
+    frontend's event (and therefore ``originalId``) is still a recurring
+    *Lesson* (e.g. a stale calendar whose occurrence was materialized after
+    it loaded). That sent a Lesson id into ``LessonInstance.get_or_404`` →
+    404 "Failed to save attendance". Branching on the event id prefix always
+    routes a lesson occurrence through materialization instead.
+    """
+    original_id = class_instance_data.get('originalId')
+    event_id = str(class_instance_data.get('id') or '')
+
+    if event_id.startswith('lessoninstance-'):
+        is_instance = True
+    elif event_id.startswith('lesson-'):
+        is_instance = False
     else:
-        # Non-materialized recurring Lesson — materialize for the given date
-        lesson = Lesson.query.get_or_404(class_instance_data.get('originalId'))
+        # Legacy/synthetic payloads without a calendar-event id: a truthy
+        # parentClassId means originalId is a materialized LessonInstance id.
+        is_instance = bool(class_instance_data.get('parentClassId'))
+
+    if is_instance:
+        # Already a materialized LessonInstance — originalId is the instance ID
+        instance = LessonInstance.query.get_or_404(original_id)
+    else:
+        # Recurring or single Lesson occurrence — originalId is the Lesson ID.
+        # Materialize (or reuse) the instance for the occurrence's date.
+        lesson = Lesson.query.get_or_404(original_id)
         from datetime import datetime as _dt
         date = _dt.strptime(class_instance_data['date'], '%Y-%m-%d').date()
         instance = get_or_materialize_instance(lesson, date)
@@ -755,8 +799,21 @@ def remove_class_service(data):
 
     if model_name == "LessonInstance":
         if scope == "single" or not scope:
+            parent_lesson = obj.lesson
+            # The date this instance overrides in the parent recurrence — the
+            # ORIGINAL occurrence date, not the (possibly edited) instance date.
+            occ_date = obj.original_lesson_occurence_date or obj.start_datetime.date()
             _maybe_cancel_instance(obj.id)
             obj.delete()
+            # When the instance overrides a recurring parent, deleting it is not
+            # enough: the parent series would re-project that occurrence (with
+            # its pre-edit values) on reload. Exclude the date from the parent
+            # recurrence, mirroring the Lesson scope="single" path (PAD-65).
+            if parent_lesson is not None and parent_lesson.recurrence_rule:
+                _remove_single_occurrence_from_lesson(
+                    lesson=parent_lesson, date=occ_date
+                )
+                return {"status": "single_removed"}, 200
             return {"status": "deleted"}, 200
 
         if scope == "future":

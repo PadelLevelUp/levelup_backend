@@ -645,6 +645,309 @@ class TestReminderSupersede:
 
 
 # ---------------------------------------------------------------------------
+# TestPastClassReminderExpiry — PAD-68
+#
+# Once a class has started (or was canceled/completed) its reminders are dead.
+# A late response must NOT be recorded against attendance and must NOT create a
+# vacancy or fan out replacement invitations for a class that already happened.
+# ---------------------------------------------------------------------------
+
+def _seed_replacement_candidates(app, coach_id, n=3):
+    """Create n other players linked to the coach, eligible for invitations."""
+    from padel_app.models.users import User
+    from padel_app.models.players import Player
+    from padel_app.models.Association_CoachPlayer import Association_CoachPlayer
+
+    player_ids = []
+    with app.app_context():
+        for i in range(n):
+            u = User(
+                name=f"Candidate {i}",
+                username=f"candidate-{i}",
+                email=f"candidate{i}@test.com",
+                password="hashed",
+                status="active",
+            )
+            db.session.add(u)
+            db.session.flush()
+            p = Player(user_id=u.id)
+            db.session.add(p)
+            db.session.flush()
+            db.session.add(Association_CoachPlayer(coach_id=coach_id, player_id=p.id))
+            player_ids.append(p.id)
+        db.session.commit()
+    return player_ids
+
+
+def _enable_auto_notify(app, coach_id):
+    from padel_app.models.notification_config import NotificationConfig
+
+    with app.app_context():
+        config = NotificationConfig.query.filter_by(coach_id=coach_id).first()
+        config.auto_notify_enabled = True
+        config.save()
+
+
+class TestPastClassReminderExpiry:
+
+    def test_late_decline_does_not_fan_out_invitations(self, app):
+        """PAD-68: answering 'no' after the class already happened sends no
+        replacement invitations and creates no vacancy."""
+        from padel_app.services.notification_service import (
+            respond_to_reminder,
+            send_class_reminders,
+        )
+        from padel_app.models.notification_event import NotificationEvent
+        from padel_app.models.vacancy import Vacancy
+
+        ids = _seed_coach_and_student(app)
+        instance_id = _seed_instance(app, ids["coach_id"], ids["student_id"], start_offset_hours=24)
+        _config_with_repeat(app, ids["coach_id"], count=2, hours=2)
+        _enable_auto_notify(app, ids["coach_id"])
+        _seed_replacement_candidates(app, ids["coach_id"], 3)
+
+        with app.app_context():
+            t0 = datetime.utcnow()
+            with patch(PATCHES[0]), patch(PATCHES[1]):
+                send_class_reminders(instance_id, now=t0)
+                # The class happens. Three days later the student finally answers.
+                result = respond_to_reminder(
+                    instance_id, "no", ids["student_user_id"], now=t0 + timedelta(days=3)
+                )
+
+            assert result == {"action": "expired"}
+            assert NotificationEvent.query.filter_by(lesson_instance_id=instance_id).count() == 0
+            assert Vacancy.query.filter_by(lesson_instance_id=instance_id).count() == 0
+
+    def test_late_decline_does_not_rewrite_attendance(self, app):
+        """PAD-68: a late answer must not retroactively mark the player absent —
+        the coach's attendance record for a class that happened is authoritative."""
+        from padel_app.services.notification_service import (
+            respond_to_reminder,
+            send_class_reminders,
+        )
+        from padel_app.models.presences import Presence
+
+        ids = _seed_coach_and_student(app)
+        instance_id = _seed_instance(app, ids["coach_id"], ids["student_id"], start_offset_hours=24)
+        _config_with_repeat(app, ids["coach_id"], count=2, hours=2)
+
+        with app.app_context():
+            t0 = datetime.utcnow()
+            with patch(PATCHES[0]), patch(PATCHES[1]):
+                send_class_reminders(instance_id, now=t0)
+                presence = Presence.query.filter_by(
+                    lesson_instance_id=instance_id, player_id=ids["student_id"]
+                ).first()
+                presence.status = "present"
+                presence.save()
+
+                respond_to_reminder(
+                    instance_id, "no", ids["student_user_id"], now=t0 + timedelta(days=3)
+                )
+
+            presence = Presence.query.filter_by(
+                lesson_instance_id=instance_id, player_id=ids["student_id"]
+            ).first()
+            assert presence.status == "present"
+            assert presence.justification is None
+
+    def test_late_response_marks_stale_reminder_expired(self, app):
+        """PAD-68: the un-actioned reminder is retired (superseded/expired) so the
+        UI stops offering live Yes/No buttons for a class that already happened."""
+        from padel_app.services.notification_service import (
+            respond_to_reminder,
+            send_class_reminders,
+        )
+        from padel_app.models.messages import Message
+
+        ids = _seed_coach_and_student(app)
+        instance_id = _seed_instance(app, ids["coach_id"], ids["student_id"], start_offset_hours=24)
+        _config_with_repeat(app, ids["coach_id"], count=2, hours=2)
+
+        with app.app_context():
+            t0 = datetime.utcnow()
+            with patch(PATCHES[0]), patch(PATCHES[1]):
+                send_class_reminders(instance_id, now=t0)
+                respond_to_reminder(
+                    instance_id, "yes", ids["student_user_id"], now=t0 + timedelta(days=3)
+                )
+
+            msg = Message.query.filter_by(message_type="notification_reminder").first()
+            assert msg.msg_metadata.get("superseded") is True
+            assert msg.msg_metadata.get("expired") is True
+            # It was never answered — it must not carry a confirmed/absent badge.
+            assert not msg.msg_metadata.get("responded")
+
+    def test_trigger_invitations_noop_for_past_class(self, app):
+        """PAD-68: the invitation engine refuses to open or fill vacancies for a
+        class that already started, whatever calls it."""
+        from padel_app.services.notification_service import trigger_invitations
+        from padel_app.models.lesson_instances import LessonInstance
+        from padel_app.models.notification_event import NotificationEvent
+        from padel_app.models.presences import Presence
+
+        ids = _seed_coach_and_student(app)
+        instance_id = _seed_instance(app, ids["coach_id"], ids["student_id"], start_offset_hours=24)
+        _config_with_repeat(app, ids["coach_id"], count=2, hours=2)
+        _enable_auto_notify(app, ids["coach_id"])
+        _seed_replacement_candidates(app, ids["coach_id"], 3)
+
+        with app.app_context():
+            Presence(
+                lesson_instance_id=instance_id,
+                player_id=ids["student_id"],
+                invited=True,
+                confirmed=True,
+                status="absent",
+            ).create()
+            instance = LessonInstance.query.get(instance_id)
+            with patch(PATCHES[0]), patch(PATCHES[1]):
+                notified = trigger_invitations(
+                    instance, ids["coach_id"], now=datetime.utcnow() + timedelta(days=3)
+                )
+
+            assert notified == []
+            assert NotificationEvent.query.filter_by(lesson_instance_id=instance_id).count() == 0
+
+    def test_invitation_batch_expires_vacancy_for_past_class(self, app):
+        """PAD-68: the send chokepoint expires an open vacancy instead of
+        inviting anyone once the class has started."""
+        from padel_app.services.notification_service import (
+            _send_invitation_batch,
+            get_or_create_config,
+        )
+        from padel_app.models.lesson_instances import LessonInstance
+        from padel_app.models.notification_event import NotificationEvent
+        from padel_app.models.vacancy import Vacancy
+
+        ids = _seed_coach_and_student(app)
+        instance_id = _seed_instance(app, ids["coach_id"], ids["student_id"], start_offset_hours=24)
+        _config_with_repeat(app, ids["coach_id"], count=2, hours=2)
+        _enable_auto_notify(app, ids["coach_id"])
+        _seed_replacement_candidates(app, ids["coach_id"], 3)
+
+        with app.app_context():
+            vacancy = Vacancy(
+                lesson_instance_id=instance_id,
+                coach_id=ids["coach_id"],
+                original_player_id=ids["student_id"],
+                status="open",
+                approval_status="not_required",
+            )
+            vacancy.create()
+            instance = LessonInstance.query.get(instance_id)
+            config = get_or_create_config(ids["coach_id"])
+
+            with patch(PATCHES[0]), patch(PATCHES[1]):
+                notified = _send_invitation_batch(
+                    vacancy, instance, config, ids["coach_id"],
+                    now=datetime.utcnow() + timedelta(days=3),
+                )
+
+            assert notified == []
+            assert vacancy.status == "expired"
+            assert NotificationEvent.query.filter_by(lesson_instance_id=instance_id).count() == 0
+
+    def test_response_before_class_start_still_works(self, app):
+        """Guard rail: the expiry check must not break the normal, timely path."""
+        from padel_app.services.notification_service import (
+            respond_to_reminder,
+            send_class_reminders,
+        )
+        from padel_app.models.presences import Presence
+
+        ids = _seed_coach_and_student(app)
+        instance_id = _seed_instance(app, ids["coach_id"], ids["student_id"], start_offset_hours=24)
+        _config_with_repeat(app, ids["coach_id"], count=2, hours=2)
+
+        with app.app_context():
+            t0 = datetime.utcnow()
+            with patch(PATCHES[0]), patch(PATCHES[1]):
+                send_class_reminders(instance_id, now=t0)
+                result = respond_to_reminder(
+                    instance_id, "no", ids["student_user_id"], now=t0 + timedelta(hours=1)
+                )
+
+            assert result == {"action": "declined"}
+            presence = Presence.query.filter_by(
+                lesson_instance_id=instance_id, player_id=ids["student_id"]
+            ).first()
+            assert presence.status == "absent"
+
+
+# ---------------------------------------------------------------------------
+# TestResponseAlwaysRecorded — PAD-69
+#
+# A student's answer must always be durably recorded, so the next reminder pass
+# can never mistake them for someone who never replied.
+# ---------------------------------------------------------------------------
+
+class TestResponseAlwaysRecorded:
+
+    def test_decline_creates_presence_when_missing(self, app):
+        """PAD-69: with no Presence row the answer used to be silently dropped,
+        and the follow-up reminder was then sent as if nothing was answered."""
+        from padel_app.services.notification_service import (
+            respond_to_reminder,
+            send_class_reminders,
+        )
+        from padel_app.models.messages import Message
+        from padel_app.models.presences import Presence
+
+        ids = _seed_coach_and_student(app)
+        instance_id = _seed_instance(app, ids["coach_id"], ids["student_id"], start_offset_hours=24)
+        _config_with_repeat(app, ids["coach_id"], count=2, hours=2)
+
+        with app.app_context():
+            t0 = datetime.utcnow()
+            with patch(PATCHES[0]), patch(PATCHES[1]):
+                send_class_reminders(instance_id, now=t0)
+                # Simulate the Presence row being absent when the student answers.
+                Presence.query.filter_by(
+                    lesson_instance_id=instance_id, player_id=ids["student_id"]
+                ).first().delete()
+
+                respond_to_reminder(
+                    instance_id, "no", ids["student_user_id"], now=t0 + timedelta(minutes=30)
+                )
+                send_class_reminders(instance_id, now=t0 + timedelta(hours=2))
+
+            presence = Presence.query.filter_by(
+                lesson_instance_id=instance_id, player_id=ids["student_id"]
+            ).first()
+            assert presence is not None
+            assert presence.confirmed is True
+            assert presence.status == "absent"
+
+            # Exactly one reminder: no follow-up after an answer was given.
+            assert Message.query.filter_by(message_type="notification_reminder").count() == 1
+
+    def test_no_followup_reminder_after_decline(self, app):
+        """PAD-69 regression guard for the ordinary path."""
+        from padel_app.services.notification_service import (
+            respond_to_reminder,
+            send_class_reminders,
+        )
+        from padel_app.models.messages import Message
+
+        ids = _seed_coach_and_student(app)
+        instance_id = _seed_instance(app, ids["coach_id"], ids["student_id"], start_offset_hours=24)
+        _config_with_repeat(app, ids["coach_id"], count=2, hours=2)
+
+        with app.app_context():
+            t0 = datetime.utcnow()
+            with patch(PATCHES[0]), patch(PATCHES[1]):
+                send_class_reminders(instance_id, now=t0)
+                respond_to_reminder(
+                    instance_id, "no", ids["student_user_id"], now=t0 + timedelta(minutes=30)
+                )
+                send_class_reminders(instance_id, now=t0 + timedelta(hours=2))
+
+            assert Message.query.filter_by(message_type="notification_reminder").count() == 1
+
+
+# ---------------------------------------------------------------------------
 # TestRespondToReminder
 # ---------------------------------------------------------------------------
 

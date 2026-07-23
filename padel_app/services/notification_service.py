@@ -15,6 +15,7 @@ Handles reminders, vacancy-based invitations, waiting list, and manual notificat
   - process_invitation_batches()                 recurring APScheduler job (every 2 min)
   - respond_to_notification(...)                 player presses Yes/No on invite
   - coach_respond_to_notification(...)           coach manually records a response
+  - expire_stale_invitations()                   retire pending invites for classes that are over
 
   Manual notifications
   - send_manual_notifications(...)               coach hand-picks players
@@ -50,13 +51,19 @@ from padel_app.models import (
 )
 from padel_app.models.standing_waiting_list_entry import StandingWaitingListEntry
 from padel_app.models.notification_config import (
-    DEFAULT_MESSAGE_TEMPLATES,
     DEFAULT_NOTIFICATION_GROUPS,
     DEFAULT_PRIORITY_CRITERIA,
     DEFAULT_RESTRICTIONS,
     DEFAULT_ROUNDS,
+    default_templates_for_locale,
+    resolve_message_template,
 )
 from padel_app.realtime import publish
+from padel_app.services.level_ladder import (
+    get_level_ladder,
+    ladder_index,
+    ladder_index_map,
+)
 from padel_app.utils.push_notifications import send_push_notification
 
 
@@ -76,7 +83,10 @@ def get_or_create_config(coach_id: int) -> NotificationConfig:
 
 
 def get_config_dict(coach_id: int) -> dict:
+    from padel_app.models import Coach
+
     config = get_or_create_config(coach_id)
+    locale = _resolve_locale(Coach.query.get(coach_id))
     return {
         "autoNotifyEnabled": config.auto_notify_enabled,
         "invitationMode": config.get_invitation_mode(),
@@ -84,7 +94,7 @@ def get_config_dict(coach_id: int) -> dict:
         "restrictions": config.get_restrictions(),
         "rounds": config.get_rounds(),
         "notificationGroups": config.get_notification_groups(),
-        "messageTemplates": config.get_message_templates(),
+        "messageTemplates": config.get_message_templates(locale),
         "reminderTiming": config.reminder_timing,
         "invitationStartTiming": config.get_invitation_start_timing(),
         "invitationGroups": config.get_invitation_groups(),
@@ -147,10 +157,19 @@ def _is_semi_auto(config: NotificationConfig) -> bool:
 # Student ranking helpers
 # ---------------------------------------------------------------------------
 
-def _level_sort_key(coach_player: Association_CoachPlayer) -> int:
-    if coach_player.level:
-        return coach_player.level.display_order
-    return 9999
+def _level_sort_key(coach_player: Association_CoachPlayer, ladder: dict | None = None) -> int:
+    """Rank a candidate by their position in the coach's ladder (0 = strongest).
+
+    ``ladder`` is a ``{level_id: position}`` map (see level_ladder.py). Without
+    one — the only caller that has no vacancy to derive the coach from — this
+    falls back to the raw ``display_order``. Players with no level always sort
+    last.
+    """
+    if not coach_player.level:
+        return 9999
+    if ladder is not None:
+        return ladder.get(coach_player.level_id, 9999)
+    return coach_player.level.display_order or 9999
 
 
 # ---------------------------------------------------------------------------
@@ -210,13 +229,16 @@ def _attendance_stats(player_id: int) -> tuple[float, float]:
 def _build_sort_key(criteria: list[dict], player_stats: dict, vacancy: Vacancy = None):
     enabled = [c["id"] for c in criteria if c.get("enabled")]
     vacancy_side = getattr(vacancy, "side", None)
+    # PAD-70: rank by ladder position, not by the raw display_order integer.
+    vacancy_coach_id = getattr(vacancy, "coach_id", None)
+    ladder = ladder_index_map(vacancy_coach_id) if vacancy_coach_id else None
 
     def key(cp: Association_CoachPlayer):
         parts = []
         stats = player_stats.get(cp.player_id, {})
         for criterion in enabled:
             if criterion == "level":
-                parts.append(_level_sort_key(cp))
+                parts.append(_level_sort_key(cp, ladder))
             elif criterion == "justified_misses":
                 parts.append(-stats.get("justified_miss_rate", 0.0))
             elif criterion == "attendance":
@@ -275,29 +297,36 @@ def _has_makeups(player_id: int, coach_id: int) -> bool:
 
 
 def _level_ids_one_above(vacancy_level, coach_id: int) -> set:
-    """Return the set of level IDs that are one step above vacancy_level (closest higher level)."""
-    from padel_app.models.coach_levels import CoachLevel
-    levels_above = [
-        lv for lv in CoachLevel.query.filter_by(coach_id=coach_id).all()
-        if lv.display_order < vacancy_level.display_order
-    ]
-    if not levels_above:
+    """Level IDs sitting exactly one step ABOVE (stronger than) ``vacancy_level``.
+
+    PAD-70: adjacency is a question about the coach's ladder POSITION, not about
+    the ``display_order`` integers. Comparing the raw values treats a level with
+    an unset order (``NULL`` / the column default ``0``) as the coach's
+    strongest level and collapses duplicated orders into a single step, which is
+    how a "5-" student got invited as if they were one level above a "4"
+    vacancy. See ``padel_app/services/level_ladder.py``.
+
+    Returns an empty set when the vacancy sits at the top of the ladder, or when
+    its level does not belong to this coach.
+    """
+    ladder = get_level_ladder(coach_id)
+    index = ladder_index(ladder, getattr(vacancy_level, "id", None))
+    if index is None or index == 0:
         return set()
-    max_order = max(lv.display_order for lv in levels_above)
-    return {lv.id for lv in levels_above if lv.display_order == max_order}
+    return {ladder[index - 1].id}
 
 
 def _level_ids_one_below(vacancy_level, coach_id: int) -> set:
-    """Return the set of level IDs that are one step below vacancy_level (closest lower level)."""
-    from padel_app.models.coach_levels import CoachLevel
-    levels_below = [
-        lv for lv in CoachLevel.query.filter_by(coach_id=coach_id).all()
-        if lv.display_order > vacancy_level.display_order
-    ]
-    if not levels_below:
+    """Level IDs sitting exactly one step BELOW (weaker than) ``vacancy_level``.
+
+    Positional, for the same reasons as :func:`_level_ids_one_above`. Empty when
+    the vacancy sits at the bottom of the ladder.
+    """
+    ladder = get_level_ladder(coach_id)
+    index = ladder_index(ladder, getattr(vacancy_level, "id", None))
+    if index is None or index >= len(ladder) - 1:
         return set()
-    min_order = min(lv.display_order for lv in levels_below)
-    return {lv.id for lv in levels_below if lv.display_order == min_order}
+    return {ladder[index + 1].id}
 
 
 def _compare(value, op: str, threshold) -> bool:
@@ -325,8 +354,6 @@ def _passes_group_rules(rules: list, cp: Association_CoachPlayer, vacancy: Vacan
                 continue  # No level on vacancy → skip this filter
             if cp.level is None:
                 return False
-            vd = vacancy.level.display_order
-            cd = cp.level.display_order
             if op == "same_as_vacancy":
                 if cp.level_id != vacancy.level_id:
                     return False
@@ -336,11 +363,17 @@ def _passes_group_rules(rules: list, cp: Association_CoachPlayer, vacancy: Vacan
             elif op == "one_below_vacancy":
                 if cp.level_id not in _level_ids_one_below(vacancy.level, coach_id):
                     return False
-            elif op == "all_above_vacancy":
-                if cd >= vd:
+            elif op in ("all_above_vacancy", "all_below_vacancy"):
+                # PAD-70: compare ladder POSITIONS (0 = strongest), never the raw
+                # display_order values — see level_ladder.py.
+                ladder = get_level_ladder(coach_id)
+                vd = ladder_index(ladder, vacancy.level_id)
+                cd = ladder_index(ladder, cp.level_id)
+                if vd is None or cd is None:
                     return False
-            elif op == "all_below_vacancy":
-                if cd <= vd:
+                if op == "all_above_vacancy" and cd >= vd:
+                    return False
+                if op == "all_below_vacancy" and cd <= vd:
                     return False
 
         elif attr == "side":
@@ -675,6 +708,20 @@ def _send_system_message(
     from padel_app.serializers.message import serialize_message
     from padel_app.utils.expo_push import send_expo_push_to_user
 
+    # PAD-67 backstop: never deliver an empty message. Template resolution
+    # (``resolve_message_template``) already substitutes a built-in default for a
+    # missing/blank template, so reaching here with blank text means the rendered
+    # body genuinely has nothing to say — sending it would only produce the empty
+    # chat bubbles + empty push notifications reported in the ticket.
+    if not (text or "").strip():
+        from flask import current_app, has_app_context
+        if has_app_context():
+            current_app.logger.warning(
+                "_send_system_message: refusing to send an empty %s message to user %s",
+                message_type, player_user_id,
+            )
+        return None
+
     conv = _get_or_create_direct_conversation(coach_user_id, player_user_id)
     msg = Message(
         text=text,
@@ -808,10 +855,28 @@ def _user_id_for_player(player_id: int) -> int | None:
     return player.user_id if player else None
 
 
+def _instance_is_over(instance: LessonInstance, now: datetime | None = None) -> bool:
+    """True when a class can no longer accept attendance changes or invitations.
+
+    PAD-68: a class that has already started (or was canceled/completed) is
+    "closed" — nothing about its roster can usefully change any more. Every
+    notification path that could send a message or move a player must consult
+    this before acting, so a late response to a stale reminder/invite can never
+    resurrect the invitation engine for a class that already happened.
+    """
+    if instance is None:
+        return True
+    if instance.status in ("canceled", "completed"):
+        return True
+    _now = now or utcnow_naive()
+    return instance.start_datetime is not None and instance.start_datetime <= _now
+
+
 def _effective_filled_spots(instance: LessonInstance) -> int:
-    enrolled = len(instance.players_relations)
-    absent = sum(1 for p in instance.presences if p.status == "absent")
-    return max(0, enrolled - absent)
+    # Delegates to the single source of truth on the model (PAD-71) so the
+    # invitation engine, the calendar payload and the class-detail capacity
+    # field can never drift apart.
+    return instance.effective_filled_spots
 
 
 def _add_player_to_instance(player_id: int, instance: LessonInstance) -> None:
@@ -844,6 +909,7 @@ def _broadcast_spot_filled(
     coach_user_id: int,
     templates: dict,
     vacancy_id: int | None = None,
+    locale: str | None = None,
 ) -> None:
     """
     Mark all other 'sent' events as expired, update their invite messages,
@@ -852,7 +918,7 @@ def _broadcast_spot_filled(
     from padel_app.models import Message
     from padel_app.serializers.message import serialize_message
 
-    spot_filled_text = templates.get("spot_filled", DEFAULT_MESSAGE_TEMPLATES["spot_filled"])
+    spot_filled_text = resolve_message_template(templates, "spot_filled", locale)
 
     query = NotificationEvent.query.filter(
         NotificationEvent.status == "sent",
@@ -1089,7 +1155,7 @@ def send_class_reminders(instance_id: int, *, now: datetime | None = None) -> di
 
         template_key = "reminder_followup" if sent_count > 0 else "reminder"
         text = _format_template(
-            templates.get(template_key, DEFAULT_MESSAGE_TEMPLATES[template_key]),
+            resolve_message_template(templates, template_key, locale),
             name=player_name,
             level=level_code,
             weekday=weekday,
@@ -1141,6 +1207,135 @@ def send_class_reminders(instance_id: int, *, now: datetime | None = None) -> di
     return {"sent": sent_this_round, "more_due": more_due}
 
 
+def _expire_stale_reminders(instance: LessonInstance, player_user_id: int) -> None:
+    """Flag every un-actioned reminder for (player, instance) as expired.
+
+    PAD-68: PAD-49 only supersedes older reminders when a *newer* one is sent, so
+    the last reminder of a series stays actionable forever. Once the class is
+    over there will never be a newer reminder, so nothing ever retires it. This
+    retires them explicitly — reusing the existing ``superseded`` flag the UI
+    already renders as "reminder expired", so no client change is required for
+    the flag to take effect.
+    """
+    from padel_app.models import Coach, Message
+    from padel_app.serializers.message import serialize_message
+
+    coach_rel = Association_CoachLessonInstance.query.filter_by(
+        lesson_instance_id=instance.id
+    ).first()
+    coach = Coach.query.get(coach_rel.coach_id) if coach_rel else None
+    if not coach or not coach.user_id:
+        return
+
+    conv = _get_or_create_direct_conversation(coach.user_id, player_user_id)
+    reminders = Message.query.filter_by(
+        conversation_id=conv.id,
+        message_type="notification_reminder",
+    ).all()
+    for m in reminders:
+        if (
+            m.msg_metadata
+            and m.msg_metadata.get("lessonInstanceId") == instance.id
+            and not m.msg_metadata.get("responded")
+            and not m.msg_metadata.get("superseded")
+        ):
+            m.msg_metadata = {**m.msg_metadata, "superseded": True, "expired": True}
+            m.save()
+            publish({"type": "message_edited", "payload": serialize_message(m, None)})
+
+
+def _retire_invite_message(event: NotificationEvent) -> None:
+    """Flag the conversation message that delivered ``event`` as no longer live.
+
+    PAD-68: reuses the ``responded`` flag the invite bubble already keys off, so
+    the Yes/No buttons stop rendering on both web and mobile with no client
+    change. ``response`` is set to ``"expired"`` — neither "yes" nor "no" — which
+    both clients already fall through to a neutral non-actionable badge.
+    """
+    from padel_app.models import Message
+    from padel_app.serializers.message import serialize_message
+
+    if not event.message_id:
+        return
+    msg = Message.query.get(event.message_id)
+    if msg is None or msg.msg_metadata is None:
+        return
+    if msg.msg_metadata.get("responded"):
+        return
+    msg.msg_metadata = {**msg.msg_metadata, "responded": True, "response": "expired"}
+    msg.save()
+    publish({"type": "message_edited", "payload": serialize_message(msg, None)})
+
+
+def _expire_stale_invitations(instance: LessonInstance) -> int:
+    """Retire every un-actioned invitation for a class that is already over.
+
+    PAD-68 follow-up: the first pass retired stale *reminders* but pending
+    *invitations* stayed live — a student could still tap "yes" on an invite for
+    a class that already happened. This moves every NotificationEvent still in
+    ``sent``/``queued`` to the existing terminal ``expired`` status, flags the
+    invite message so the client stops offering buttons, and closes any vacancy
+    that is still open (nothing can fill a class that already happened).
+
+    Idempotent: a second call finds nothing in ``sent``/``queued`` and nothing
+    un-``responded``, so repeated taps are no-ops.
+
+    Callers must have already established that the class is over via
+    ``_instance_is_over`` — there is deliberately only one staleness rule.
+    """
+    pending = NotificationEvent.query.filter(
+        NotificationEvent.lesson_instance_id == instance.id,
+        NotificationEvent.status.in_(("sent", "queued")),
+    ).all()
+
+    for event in pending:
+        event.status = "expired"
+        event.save()
+        _retire_invite_message(event)
+
+    open_vacancies = Vacancy.query.filter_by(
+        lesson_instance_id=instance.id, status="open"
+    ).all()
+    for vacancy in open_vacancies:
+        vacancy.status = "expired"
+        vacancy.save()
+
+    return len(pending)
+
+
+def expire_stale_invitations(*, now: datetime | None = None) -> int:
+    """Sweep every class that is over and retire its still-pending invitations.
+
+    PAD-68 follow-up: the lazy guards only fire when *someone responds*. An
+    invitation nobody ever answers — the common case for a class that quietly
+    passed — would stay live forever. This sweep runs from the existing
+    two-minute ``process_batches`` APScheduler job so stale invites are retired
+    without requiring any user action.
+
+    Returns the number of NotificationEvent rows retired.
+    """
+    _now = now or utcnow_naive()
+
+    instance_ids = [
+        row[0]
+        for row in NotificationEvent.query
+        .with_entities(NotificationEvent.lesson_instance_id)
+        .filter(NotificationEvent.status.in_(("sent", "queued")))
+        .distinct()
+        .all()
+    ]
+
+    retired = 0
+    for instance_id in instance_ids:
+        instance = LessonInstance.query.get(instance_id)
+        if instance is None:
+            continue
+        if not _instance_is_over(instance, _now):
+            continue
+        retired += _expire_stale_invitations(instance)
+    return retired
+
+
 def respond_to_reminder(
     lesson_instance_id: int,
     action: str,
@@ -1151,6 +1346,12 @@ def respond_to_reminder(
     """
     Called when a player presses Yes or No on a reminder message.
     action: "yes" | "no"
+
+    PAD-68: a reminder for a class that has already started (or was
+    canceled/completed) is *expired*. Responding to it is a no-op: the answer is
+    not recorded against attendance and it never creates a vacancy or fans out
+    replacement invitations for a class that already happened. The stale
+    reminder message is flagged so the UI stops offering Yes/No.
     """
     from padel_app.models import Coach, Player
 
@@ -1161,10 +1362,29 @@ def respond_to_reminder(
         from flask import abort
         abort(403)
 
+    _now = now or utcnow_naive()
+    if _instance_is_over(instance, _now):
+        _expire_stale_reminders(instance, acting_user_id)
+        # The class is over for everyone, not just this student: retire any
+        # invitation still offering a spot in it.
+        _expire_stale_invitations(instance)
+        return {"action": "expired"}
+
     presence = Presence.query.filter_by(
         player_id=player.id,
         lesson_instance_id=lesson_instance_id,
     ).first()
+    if presence is None:
+        # PAD-69: a response must always be durably recorded. Without a Presence
+        # row the answer is silently dropped and the next reminder pass sees the
+        # student as "never responded" and re-reminds them.
+        presence = Presence(
+            lesson_instance_id=lesson_instance_id,
+            player_id=player.id,
+            invited=True,
+            confirmed=False,
+        )
+        presence.create()
 
     coach_rel = Association_CoachLessonInstance.query.filter_by(
         lesson_instance_id=lesson_instance_id
@@ -1173,7 +1393,12 @@ def respond_to_reminder(
     coach_user_id = coach.user_id if coach else None
 
     config = get_or_create_config(coach.id) if coach else None
-    templates = config.get_message_templates() if config else DEFAULT_MESSAGE_TEMPLATES
+    locale = _resolve_locale(coach)
+    templates = (
+        config.get_message_templates(locale)
+        if config
+        else dict(default_templates_for_locale(locale))
+    )
 
     # Mark the reminder message as responded so the frontend shows the badge on reload
     if coach_user_id:
@@ -1210,7 +1435,7 @@ def respond_to_reminder(
             _send_system_message(
                 coach_user_id,
                 acting_user_id,
-                templates.get("reminder_confirmed", DEFAULT_MESSAGE_TEMPLATES["reminder_confirmed"]),
+                resolve_message_template(templates, "reminder_confirmed", locale),
                 class_instance_id=instance.id,
             )
         return {"action": "confirmed"}
@@ -1225,6 +1450,7 @@ def respond_to_reminder(
             acting_user_id,
             config,
             templates,
+            locale=locale,
             now=now,
         )
         return {"action": "declined"}
@@ -1242,6 +1468,7 @@ def _free_spot_for_declining_player(
     config,
     templates: dict,
     *,
+    locale: str | None = None,
     now: datetime | None = None,
 ) -> None:
     """Revert a player to "not attending" and free their spot.
@@ -1261,7 +1488,7 @@ def _free_spot_for_declining_player(
         _send_system_message(
             coach_user_id,
             acting_user_id,
-            templates.get("reminder_declined", DEFAULT_MESSAGE_TEMPLATES["reminder_declined"]),
+            resolve_message_template(templates, "reminder_declined", locale),
             class_instance_id=instance.id,
         )
 
@@ -1328,7 +1555,12 @@ def cancel_attendance(
     coach_user_id = coach.user_id if coach else None
 
     config = get_or_create_config(coach.id) if coach else None
-    templates = config.get_message_templates() if config else DEFAULT_MESSAGE_TEMPLATES
+    locale = _resolve_locale(coach)
+    templates = (
+        config.get_message_templates(locale)
+        if config
+        else dict(default_templates_for_locale(locale))
+    )
 
     # Flag late cancellations: at/after the deadline (start - cancellationDeadlineHours)
     # but still before start. The spot is freed either way.
@@ -1353,7 +1585,6 @@ def cancel_attendance(
     # that computes lateness — keeping a single emission point avoids duplicates and
     # a false "late" flag on plain reminder declines.
     if coach_user_id:
-        locale = _resolve_locale(coach)
         _notify_coach_of_cancellation(
             coach_user_id,
             acting_user_id,
@@ -1397,6 +1628,7 @@ def cancel_attendance(
         acting_user_id,
         config,
         templates,
+        locale=locale,
         now=now,
     )
     return {"action": "declined"}
@@ -1448,12 +1680,26 @@ def _send_invitation_batch(
     config: NotificationConfig,
     coach_id: int,
     max_sim_override: int | None = None,
+    *,
+    now: datetime | None = None,
 ) -> list[dict]:
     """
     Send the next batch of invitations for this vacancy.
     Returns list of {id, name} for players notified.
+
+    PAD-68: this is the single chokepoint every automatic invitation message
+    flows through. A class that has already started can never be filled, so the
+    vacancy is expired here instead of inviting anyone — this backstops every
+    caller (trigger_invitations, process_invitation_batches, _advance_round,
+    _send_next_on_decline) including late responses to stale messages.
     """
     from padel_app.models import Coach, Player
+
+    if _instance_is_over(instance, now):
+        if vacancy.status == "open":
+            vacancy.status = "expired"
+            vacancy.save()
+        return []
 
     # Check waiting list before doing a fresh invite round
     wl_entry = _check_waiting_list(vacancy, instance, coach_id, config, vacancy.current_round_number)
@@ -1523,7 +1769,7 @@ def _send_invitation_batch(
         event.create()
 
         text = _format_template(
-            templates.get("invite", DEFAULT_MESSAGE_TEMPLATES["invite"]),
+            resolve_message_template(templates, "invite", locale),
             name=player_name,
             level=level_code,
             weekday=weekday,
@@ -1541,8 +1787,11 @@ def _send_invitation_batch(
                 "responded": False,
             },
         )
-        event.message_id = msg.id
-        event.save()
+        # _send_system_message returns None only if the body came out empty
+        # (PAD-67 backstop); the event still exists, just without a chat message.
+        if msg is not None:
+            event.message_id = msg.id
+            event.save()
 
         notified.append({"id": str(cp.player_id), "name": player_name})
 
@@ -1643,6 +1892,9 @@ def trigger_invitations(
         return []
     if not instance.notifications_enabled:
         return []
+    # PAD-68: never open/refresh vacancies for a class that already happened.
+    if _instance_is_over(instance, now):
+        return []
 
     semi_auto = _is_semi_auto(config)
     open_vacancies: list[Vacancy] | None = None
@@ -1678,7 +1930,7 @@ def trigger_invitations(
 
     all_notified: list[dict] = []
     for vacancy in sendable:
-        notified = _send_invitation_batch(vacancy, instance, config, coach_id)
+        notified = _send_invitation_batch(vacancy, instance, config, coach_id, now=_now)
         all_notified.extend(notified)
 
     if all_notified:
@@ -1705,8 +1957,16 @@ def process_invitation_batches(*, now: datetime | None = None) -> int:
     Returns count of vacancies where a batch was sent.
 
     Pass ``now`` in tests to control the current time without waiting for real time to pass.
+
+    PAD-68 follow-up: this pass also retires invitations that are still pending
+    for classes that already happened. It is hooked here rather than on a new
+    APScheduler job because this is already the periodic notification-engine
+    tick (every 2 minutes, ``process_batches``), so no new job registration or
+    jobstore entry is needed, and the sweep must run whether or not the class
+    still has an open vacancy.
     """
     _now = now or utcnow_naive()
+    expire_stale_invitations(now=_now)
     open_vacancies = Vacancy.query.filter_by(status="open").all()
     processed = 0
 
@@ -1738,7 +1998,7 @@ def process_invitation_batches(*, now: datetime | None = None) -> int:
 
         # Fresh vacancy (no batch sent yet) — trigger immediately
         if last is None:
-            _send_invitation_batch(vacancy, instance, config, vacancy.coach_id)
+            _send_invitation_batch(vacancy, instance, config, vacancy.coach_id, now=_now)
             processed += 1
             continue
 
@@ -1747,7 +2007,7 @@ def process_invitation_batches(*, now: datetime | None = None) -> int:
         if max_inactive.get("enabled"):
             threshold = timedelta(minutes=max_inactive["value"])
             if _now - last >= threshold:
-                _send_invitation_batch(vacancy, instance, config, vacancy.coach_id)
+                _send_invitation_batch(vacancy, instance, config, vacancy.coach_id, now=_now)
                 processed += 1
 
     return processed
@@ -1757,7 +2017,13 @@ def process_invitation_batches(*, now: datetime | None = None) -> int:
 # Respond to notification (player presses Yes / No on invite)
 # ---------------------------------------------------------------------------
 
-def respond_to_notification(notification_event_id: int, action: str, acting_user_id: int) -> dict:
+def respond_to_notification(
+    notification_event_id: int,
+    action: str,
+    acting_user_id: int,
+    *,
+    now: datetime | None = None,
+) -> dict:
     from flask import abort
     from padel_app.models import Coach, Message, Player
     from padel_app.serializers.message import serialize_message
@@ -1768,10 +2034,22 @@ def respond_to_notification(notification_event_id: int, action: str, acting_user
     if not player or player.user_id != acting_user_id:
         abort(403, "Not authorized to respond to this notification")
 
+    # PAD-68: a late response to an invitation for a class that already happened
+    # must not enrol anyone, free anyone, or trigger the next invitation round.
+    # Every pending invite for the class is retired here, not just this one — the
+    # class is over for everyone who was offered the spot.
+    if _instance_is_over(event.lesson_instance, now):
+        _expire_stale_invitations(event.lesson_instance)
+        # The event may already have been out of sent/queued (so the sweep above
+        # skipped it) while its message was still showing live buttons.
+        _retire_invite_message(event)
+        return {"action": "expired"}
+
     config = get_or_create_config(event.coach_id)
-    templates = config.get_message_templates()
 
     coach = Coach.query.get(event.coach_id)
+    locale = _resolve_locale(coach)
+    templates = config.get_message_templates(locale)
     coach_user_id = coach.user_id if coach else None
     player_user_id = acting_user_id
 
@@ -1804,7 +2082,7 @@ def respond_to_notification(notification_event_id: int, action: str, acting_user
             _send_system_message(
                 coach_user_id,
                 player_user_id,
-                templates.get("decline", DEFAULT_MESSAGE_TEMPLATES["decline"]),
+                resolve_message_template(templates, "decline", locale),
                 class_instance_id=instance.id,
             )
 
@@ -1827,10 +2105,10 @@ def respond_to_notification(notification_event_id: int, action: str, acting_user
                 _send_system_message(
                     coach_user_id,
                     player_user_id,
-                    templates.get("spot_filled", DEFAULT_MESSAGE_TEMPLATES["spot_filled"]),
+                    resolve_message_template(templates, "spot_filled", locale),
                     class_instance_id=instance.id,
                 )
-            _offer_waiting_list(event.player_id, instance, event.coach_id, templates)
+            _offer_waiting_list(event.player_id, instance, event.coach_id, templates, locale)
             publish({
                 "type": "notification_responded",
                 "payload": {
@@ -1849,10 +2127,10 @@ def respond_to_notification(notification_event_id: int, action: str, acting_user
                 _send_system_message(
                     coach_user_id,
                     player_user_id,
-                    templates.get("spot_filled", DEFAULT_MESSAGE_TEMPLATES["spot_filled"]),
+                    resolve_message_template(templates, "spot_filled", locale),
                     class_instance_id=instance.id,
                 )
-            _offer_waiting_list(event.player_id, instance, event.coach_id, templates)
+            _offer_waiting_list(event.player_id, instance, event.coach_id, templates, locale)
             publish({
                 "type": "notification_responded",
                 "payload": {
@@ -1878,7 +2156,7 @@ def respond_to_notification(notification_event_id: int, action: str, acting_user
             _send_system_message(
                 coach_user_id,
                 player_user_id,
-                templates.get("confirm", DEFAULT_MESSAGE_TEMPLATES["confirm"]),
+                resolve_message_template(templates, "confirm", locale),
                 class_instance_id=instance.id,
             )
             _broadcast_spot_filled(
@@ -1887,6 +2165,7 @@ def respond_to_notification(notification_event_id: int, action: str, acting_user
                 coach_user_id,
                 templates,
                 vacancy_id=vacancy.id if vacancy else None,
+                locale=locale,
             )
 
         publish({
@@ -1902,12 +2181,25 @@ def respond_to_notification(notification_event_id: int, action: str, acting_user
     return {"action": "unknown"}
 
 
-def coach_respond_to_notification(notification_event_id: int, action: str, coach_id: int) -> dict:
+def coach_respond_to_notification(
+    notification_event_id: int,
+    action: str,
+    coach_id: int,
+    *,
+    now: datetime | None = None,
+) -> dict:
     from flask import abort
 
     event = NotificationEvent.query.get_or_404(notification_event_id)
     if event.coach_id != coach_id:
         abort(403, "Not authorized")
+
+    # PAD-68: the coach recording a late answer must not enrol anyone into a
+    # class that already happened either — same staleness rule as the player path.
+    if _instance_is_over(event.lesson_instance, now):
+        _expire_stale_invitations(event.lesson_instance)
+        _retire_invite_message(event)
+        return {"action": "expired"}
 
     instance = event.lesson_instance
     vacancy = event.vacancy
@@ -1998,7 +2290,7 @@ def send_manual_notifications(
             time_str = instance.start_datetime.strftime("%H:%M") if instance.start_datetime else ""
 
             text = _format_template(
-                templates.get("invite", DEFAULT_MESSAGE_TEMPLATES["invite"]),
+                resolve_message_template(templates, "invite", locale),
                 name=player_name,
                 level=level_code,
                 weekday=weekday,
@@ -2016,8 +2308,9 @@ def send_manual_notifications(
                     "responded": False,
                 },
             )
-            event.message_id = msg.id
-            event.save()
+            if msg is not None:
+                event.message_id = msg.id
+                event.save()
 
         events.append(event)
 
@@ -2042,6 +2335,7 @@ def _offer_waiting_list(
     instance: LessonInstance,
     coach_id: int,
     templates: dict,
+    locale: str | None = None,
 ) -> None:
     """Send a waiting-list offer message to the player."""
     from padel_app.models import Coach
@@ -2052,7 +2346,7 @@ def _offer_waiting_list(
     if not player_user_id:
         return
 
-    text = templates.get("waiting_list_offer", DEFAULT_MESSAGE_TEMPLATES["waiting_list_offer"])
+    text = resolve_message_template(templates, "waiting_list_offer", locale)
     _send_system_message(
         coach_user_id=coach.user_id,
         player_user_id=player_user_id,
@@ -2069,7 +2363,16 @@ def respond_to_waiting_list(
     lesson_instance_id: int,
     action: str,
     acting_user_id: int,
+    *,
+    now: datetime | None = None,
 ) -> dict:
+    """
+    Called when a player presses Yes or No on a waiting-list offer.
+
+    PAD-68: joining the waiting list for a class that already happened is
+    meaningless — the entry could never be filled — so a late answer is a no-op
+    and any invitation still pending for that class is retired.
+    """
     from padel_app.models import Coach, Player
 
     instance = LessonInstance.query.get_or_404(lesson_instance_id)
@@ -2079,6 +2382,10 @@ def respond_to_waiting_list(
         from flask import abort
         abort(403)
 
+    if _instance_is_over(instance, now):
+        _expire_stale_invitations(instance)
+        return {"action": "expired"}
+
     coach_rel = Association_CoachLessonInstance.query.filter_by(
         lesson_instance_id=lesson_instance_id
     ).first()
@@ -2087,7 +2394,8 @@ def respond_to_waiting_list(
         return {"action": "unknown"}
 
     config = get_or_create_config(coach.id)
-    templates = config.get_message_templates()
+    locale = _resolve_locale(coach)
+    templates = config.get_message_templates(locale)
 
     if action == "yes":
         # Upsert waiting list entry
@@ -2109,7 +2417,7 @@ def respond_to_waiting_list(
             _send_system_message(
                 coach_user_id=coach.user_id,
                 player_user_id=acting_user_id,
-                text=templates.get("waiting_list_confirm", DEFAULT_MESSAGE_TEMPLATES["waiting_list_confirm"]),
+                text=resolve_message_template(templates, "waiting_list_confirm", locale),
                 class_instance_id=instance.id,
             )
         return {"action": "added_to_waiting_list"}
@@ -2270,7 +2578,7 @@ def _fill_from_waiting_list(
     time_str = instance.start_datetime.strftime("%H:%M") if instance.start_datetime else ""
 
     text = _format_template(
-        templates.get("waiting_list_placed", DEFAULT_MESSAGE_TEMPLATES["waiting_list_placed"]),
+        resolve_message_template(templates, "waiting_list_placed", locale),
         name=player_name,
         level=level_code,
         weekday=weekday,
