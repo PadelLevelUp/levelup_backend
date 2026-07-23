@@ -57,6 +57,11 @@ from padel_app.models.notification_config import (
     DEFAULT_ROUNDS,
 )
 from padel_app.realtime import publish
+from padel_app.services.level_ladder import (
+    get_level_ladder,
+    ladder_index,
+    ladder_index_map,
+)
 from padel_app.utils.push_notifications import send_push_notification
 
 
@@ -147,10 +152,19 @@ def _is_semi_auto(config: NotificationConfig) -> bool:
 # Student ranking helpers
 # ---------------------------------------------------------------------------
 
-def _level_sort_key(coach_player: Association_CoachPlayer) -> int:
-    if coach_player.level:
-        return coach_player.level.display_order
-    return 9999
+def _level_sort_key(coach_player: Association_CoachPlayer, ladder: dict | None = None) -> int:
+    """Rank a candidate by their position in the coach's ladder (0 = strongest).
+
+    ``ladder`` is a ``{level_id: position}`` map (see level_ladder.py). Without
+    one — the only caller that has no vacancy to derive the coach from — this
+    falls back to the raw ``display_order``. Players with no level always sort
+    last.
+    """
+    if not coach_player.level:
+        return 9999
+    if ladder is not None:
+        return ladder.get(coach_player.level_id, 9999)
+    return coach_player.level.display_order or 9999
 
 
 # ---------------------------------------------------------------------------
@@ -210,13 +224,16 @@ def _attendance_stats(player_id: int) -> tuple[float, float]:
 def _build_sort_key(criteria: list[dict], player_stats: dict, vacancy: Vacancy = None):
     enabled = [c["id"] for c in criteria if c.get("enabled")]
     vacancy_side = getattr(vacancy, "side", None)
+    # PAD-70: rank by ladder position, not by the raw display_order integer.
+    vacancy_coach_id = getattr(vacancy, "coach_id", None)
+    ladder = ladder_index_map(vacancy_coach_id) if vacancy_coach_id else None
 
     def key(cp: Association_CoachPlayer):
         parts = []
         stats = player_stats.get(cp.player_id, {})
         for criterion in enabled:
             if criterion == "level":
-                parts.append(_level_sort_key(cp))
+                parts.append(_level_sort_key(cp, ladder))
             elif criterion == "justified_misses":
                 parts.append(-stats.get("justified_miss_rate", 0.0))
             elif criterion == "attendance":
@@ -275,29 +292,36 @@ def _has_makeups(player_id: int, coach_id: int) -> bool:
 
 
 def _level_ids_one_above(vacancy_level, coach_id: int) -> set:
-    """Return the set of level IDs that are one step above vacancy_level (closest higher level)."""
-    from padel_app.models.coach_levels import CoachLevel
-    levels_above = [
-        lv for lv in CoachLevel.query.filter_by(coach_id=coach_id).all()
-        if lv.display_order < vacancy_level.display_order
-    ]
-    if not levels_above:
+    """Level IDs sitting exactly one step ABOVE (stronger than) ``vacancy_level``.
+
+    PAD-70: adjacency is a question about the coach's ladder POSITION, not about
+    the ``display_order`` integers. Comparing the raw values treats a level with
+    an unset order (``NULL`` / the column default ``0``) as the coach's
+    strongest level and collapses duplicated orders into a single step, which is
+    how a "5-" student got invited as if they were one level above a "4"
+    vacancy. See ``padel_app/services/level_ladder.py``.
+
+    Returns an empty set when the vacancy sits at the top of the ladder, or when
+    its level does not belong to this coach.
+    """
+    ladder = get_level_ladder(coach_id)
+    index = ladder_index(ladder, getattr(vacancy_level, "id", None))
+    if index is None or index == 0:
         return set()
-    max_order = max(lv.display_order for lv in levels_above)
-    return {lv.id for lv in levels_above if lv.display_order == max_order}
+    return {ladder[index - 1].id}
 
 
 def _level_ids_one_below(vacancy_level, coach_id: int) -> set:
-    """Return the set of level IDs that are one step below vacancy_level (closest lower level)."""
-    from padel_app.models.coach_levels import CoachLevel
-    levels_below = [
-        lv for lv in CoachLevel.query.filter_by(coach_id=coach_id).all()
-        if lv.display_order > vacancy_level.display_order
-    ]
-    if not levels_below:
+    """Level IDs sitting exactly one step BELOW (weaker than) ``vacancy_level``.
+
+    Positional, for the same reasons as :func:`_level_ids_one_above`. Empty when
+    the vacancy sits at the bottom of the ladder.
+    """
+    ladder = get_level_ladder(coach_id)
+    index = ladder_index(ladder, getattr(vacancy_level, "id", None))
+    if index is None or index >= len(ladder) - 1:
         return set()
-    min_order = min(lv.display_order for lv in levels_below)
-    return {lv.id for lv in levels_below if lv.display_order == min_order}
+    return {ladder[index + 1].id}
 
 
 def _compare(value, op: str, threshold) -> bool:
@@ -325,8 +349,6 @@ def _passes_group_rules(rules: list, cp: Association_CoachPlayer, vacancy: Vacan
                 continue  # No level on vacancy → skip this filter
             if cp.level is None:
                 return False
-            vd = vacancy.level.display_order
-            cd = cp.level.display_order
             if op == "same_as_vacancy":
                 if cp.level_id != vacancy.level_id:
                     return False
@@ -336,11 +358,17 @@ def _passes_group_rules(rules: list, cp: Association_CoachPlayer, vacancy: Vacan
             elif op == "one_below_vacancy":
                 if cp.level_id not in _level_ids_one_below(vacancy.level, coach_id):
                     return False
-            elif op == "all_above_vacancy":
-                if cd >= vd:
+            elif op in ("all_above_vacancy", "all_below_vacancy"):
+                # PAD-70: compare ladder POSITIONS (0 = strongest), never the raw
+                # display_order values — see level_ladder.py.
+                ladder = get_level_ladder(coach_id)
+                vd = ladder_index(ladder, vacancy.level_id)
+                cd = ladder_index(ladder, cp.level_id)
+                if vd is None or cd is None:
                     return False
-            elif op == "all_below_vacancy":
-                if cd <= vd:
+                if op == "all_above_vacancy" and cd >= vd:
+                    return False
+                if op == "all_below_vacancy" and cd <= vd:
                     return False
 
         elif attr == "side":
