@@ -1,3 +1,5 @@
+from sqlalchemy.orm import selectinload
+
 from padel_app.tools.calendar_tools import expand_occurrences
 from padel_app.models import (
     Lesson,
@@ -36,6 +38,14 @@ def load_lesson_instances_for_coach(coach_id, range_start, range_end):
     instances = (
         LessonInstance.query
         .join(Lesson)
+        # PAD-71: the serialized event's participantCount reads
+        # LessonInstance.effective_filled_spots, which walks both
+        # players_relations and presences — eager-load them so a week of
+        # classes stays at a constant number of queries.
+        .options(
+            selectinload(LessonInstance.players_relations),
+            selectinload(LessonInstance.presences),
+        )
         .filter(
             LessonInstance.start_datetime >= range_start,
             LessonInstance.start_datetime <= range_end,
