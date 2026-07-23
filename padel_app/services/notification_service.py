@@ -15,6 +15,7 @@ Handles reminders, vacancy-based invitations, waiting list, and manual notificat
   - process_invitation_batches()                 recurring APScheduler job (every 2 min)
   - respond_to_notification(...)                 player presses Yes/No on invite
   - coach_respond_to_notification(...)           coach manually records a response
+  - expire_stale_invitations()                   retire pending invites for classes that are over
 
   Manual notifications
   - send_manual_notifications(...)               coach hand-picks players
@@ -1195,6 +1196,98 @@ def _expire_stale_reminders(instance: LessonInstance, player_user_id: int) -> No
             publish({"type": "message_edited", "payload": serialize_message(m, None)})
 
 
+def _retire_invite_message(event: NotificationEvent) -> None:
+    """Flag the conversation message that delivered ``event`` as no longer live.
+
+    PAD-68: reuses the ``responded`` flag the invite bubble already keys off, so
+    the Yes/No buttons stop rendering on both web and mobile with no client
+    change. ``response`` is set to ``"expired"`` — neither "yes" nor "no" — which
+    both clients already fall through to a neutral non-actionable badge.
+    """
+    from padel_app.models import Message
+    from padel_app.serializers.message import serialize_message
+
+    if not event.message_id:
+        return
+    msg = Message.query.get(event.message_id)
+    if msg is None or msg.msg_metadata is None:
+        return
+    if msg.msg_metadata.get("responded"):
+        return
+    msg.msg_metadata = {**msg.msg_metadata, "responded": True, "response": "expired"}
+    msg.save()
+    publish({"type": "message_edited", "payload": serialize_message(msg, None)})
+
+
+def _expire_stale_invitations(instance: LessonInstance) -> int:
+    """Retire every un-actioned invitation for a class that is already over.
+
+    PAD-68 follow-up: the first pass retired stale *reminders* but pending
+    *invitations* stayed live — a student could still tap "yes" on an invite for
+    a class that already happened. This moves every NotificationEvent still in
+    ``sent``/``queued`` to the existing terminal ``expired`` status, flags the
+    invite message so the client stops offering buttons, and closes any vacancy
+    that is still open (nothing can fill a class that already happened).
+
+    Idempotent: a second call finds nothing in ``sent``/``queued`` and nothing
+    un-``responded``, so repeated taps are no-ops.
+
+    Callers must have already established that the class is over via
+    ``_instance_is_over`` — there is deliberately only one staleness rule.
+    """
+    pending = NotificationEvent.query.filter(
+        NotificationEvent.lesson_instance_id == instance.id,
+        NotificationEvent.status.in_(("sent", "queued")),
+    ).all()
+
+    for event in pending:
+        event.status = "expired"
+        event.save()
+        _retire_invite_message(event)
+
+    open_vacancies = Vacancy.query.filter_by(
+        lesson_instance_id=instance.id, status="open"
+    ).all()
+    for vacancy in open_vacancies:
+        vacancy.status = "expired"
+        vacancy.save()
+
+    return len(pending)
+
+
+def expire_stale_invitations(*, now: datetime | None = None) -> int:
+    """Sweep every class that is over and retire its still-pending invitations.
+
+    PAD-68 follow-up: the lazy guards only fire when *someone responds*. An
+    invitation nobody ever answers — the common case for a class that quietly
+    passed — would stay live forever. This sweep runs from the existing
+    two-minute ``process_batches`` APScheduler job so stale invites are retired
+    without requiring any user action.
+
+    Returns the number of NotificationEvent rows retired.
+    """
+    _now = now or utcnow_naive()
+
+    instance_ids = [
+        row[0]
+        for row in NotificationEvent.query
+        .with_entities(NotificationEvent.lesson_instance_id)
+        .filter(NotificationEvent.status.in_(("sent", "queued")))
+        .distinct()
+        .all()
+    ]
+
+    retired = 0
+    for instance_id in instance_ids:
+        instance = LessonInstance.query.get(instance_id)
+        if instance is None:
+            continue
+        if not _instance_is_over(instance, _now):
+            continue
+        retired += _expire_stale_invitations(instance)
+    return retired
+
+
 def respond_to_reminder(
     lesson_instance_id: int,
     action: str,
@@ -1224,6 +1317,9 @@ def respond_to_reminder(
     _now = now or utcnow_naive()
     if _instance_is_over(instance, _now):
         _expire_stale_reminders(instance, acting_user_id)
+        # The class is over for everyone, not just this student: retire any
+        # invitation still offering a spot in it.
+        _expire_stale_invitations(instance)
         return {"action": "expired"}
 
     presence = Presence.query.filter_by(
@@ -1798,8 +1894,16 @@ def process_invitation_batches(*, now: datetime | None = None) -> int:
     Returns count of vacancies where a batch was sent.
 
     Pass ``now`` in tests to control the current time without waiting for real time to pass.
+
+    PAD-68 follow-up: this pass also retires invitations that are still pending
+    for classes that already happened. It is hooked here rather than on a new
+    APScheduler job because this is already the periodic notification-engine
+    tick (every 2 minutes, ``process_batches``), so no new job registration or
+    jobstore entry is needed, and the sweep must run whether or not the class
+    still has an open vacancy.
     """
     _now = now or utcnow_naive()
+    expire_stale_invitations(now=_now)
     open_vacancies = Vacancy.query.filter_by(status="open").all()
     processed = 0
 
@@ -1869,20 +1973,13 @@ def respond_to_notification(
 
     # PAD-68: a late response to an invitation for a class that already happened
     # must not enrol anyone, free anyone, or trigger the next invitation round.
+    # Every pending invite for the class is retired here, not just this one — the
+    # class is over for everyone who was offered the spot.
     if _instance_is_over(event.lesson_instance, now):
-        if event.status in ("sent", "queued"):
-            event.status = "expired"
-            event.save()
-        if event.message_id:
-            stale_msg = Message.query.get(event.message_id)
-            if stale_msg and stale_msg.msg_metadata is not None and not stale_msg.msg_metadata.get("responded"):
-                stale_msg.msg_metadata = {
-                    **stale_msg.msg_metadata,
-                    "responded": True,
-                    "response": "expired",
-                }
-                stale_msg.save()
-                publish({"type": "message_edited", "payload": serialize_message(stale_msg, None)})
+        _expire_stale_invitations(event.lesson_instance)
+        # The event may already have been out of sent/queued (so the sweep above
+        # skipped it) while its message was still showing live buttons.
+        _retire_invite_message(event)
         return {"action": "expired"}
 
     config = get_or_create_config(event.coach_id)
@@ -2019,12 +2116,25 @@ def respond_to_notification(
     return {"action": "unknown"}
 
 
-def coach_respond_to_notification(notification_event_id: int, action: str, coach_id: int) -> dict:
+def coach_respond_to_notification(
+    notification_event_id: int,
+    action: str,
+    coach_id: int,
+    *,
+    now: datetime | None = None,
+) -> dict:
     from flask import abort
 
     event = NotificationEvent.query.get_or_404(notification_event_id)
     if event.coach_id != coach_id:
         abort(403, "Not authorized")
+
+    # PAD-68: the coach recording a late answer must not enrol anyone into a
+    # class that already happened either — same staleness rule as the player path.
+    if _instance_is_over(event.lesson_instance, now):
+        _expire_stale_invitations(event.lesson_instance)
+        _retire_invite_message(event)
+        return {"action": "expired"}
 
     instance = event.lesson_instance
     vacancy = event.vacancy
@@ -2186,7 +2296,16 @@ def respond_to_waiting_list(
     lesson_instance_id: int,
     action: str,
     acting_user_id: int,
+    *,
+    now: datetime | None = None,
 ) -> dict:
+    """
+    Called when a player presses Yes or No on a waiting-list offer.
+
+    PAD-68: joining the waiting list for a class that already happened is
+    meaningless — the entry could never be filled — so a late answer is a no-op
+    and any invitation still pending for that class is retired.
+    """
     from padel_app.models import Coach, Player
 
     instance = LessonInstance.query.get_or_404(lesson_instance_id)
@@ -2195,6 +2314,10 @@ def respond_to_waiting_list(
     if not player:
         from flask import abort
         abort(403)
+
+    if _instance_is_over(instance, now):
+        _expire_stale_invitations(instance)
+        return {"action": "expired"}
 
     coach_rel = Association_CoachLessonInstance.query.filter_by(
         lesson_instance_id=lesson_instance_id
