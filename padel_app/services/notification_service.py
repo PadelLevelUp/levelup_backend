@@ -808,6 +808,23 @@ def _user_id_for_player(player_id: int) -> int | None:
     return player.user_id if player else None
 
 
+def _instance_is_over(instance: LessonInstance, now: datetime | None = None) -> bool:
+    """True when a class can no longer accept attendance changes or invitations.
+
+    PAD-68: a class that has already started (or was canceled/completed) is
+    "closed" — nothing about its roster can usefully change any more. Every
+    notification path that could send a message or move a player must consult
+    this before acting, so a late response to a stale reminder/invite can never
+    resurrect the invitation engine for a class that already happened.
+    """
+    if instance is None:
+        return True
+    if instance.status in ("canceled", "completed"):
+        return True
+    _now = now or utcnow_naive()
+    return instance.start_datetime is not None and instance.start_datetime <= _now
+
+
 def _effective_filled_spots(instance: LessonInstance) -> int:
     enrolled = len(instance.players_relations)
     absent = sum(1 for p in instance.presences if p.status == "absent")
@@ -1141,6 +1158,43 @@ def send_class_reminders(instance_id: int, *, now: datetime | None = None) -> di
     return {"sent": sent_this_round, "more_due": more_due}
 
 
+def _expire_stale_reminders(instance: LessonInstance, player_user_id: int) -> None:
+    """Flag every un-actioned reminder for (player, instance) as expired.
+
+    PAD-68: PAD-49 only supersedes older reminders when a *newer* one is sent, so
+    the last reminder of a series stays actionable forever. Once the class is
+    over there will never be a newer reminder, so nothing ever retires it. This
+    retires them explicitly — reusing the existing ``superseded`` flag the UI
+    already renders as "reminder expired", so no client change is required for
+    the flag to take effect.
+    """
+    from padel_app.models import Coach, Message
+    from padel_app.serializers.message import serialize_message
+
+    coach_rel = Association_CoachLessonInstance.query.filter_by(
+        lesson_instance_id=instance.id
+    ).first()
+    coach = Coach.query.get(coach_rel.coach_id) if coach_rel else None
+    if not coach or not coach.user_id:
+        return
+
+    conv = _get_or_create_direct_conversation(coach.user_id, player_user_id)
+    reminders = Message.query.filter_by(
+        conversation_id=conv.id,
+        message_type="notification_reminder",
+    ).all()
+    for m in reminders:
+        if (
+            m.msg_metadata
+            and m.msg_metadata.get("lessonInstanceId") == instance.id
+            and not m.msg_metadata.get("responded")
+            and not m.msg_metadata.get("superseded")
+        ):
+            m.msg_metadata = {**m.msg_metadata, "superseded": True, "expired": True}
+            m.save()
+            publish({"type": "message_edited", "payload": serialize_message(m, None)})
+
+
 def respond_to_reminder(
     lesson_instance_id: int,
     action: str,
@@ -1151,6 +1205,12 @@ def respond_to_reminder(
     """
     Called when a player presses Yes or No on a reminder message.
     action: "yes" | "no"
+
+    PAD-68: a reminder for a class that has already started (or was
+    canceled/completed) is *expired*. Responding to it is a no-op: the answer is
+    not recorded against attendance and it never creates a vacancy or fans out
+    replacement invitations for a class that already happened. The stale
+    reminder message is flagged so the UI stops offering Yes/No.
     """
     from padel_app.models import Coach, Player
 
@@ -1161,10 +1221,26 @@ def respond_to_reminder(
         from flask import abort
         abort(403)
 
+    _now = now or utcnow_naive()
+    if _instance_is_over(instance, _now):
+        _expire_stale_reminders(instance, acting_user_id)
+        return {"action": "expired"}
+
     presence = Presence.query.filter_by(
         player_id=player.id,
         lesson_instance_id=lesson_instance_id,
     ).first()
+    if presence is None:
+        # PAD-69: a response must always be durably recorded. Without a Presence
+        # row the answer is silently dropped and the next reminder pass sees the
+        # student as "never responded" and re-reminds them.
+        presence = Presence(
+            lesson_instance_id=lesson_instance_id,
+            player_id=player.id,
+            invited=True,
+            confirmed=False,
+        )
+        presence.create()
 
     coach_rel = Association_CoachLessonInstance.query.filter_by(
         lesson_instance_id=lesson_instance_id
@@ -1448,12 +1524,26 @@ def _send_invitation_batch(
     config: NotificationConfig,
     coach_id: int,
     max_sim_override: int | None = None,
+    *,
+    now: datetime | None = None,
 ) -> list[dict]:
     """
     Send the next batch of invitations for this vacancy.
     Returns list of {id, name} for players notified.
+
+    PAD-68: this is the single chokepoint every automatic invitation message
+    flows through. A class that has already started can never be filled, so the
+    vacancy is expired here instead of inviting anyone — this backstops every
+    caller (trigger_invitations, process_invitation_batches, _advance_round,
+    _send_next_on_decline) including late responses to stale messages.
     """
     from padel_app.models import Coach, Player
+
+    if _instance_is_over(instance, now):
+        if vacancy.status == "open":
+            vacancy.status = "expired"
+            vacancy.save()
+        return []
 
     # Check waiting list before doing a fresh invite round
     wl_entry = _check_waiting_list(vacancy, instance, coach_id, config, vacancy.current_round_number)
@@ -1643,6 +1733,9 @@ def trigger_invitations(
         return []
     if not instance.notifications_enabled:
         return []
+    # PAD-68: never open/refresh vacancies for a class that already happened.
+    if _instance_is_over(instance, now):
+        return []
 
     semi_auto = _is_semi_auto(config)
     open_vacancies: list[Vacancy] | None = None
@@ -1678,7 +1771,7 @@ def trigger_invitations(
 
     all_notified: list[dict] = []
     for vacancy in sendable:
-        notified = _send_invitation_batch(vacancy, instance, config, coach_id)
+        notified = _send_invitation_batch(vacancy, instance, config, coach_id, now=_now)
         all_notified.extend(notified)
 
     if all_notified:
@@ -1738,7 +1831,7 @@ def process_invitation_batches(*, now: datetime | None = None) -> int:
 
         # Fresh vacancy (no batch sent yet) — trigger immediately
         if last is None:
-            _send_invitation_batch(vacancy, instance, config, vacancy.coach_id)
+            _send_invitation_batch(vacancy, instance, config, vacancy.coach_id, now=_now)
             processed += 1
             continue
 
@@ -1747,7 +1840,7 @@ def process_invitation_batches(*, now: datetime | None = None) -> int:
         if max_inactive.get("enabled"):
             threshold = timedelta(minutes=max_inactive["value"])
             if _now - last >= threshold:
-                _send_invitation_batch(vacancy, instance, config, vacancy.coach_id)
+                _send_invitation_batch(vacancy, instance, config, vacancy.coach_id, now=_now)
                 processed += 1
 
     return processed
@@ -1757,7 +1850,13 @@ def process_invitation_batches(*, now: datetime | None = None) -> int:
 # Respond to notification (player presses Yes / No on invite)
 # ---------------------------------------------------------------------------
 
-def respond_to_notification(notification_event_id: int, action: str, acting_user_id: int) -> dict:
+def respond_to_notification(
+    notification_event_id: int,
+    action: str,
+    acting_user_id: int,
+    *,
+    now: datetime | None = None,
+) -> dict:
     from flask import abort
     from padel_app.models import Coach, Message, Player
     from padel_app.serializers.message import serialize_message
@@ -1767,6 +1866,24 @@ def respond_to_notification(notification_event_id: int, action: str, acting_user
     player = Player.query.get(event.player_id)
     if not player or player.user_id != acting_user_id:
         abort(403, "Not authorized to respond to this notification")
+
+    # PAD-68: a late response to an invitation for a class that already happened
+    # must not enrol anyone, free anyone, or trigger the next invitation round.
+    if _instance_is_over(event.lesson_instance, now):
+        if event.status in ("sent", "queued"):
+            event.status = "expired"
+            event.save()
+        if event.message_id:
+            stale_msg = Message.query.get(event.message_id)
+            if stale_msg and stale_msg.msg_metadata is not None and not stale_msg.msg_metadata.get("responded"):
+                stale_msg.msg_metadata = {
+                    **stale_msg.msg_metadata,
+                    "responded": True,
+                    "response": "expired",
+                }
+                stale_msg.save()
+                publish({"type": "message_edited", "payload": serialize_message(stale_msg, None)})
+        return {"action": "expired"}
 
     config = get_or_create_config(event.coach_id)
     templates = config.get_message_templates()
