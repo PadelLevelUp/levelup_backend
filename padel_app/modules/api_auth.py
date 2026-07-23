@@ -5,8 +5,31 @@ from werkzeug.security import check_password_hash
 from padel_app.models import User, TokenBlocklist
 from padel_app.sql_db import db
 from padel_app.services.account_service import delete_account_service
+from padel_app.services.user_service import (
+    OWN_PROFILE_FIELDS,
+    ProfileValidationError,
+    update_own_profile_service,
+)
 
 bp = Blueprint("auth_api", __name__, url_prefix="/api/auth")
+
+
+def _serialize_me(user):
+    """The payload the app hydrates its session and Settings profile form from."""
+    return {
+        "id": user.id,
+        "username": user.username,
+        "name": user.name,
+        "roles": ["coach"] if user.coach else ["player"],
+        "coachId": user.coach.id if user.coach else None,
+        "isSuperAdmin": user.is_superadmin,
+        "language": getattr(user, "language", "pt") or "pt",
+        # PAD-81: the Settings profile form is hydrated from here instead of
+        # from hardcoded local defaults.
+        "abbreviation": user.abbreviation_display,
+        "email": user.email,
+        "phone": user.phone,
+    }
 
 @bp.post("/login")
 def login():
@@ -49,15 +72,7 @@ def me():
     user_id = int(get_jwt_identity())
     user = User.query.get_or_404(user_id)
 
-    return jsonify({
-        "id": user.id,
-        "username": user.username,
-        "name": user.name,
-        "roles": ["coach"] if user.coach else ["player"],
-        "coachId": user.coach.id if user.coach else None,
-        "isSuperAdmin": user.is_superadmin,
-        "language": getattr(user, "language", "pt") or "pt",
-    })
+    return jsonify(_serialize_me(user))
 
 
 @bp.delete("/me")
@@ -72,20 +87,15 @@ def delete_me():
 @jwt_required()
 def update_me():
     user_id = int(get_jwt_identity())
-    user = User.query.get_or_404(user_id)
     data = request.get_json() or {}
-    lang = data.get("language")
-    if lang is not None:
-        if lang not in ("pt", "en"):
-            return {"error": "Unsupported language"}, 400
-        user.language = lang
-    db.session.commit()
-    return jsonify({
-        "id": user.id,
-        "username": user.username,
-        "name": user.name,
-        "roles": ["coach"] if user.coach else ["player"],
-        "coachId": user.coach.id if user.coach else None,
-        "isSuperAdmin": user.is_superadmin,
-        "language": user.language,
-    })
+    # PAD-81: only the fields a user may change on their own account, and only
+    # the ones actually present in the payload (partial update).
+    payload = {k: v for k, v in data.items() if k in OWN_PROFILE_FIELDS}
+
+    try:
+        user = update_own_profile_service(user_id, payload)
+    except ProfileValidationError as exc:
+        db.session.rollback()
+        return {"error": exc.message}, exc.status
+
+    return jsonify(_serialize_me(user))

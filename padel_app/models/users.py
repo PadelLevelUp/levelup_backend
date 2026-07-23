@@ -18,6 +18,10 @@ class User(db.Model, model.Model, UserMixin):
     username = Column(String(80), unique=True, nullable=False)
     email = Column(String(120), unique=True, nullable=True)
     phone = Column(String(20), nullable=True)
+    # PAD-81: optional short badge label shown next to the user across the app.
+    # When NULL the abbreviation is derived from `name` (see `abbreviation_display`),
+    # which is exactly what the app did before the column existed.
+    abbreviation = Column(String(8), nullable=True)
     password = Column(String(255), nullable=True)
     is_admin = Column(Boolean, default=False, nullable=False)
     is_superadmin = Column(Boolean, default=False, nullable=False)
@@ -59,6 +63,20 @@ class User(db.Model, model.Model, UserMixin):
     @property
     def user_image_url(self):
         return self.user_image.url() if self.user_image else None
+
+    @property
+    def abbreviation_display(self):
+        """
+        The short badge label to render for this user (PAD-81).
+
+        Uses the explicitly stored `abbreviation` when the coach set one, and
+        otherwise falls back to the initials of the first two words of `name` —
+        the behaviour that `serialize_user` hardcoded before the column existed.
+        """
+        stored = (self.abbreviation or "").strip()
+        if stored:
+            return stored
+        return "".join(part[0] for part in (self.name or "").split()[:2]).upper()
 
     def display_all_info(self):
         searchable = {"field": "username", "label": "Username"}
