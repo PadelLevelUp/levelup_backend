@@ -148,6 +148,14 @@
           <code class="font-mono text-primary">POST /api/edit/&lt;model&gt;/&lt;id&gt;</code>,
           <code class="font-mono text-primary">GET /api/query/&lt;model&gt;</code>.
         </p>
+        <p class="text-gray-700 dark:text-gray-300 mt-2">
+          <span class="font-semibold">Authentication is required.</span> Every
+          <span class="font-semibold">/api</span> endpoint on this page is administrator-only:
+          send an admin Flask-Login session cookie or an admin JWT
+          (<code class="font-mono text-primary">Authorization: Bearer &lt;token&gt;</code>).
+          Anonymous calls return <code class="font-mono text-primary">401</code>; non-admin
+          callers return <code class="font-mono text-primary">403</code>.
+        </p>
       </div>
 
       <div class="space-y-16">

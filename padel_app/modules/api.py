@@ -1,10 +1,62 @@
 from flask import Blueprint, abort, jsonify, redirect, render_template, request, url_for
+from flask_jwt_extended import get_jwt_identity, verify_jwt_in_request
+from flask_login import current_user
 
 from padel_app.model import Image
 from padel_app.tools import tools
-from padel_app.models import MODELS
+from padel_app.models import MODELS, User
 
 bp = Blueprint("api", __name__, url_prefix="/api")
+
+
+# ---------------------------------------------------------------------------
+# Authentication / authorization (PAD-88)
+# ---------------------------------------------------------------------------
+# This blueprint is the generic model-CRUD backend for the legacy Jinja admin
+# editor (`/editor`, guarded by `auth_tools.admin_required`). Every route here
+# operates on arbitrary entries of `padel_app.models.MODELS` with no service
+# layer, no ownership scoping and no business validation, so it must never be
+# reachable by anyone who is not already an administrator.
+#
+# Until PAD-88 the blueprint had no guard at all: an anonymous caller could
+# create, edit, delete, dump and CSV-export every model in the app.
+#
+# Two credentials are accepted, one per real client:
+#   * a Flask-Login session  — the legacy Jinja editor pages and their JS;
+#   * a JWT bearer token     — parity with `modules/editor_api.py`.
+# Unauthenticated callers get 401; authenticated non-admins get 403.
+
+
+def _resolve_caller():
+    """Return the calling ``User`` (session or JWT), or ``None``."""
+    try:
+        if getattr(current_user, "is_authenticated", False):
+            return current_user._get_current_object()
+    except Exception:
+        pass
+
+    try:
+        verify_jwt_in_request(optional=True)
+        identity = get_jwt_identity()
+    except Exception:
+        identity = None
+
+    if identity is None:
+        return None
+    try:
+        return User.query.get(int(identity))
+    except (TypeError, ValueError):
+        return None
+
+
+@bp.before_request
+def require_admin():
+    user = _resolve_caller()
+    if user is None:
+        return jsonify(success=False, error="Authentication required"), 401
+    if not (getattr(user, "is_admin", False) or getattr(user, "is_superadmin", False)):
+        return jsonify(success=False, error="Admin access required"), 403
+    return None
 
 
 @bp.route("/create/<model>", methods=["POST"])
