@@ -87,6 +87,36 @@ DEFAULT_MESSAGE_TEMPLATES_PT = {
 def default_templates_for_locale(locale):
     return DEFAULT_MESSAGE_TEMPLATES_PT if (locale or "pt").startswith("pt") else DEFAULT_MESSAGE_TEMPLATES
 
+
+def _is_blank_template(value) -> bool:
+    """True when a stored template can't produce a message body.
+
+    Covers the three ways a template ends up unusable: the key was never saved
+    (``None``), the coach cleared the textarea (``""`` / whitespace only), or the
+    JSON holds a non-string (legacy data, bad payload).
+    """
+    return not isinstance(value, str) or not value.strip()
+
+
+def resolve_message_template(templates, key, locale=None) -> str:
+    """Resolve one template key to non-empty text (PAD-67).
+
+    ``templates`` is whatever the caller has on hand — normally the dict from
+    :meth:`NotificationConfig.get_message_templates`, but call sites also pass a
+    raw defaults dict. Whenever the stored value is missing or blank/whitespace-
+    only, fall back to the built-in default for ``locale`` so an automatic
+    message is never delivered empty.
+    """
+    value = (templates or {}).get(key)
+    if not _is_blank_template(value):
+        return value
+    fallback = default_templates_for_locale(locale).get(key)
+    if not _is_blank_template(fallback):
+        return fallback
+    # Unknown key with no built-in default — the caller must not send anything.
+    return ""
+
+
 DEFAULT_INVITATION_GROUPS = [
     {
         "id": "1",
@@ -195,10 +225,22 @@ class NotificationConfig(db.Model, model.Model):
         return self.notification_groups if self.notification_groups is not None else DEFAULT_NOTIFICATION_GROUPS
 
     def get_message_templates(self, locale=None):
+        """Coach templates merged over the locale defaults, never blank (PAD-67).
+
+        A stored key that is missing, ``null``, non-string or blank/whitespace-
+        only does NOT override the default — otherwise the engine would render
+        and deliver an empty message body. Customisations that carry actual text
+        always win, and unknown extra keys are preserved as-is.
+        """
         defaults = default_templates_for_locale(locale)
-        if self.message_templates is None:
+        stored = self.message_templates
+        if not isinstance(stored, dict):
             return dict(defaults)
-        return {**defaults, **self.message_templates}
+        merged = {**defaults, **stored}
+        for key, default_text in defaults.items():
+            if _is_blank_template(merged.get(key)):
+                merged[key] = default_text
+        return merged
 
     def get_reminder_timing(self):
         if self.reminder_timing is None:
