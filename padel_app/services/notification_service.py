@@ -51,11 +51,12 @@ from padel_app.models import (
 )
 from padel_app.models.standing_waiting_list_entry import StandingWaitingListEntry
 from padel_app.models.notification_config import (
-    DEFAULT_MESSAGE_TEMPLATES,
     DEFAULT_NOTIFICATION_GROUPS,
     DEFAULT_PRIORITY_CRITERIA,
     DEFAULT_RESTRICTIONS,
     DEFAULT_ROUNDS,
+    default_templates_for_locale,
+    resolve_message_template,
 )
 from padel_app.realtime import publish
 from padel_app.services.level_ladder import (
@@ -82,7 +83,10 @@ def get_or_create_config(coach_id: int) -> NotificationConfig:
 
 
 def get_config_dict(coach_id: int) -> dict:
+    from padel_app.models import Coach
+
     config = get_or_create_config(coach_id)
+    locale = _resolve_locale(Coach.query.get(coach_id))
     return {
         "autoNotifyEnabled": config.auto_notify_enabled,
         "invitationMode": config.get_invitation_mode(),
@@ -90,7 +94,7 @@ def get_config_dict(coach_id: int) -> dict:
         "restrictions": config.get_restrictions(),
         "rounds": config.get_rounds(),
         "notificationGroups": config.get_notification_groups(),
-        "messageTemplates": config.get_message_templates(),
+        "messageTemplates": config.get_message_templates(locale),
         "reminderTiming": config.reminder_timing,
         "invitationStartTiming": config.get_invitation_start_timing(),
         "invitationGroups": config.get_invitation_groups(),
@@ -704,6 +708,20 @@ def _send_system_message(
     from padel_app.serializers.message import serialize_message
     from padel_app.utils.expo_push import send_expo_push_to_user
 
+    # PAD-67 backstop: never deliver an empty message. Template resolution
+    # (``resolve_message_template``) already substitutes a built-in default for a
+    # missing/blank template, so reaching here with blank text means the rendered
+    # body genuinely has nothing to say — sending it would only produce the empty
+    # chat bubbles + empty push notifications reported in the ticket.
+    if not (text or "").strip():
+        from flask import current_app, has_app_context
+        if has_app_context():
+            current_app.logger.warning(
+                "_send_system_message: refusing to send an empty %s message to user %s",
+                message_type, player_user_id,
+            )
+        return None
+
     conv = _get_or_create_direct_conversation(coach_user_id, player_user_id)
     msg = Message(
         text=text,
@@ -891,6 +909,7 @@ def _broadcast_spot_filled(
     coach_user_id: int,
     templates: dict,
     vacancy_id: int | None = None,
+    locale: str | None = None,
 ) -> None:
     """
     Mark all other 'sent' events as expired, update their invite messages,
@@ -899,7 +918,7 @@ def _broadcast_spot_filled(
     from padel_app.models import Message
     from padel_app.serializers.message import serialize_message
 
-    spot_filled_text = templates.get("spot_filled", DEFAULT_MESSAGE_TEMPLATES["spot_filled"])
+    spot_filled_text = resolve_message_template(templates, "spot_filled", locale)
 
     query = NotificationEvent.query.filter(
         NotificationEvent.status == "sent",
@@ -1136,7 +1155,7 @@ def send_class_reminders(instance_id: int, *, now: datetime | None = None) -> di
 
         template_key = "reminder_followup" if sent_count > 0 else "reminder"
         text = _format_template(
-            templates.get(template_key, DEFAULT_MESSAGE_TEMPLATES[template_key]),
+            resolve_message_template(templates, template_key, locale),
             name=player_name,
             level=level_code,
             weekday=weekday,
@@ -1374,7 +1393,12 @@ def respond_to_reminder(
     coach_user_id = coach.user_id if coach else None
 
     config = get_or_create_config(coach.id) if coach else None
-    templates = config.get_message_templates() if config else DEFAULT_MESSAGE_TEMPLATES
+    locale = _resolve_locale(coach)
+    templates = (
+        config.get_message_templates(locale)
+        if config
+        else dict(default_templates_for_locale(locale))
+    )
 
     # Mark the reminder message as responded so the frontend shows the badge on reload
     if coach_user_id:
@@ -1411,7 +1435,7 @@ def respond_to_reminder(
             _send_system_message(
                 coach_user_id,
                 acting_user_id,
-                templates.get("reminder_confirmed", DEFAULT_MESSAGE_TEMPLATES["reminder_confirmed"]),
+                resolve_message_template(templates, "reminder_confirmed", locale),
                 class_instance_id=instance.id,
             )
         return {"action": "confirmed"}
@@ -1426,6 +1450,7 @@ def respond_to_reminder(
             acting_user_id,
             config,
             templates,
+            locale=locale,
             now=now,
         )
         return {"action": "declined"}
@@ -1443,6 +1468,7 @@ def _free_spot_for_declining_player(
     config,
     templates: dict,
     *,
+    locale: str | None = None,
     now: datetime | None = None,
 ) -> None:
     """Revert a player to "not attending" and free their spot.
@@ -1462,7 +1488,7 @@ def _free_spot_for_declining_player(
         _send_system_message(
             coach_user_id,
             acting_user_id,
-            templates.get("reminder_declined", DEFAULT_MESSAGE_TEMPLATES["reminder_declined"]),
+            resolve_message_template(templates, "reminder_declined", locale),
             class_instance_id=instance.id,
         )
 
@@ -1529,7 +1555,12 @@ def cancel_attendance(
     coach_user_id = coach.user_id if coach else None
 
     config = get_or_create_config(coach.id) if coach else None
-    templates = config.get_message_templates() if config else DEFAULT_MESSAGE_TEMPLATES
+    locale = _resolve_locale(coach)
+    templates = (
+        config.get_message_templates(locale)
+        if config
+        else dict(default_templates_for_locale(locale))
+    )
 
     # Flag late cancellations: at/after the deadline (start - cancellationDeadlineHours)
     # but still before start. The spot is freed either way.
@@ -1554,7 +1585,6 @@ def cancel_attendance(
     # that computes lateness — keeping a single emission point avoids duplicates and
     # a false "late" flag on plain reminder declines.
     if coach_user_id:
-        locale = _resolve_locale(coach)
         _notify_coach_of_cancellation(
             coach_user_id,
             acting_user_id,
@@ -1598,6 +1628,7 @@ def cancel_attendance(
         acting_user_id,
         config,
         templates,
+        locale=locale,
         now=now,
     )
     return {"action": "declined"}
@@ -1738,7 +1769,7 @@ def _send_invitation_batch(
         event.create()
 
         text = _format_template(
-            templates.get("invite", DEFAULT_MESSAGE_TEMPLATES["invite"]),
+            resolve_message_template(templates, "invite", locale),
             name=player_name,
             level=level_code,
             weekday=weekday,
@@ -1756,8 +1787,11 @@ def _send_invitation_batch(
                 "responded": False,
             },
         )
-        event.message_id = msg.id
-        event.save()
+        # _send_system_message returns None only if the body came out empty
+        # (PAD-67 backstop); the event still exists, just without a chat message.
+        if msg is not None:
+            event.message_id = msg.id
+            event.save()
 
         notified.append({"id": str(cp.player_id), "name": player_name})
 
@@ -2012,9 +2046,10 @@ def respond_to_notification(
         return {"action": "expired"}
 
     config = get_or_create_config(event.coach_id)
-    templates = config.get_message_templates()
 
     coach = Coach.query.get(event.coach_id)
+    locale = _resolve_locale(coach)
+    templates = config.get_message_templates(locale)
     coach_user_id = coach.user_id if coach else None
     player_user_id = acting_user_id
 
@@ -2047,7 +2082,7 @@ def respond_to_notification(
             _send_system_message(
                 coach_user_id,
                 player_user_id,
-                templates.get("decline", DEFAULT_MESSAGE_TEMPLATES["decline"]),
+                resolve_message_template(templates, "decline", locale),
                 class_instance_id=instance.id,
             )
 
@@ -2070,10 +2105,10 @@ def respond_to_notification(
                 _send_system_message(
                     coach_user_id,
                     player_user_id,
-                    templates.get("spot_filled", DEFAULT_MESSAGE_TEMPLATES["spot_filled"]),
+                    resolve_message_template(templates, "spot_filled", locale),
                     class_instance_id=instance.id,
                 )
-            _offer_waiting_list(event.player_id, instance, event.coach_id, templates)
+            _offer_waiting_list(event.player_id, instance, event.coach_id, templates, locale)
             publish({
                 "type": "notification_responded",
                 "payload": {
@@ -2092,10 +2127,10 @@ def respond_to_notification(
                 _send_system_message(
                     coach_user_id,
                     player_user_id,
-                    templates.get("spot_filled", DEFAULT_MESSAGE_TEMPLATES["spot_filled"]),
+                    resolve_message_template(templates, "spot_filled", locale),
                     class_instance_id=instance.id,
                 )
-            _offer_waiting_list(event.player_id, instance, event.coach_id, templates)
+            _offer_waiting_list(event.player_id, instance, event.coach_id, templates, locale)
             publish({
                 "type": "notification_responded",
                 "payload": {
@@ -2121,7 +2156,7 @@ def respond_to_notification(
             _send_system_message(
                 coach_user_id,
                 player_user_id,
-                templates.get("confirm", DEFAULT_MESSAGE_TEMPLATES["confirm"]),
+                resolve_message_template(templates, "confirm", locale),
                 class_instance_id=instance.id,
             )
             _broadcast_spot_filled(
@@ -2130,6 +2165,7 @@ def respond_to_notification(
                 coach_user_id,
                 templates,
                 vacancy_id=vacancy.id if vacancy else None,
+                locale=locale,
             )
 
         publish({
@@ -2254,7 +2290,7 @@ def send_manual_notifications(
             time_str = instance.start_datetime.strftime("%H:%M") if instance.start_datetime else ""
 
             text = _format_template(
-                templates.get("invite", DEFAULT_MESSAGE_TEMPLATES["invite"]),
+                resolve_message_template(templates, "invite", locale),
                 name=player_name,
                 level=level_code,
                 weekday=weekday,
@@ -2272,8 +2308,9 @@ def send_manual_notifications(
                     "responded": False,
                 },
             )
-            event.message_id = msg.id
-            event.save()
+            if msg is not None:
+                event.message_id = msg.id
+                event.save()
 
         events.append(event)
 
@@ -2298,6 +2335,7 @@ def _offer_waiting_list(
     instance: LessonInstance,
     coach_id: int,
     templates: dict,
+    locale: str | None = None,
 ) -> None:
     """Send a waiting-list offer message to the player."""
     from padel_app.models import Coach
@@ -2308,7 +2346,7 @@ def _offer_waiting_list(
     if not player_user_id:
         return
 
-    text = templates.get("waiting_list_offer", DEFAULT_MESSAGE_TEMPLATES["waiting_list_offer"])
+    text = resolve_message_template(templates, "waiting_list_offer", locale)
     _send_system_message(
         coach_user_id=coach.user_id,
         player_user_id=player_user_id,
@@ -2356,7 +2394,8 @@ def respond_to_waiting_list(
         return {"action": "unknown"}
 
     config = get_or_create_config(coach.id)
-    templates = config.get_message_templates()
+    locale = _resolve_locale(coach)
+    templates = config.get_message_templates(locale)
 
     if action == "yes":
         # Upsert waiting list entry
@@ -2378,7 +2417,7 @@ def respond_to_waiting_list(
             _send_system_message(
                 coach_user_id=coach.user_id,
                 player_user_id=acting_user_id,
-                text=templates.get("waiting_list_confirm", DEFAULT_MESSAGE_TEMPLATES["waiting_list_confirm"]),
+                text=resolve_message_template(templates, "waiting_list_confirm", locale),
                 class_instance_id=instance.id,
             )
         return {"action": "added_to_waiting_list"}
@@ -2539,7 +2578,7 @@ def _fill_from_waiting_list(
     time_str = instance.start_datetime.strftime("%H:%M") if instance.start_datetime else ""
 
     text = _format_template(
-        templates.get("waiting_list_placed", DEFAULT_MESSAGE_TEMPLATES["waiting_list_placed"]),
+        resolve_message_template(templates, "waiting_list_placed", locale),
         name=player_name,
         level=level_code,
         weekday=weekday,
