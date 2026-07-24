@@ -20,14 +20,25 @@ def _parse_date(value):
     return datetime.strptime(value, "%Y-%m-%d").date()
 
 
-def validate_no_overlap(coach, start_date, end_date, exclude_id=None):
+def validate_no_overlap(coach, start_date, end_date, exclude_id=None, exclude_ids=None):
     """Raise ValueError if the given range is invalid or overlaps an existing
-    season of the coach (other than the one identified by exclude_id)."""
+    season of the coach.
+
+    ``exclude_id`` skips a single persisted season (the row being edited).
+    ``exclude_ids`` skips a set of persisted seasons — used by
+    :func:`upsert_seasons`, where every season addressed by the payload is
+    about to be rewritten and is therefore checked pairwise against the payload
+    instead of against its own stale persisted range.
+    """
     if start_date > end_date:
         raise ValueError("Season start must be before end")
 
+    skip = set(exclude_ids or ())
+    if exclude_id is not None:
+        skip.add(exclude_id)
+
     for season in coach.seasons:
-        if exclude_id is not None and season.id == exclude_id:
+        if season.id in skip:
             continue
         if _seasons_overlap(start_date, end_date, season.start_date, season.end_date):
             raise ValueError("Overlapping seasons are not allowed")
@@ -54,11 +65,30 @@ def resolve_season_end_for_coach(coach, on_date):
 # ---------------------------------------------------------------------------
 
 def upsert_seasons(coach, data):
-    """Batch upsert seasons from a list of {id?, name, startDate, endDate}.
+    """Batch upsert seasons from a list of ``{id?, name, startDate, endDate}``.
 
-    Validates the intended FINAL set for pairwise overlaps before writing.
-    Deletes coach seasons not present in the incoming set, then updates/creates
-    the rest. Returns the coach's resulting seasons.
+    Semantics (PAD-89) — **explicit deletes only**:
+
+    * An entry carrying an ``id`` that belongs to the coach UPDATES that season
+      in place. Its id, and therefore its ``created_at`` history, is preserved.
+    * An entry without an ``id`` CREATES a season.
+    * A persisted season that the payload does not mention is **left alone**.
+      It is never deleted. Removing a season is done explicitly through
+      :func:`delete_season` (``POST /app/delete/season``), which the web client
+      already calls when a coach removes a row.
+
+    Validation runs in two passes before anything is written:
+
+    1. pairwise, across the incoming payload (the intended new/updated rows);
+    2. against the coach's persisted seasons that the payload does not address,
+       via :func:`validate_no_overlap` — the DB-aware check that previously
+       existed but was never wired into a production write path.
+
+    Any conflict raises ``ValueError`` and the whole batch is rejected, so a
+    payload can no longer resolve an overlap by silently destroying the season
+    it collides with.
+
+    Returns the coach's resulting seasons.
     """
     from padel_app.models import Season
 
@@ -82,7 +112,7 @@ def upsert_seasons(coach, data):
             }
         )
 
-    # Validate the final set for pairwise overlaps.
+    # Pass 1 — pairwise overlaps within the incoming payload.
     for i in range(len(entries)):
         for j in range(i + 1, len(entries)):
             if _seasons_overlap(
@@ -93,15 +123,25 @@ def upsert_seasons(coach, data):
             ):
                 raise ValueError("Overlapping seasons are not allowed")
 
-    incoming_ids = {e["id"] for e in entries if e["id"] is not None}
+    # Only ids the coach actually owns can be "addressed" by the payload; an
+    # unknown id falls through to a create, as before.
+    owned_ids = {season.id for season in coach.seasons}
+    addressed_ids = {
+        e["id"] for e in entries if e["id"] is not None and e["id"] in owned_ids
+    }
 
-    # Delete coach seasons not in the incoming set.
-    for season in list(coach.seasons):
-        if season.id not in incoming_ids:
-            db.session.delete(season)
-    db.session.flush()
+    # Pass 2 — DB-aware: every entry must also clear the coach's persisted
+    # seasons that this payload does not address. Those rows are NOT deleted
+    # (that is the PAD-89 data-loss bug); they are validated against.
+    for e in entries:
+        validate_no_overlap(
+            coach,
+            e["start_date"],
+            e["end_date"],
+            exclude_ids=addressed_ids,
+        )
 
-    # Update / create the rest.
+    # Update / create. Seasons absent from the payload are left untouched.
     for e in entries:
         season = None
         if e["id"] is not None:
