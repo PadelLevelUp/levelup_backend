@@ -57,10 +57,36 @@ def transform_to_datetime(obj, data):
 # ---------------------------------------------------------------------------
 
 def get_or_materialize_instance(lesson: Lesson, date):
-    instance = LessonInstance.query.filter_by(
-        lesson_id=lesson.id,
-        start_datetime=datetime.combine(date, lesson.start_datetime.time()),
-    ).first()
+    # An occurrence's identity is (lesson_id, occurrence date), NOT the parent
+    # lesson's time-of-day. A "this occurrence only" edit can move an instance's
+    # start_datetime off the parent's time; keying the lookup on
+    # datetime.combine(date, lesson.start_datetime.time()) then misses and
+    # materializes a duplicate LessonInstance for the same date, with a fresh set
+    # of unconfirmed Presence rows — the reminder-double-send path in PAD-85/69.
+    #
+    # Match on original_lesson_occurence_date (the canonical occurrence key, same
+    # as calendar_helpers), falling back to any instance whose start_datetime
+    # lands on that calendar day for legacy rows where the column is unset.
+    from sqlalchemy import and_, or_
+
+    day_start = datetime.combine(date, time.min)
+    day_end = day_start + timedelta(days=1)
+    instance = (
+        LessonInstance.query
+        .filter(LessonInstance.lesson_id == lesson.id)
+        .filter(
+            or_(
+                LessonInstance.original_lesson_occurence_date == date,
+                and_(
+                    LessonInstance.original_lesson_occurence_date.is_(None),
+                    LessonInstance.start_datetime >= day_start,
+                    LessonInstance.start_datetime < day_end,
+                ),
+            )
+        )
+        .order_by(LessonInstance.id.asc())
+        .first()
+    )
 
     if instance:
         return instance
