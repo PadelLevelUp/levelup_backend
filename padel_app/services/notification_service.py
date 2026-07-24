@@ -1336,6 +1336,83 @@ def expire_stale_invitations(*, now: datetime | None = None) -> int:
     return retired
 
 
+# ---------------------------------------------------------------------------
+# Reminder response idempotency (PAD-94)
+# ---------------------------------------------------------------------------
+
+# The state name each raw button action is reported as.
+_RESPONSE_STATE = {"yes": "confirmed", "no": "declined"}
+
+
+def _pending_reminder_message(
+    coach_user_id: int | None,
+    player_user_id: int,
+    lesson_instance_id: int,
+):
+    """The newest reminder message for this (player, instance) still awaiting an
+    answer, or ``None``.
+
+    ``None`` means there is no live question on screen: either the player never
+    got a reminder, or every reminder they got is already actioned/superseded.
+    Combined with :func:`_recorded_reminder_action` that is what distinguishes a
+    repeat tap on an already-answered reminder (PAD-94) from a fresh answer to a
+    newer reminder (PAD-49 rule 9), which must always be processed.
+    """
+    if not coach_user_id:
+        return None
+    from padel_app.models import Message
+
+    conv = _get_or_create_direct_conversation(coach_user_id, player_user_id)
+    recent_reminders = Message.query.filter_by(
+        conversation_id=conv.id,
+        message_type="notification_reminder",
+    ).order_by(Message.id.desc()).all()
+    return next(
+        (m for m in recent_reminders
+         if m.msg_metadata
+         and m.msg_metadata.get("lessonInstanceId") == lesson_instance_id
+         and not m.msg_metadata.get("responded")
+         and not m.msg_metadata.get("superseded")),
+        None,
+    )
+
+
+def _recorded_reminder_action(presence: "Presence | None") -> str | None:
+    """The reminder answer currently durably recorded on ``presence``.
+
+    Returns ``"no"``, ``"yes"`` or ``None`` (nothing recorded / the coach has
+    since overwritten the row with an attendance decision of their own, in which
+    case we deliberately do NOT claim an answer is on record).
+
+    Mirrors exactly what the two response paths write:
+    ``_free_spot_for_declining_player`` sets ``status="absent"`` +
+    ``justification="justified"``, and the confirm branch sets ``confirmed``
+    while leaving ``status`` alone for the coach to fill in.
+    """
+    if presence is None:
+        return None
+    if presence.status == "absent" and presence.justification == "justified":
+        return "no"
+    if presence.confirmed and presence.status is None:
+        return "yes"
+    return None
+
+
+def _vacancy_has_live_invitations(vacancy: "Vacancy | None") -> bool:
+    """True when this vacancy already has invitations out that are still in play.
+
+    PAD-94 belt-and-braces: even if some other caller re-enters the decline path
+    for a spot that is already being filled, re-driving the invitation engine
+    would only duplicate messages already sitting in candidates' inboxes.
+    """
+    if vacancy is None:
+        return False
+    return NotificationEvent.query.filter(
+        NotificationEvent.vacancy_id == vacancy.id,
+        NotificationEvent.status.in_(["sent", "queued", "confirmed"]),
+    ).count() > 0
+
+
 def respond_to_reminder(
     lesson_instance_id: int,
     action: str,
@@ -1400,31 +1477,33 @@ def respond_to_reminder(
         else dict(default_templates_for_locale(locale))
     )
 
+    # The newest reminder for this (player, instance) that is still awaiting an
+    # answer, if any. ``None`` means every reminder they were sent has already
+    # been actioned (or superseded) — the signal that a repeat tap is a repeat.
+    reminder_msg = _pending_reminder_message(
+        coach_user_id, acting_user_id, lesson_instance_id
+    )
+
+    # PAD-94: responding is idempotent. A student whose reminder bubble does not
+    # visibly settle taps Yes/No again — in production one student tapped "No"
+    # eight times in 62 seconds, which sent eight `reminder_declined` messages
+    # and re-drove the invitation engine eight times, spamming the same two
+    # replacement candidates. Re-submitting the answer ALREADY on record is a
+    # no-op that reports what is recorded; changing the answer still goes
+    # through, and a genuinely new reminder (PAD-49) is always answerable.
+    if reminder_msg is None and _recorded_reminder_action(presence) == action:
+        return {"action": _RESPONSE_STATE.get(action, "unknown"), "duplicate": True}
+
     # Mark the reminder message as responded so the frontend shows the badge on reload
-    if coach_user_id:
-        from padel_app.models import Message
+    if reminder_msg is not None:
         from padel_app.serializers.message import serialize_message
-        conv = _get_or_create_direct_conversation(coach_user_id, acting_user_id)
-        recent_reminders = Message.query.filter_by(
-            conversation_id=conv.id,
-            message_type="notification_reminder",
-        ).order_by(Message.id.desc()).all()
-        reminder_msg = next(
-            (m for m in recent_reminders
-             if m.msg_metadata
-             and m.msg_metadata.get("lessonInstanceId") == lesson_instance_id
-             and not m.msg_metadata.get("responded")
-             and not m.msg_metadata.get("superseded")),
-            None,
-        )
-        if reminder_msg:
-            reminder_msg.msg_metadata = {
-                **reminder_msg.msg_metadata,
-                "responded": True,
-                "response": action,
-            }
-            reminder_msg.save()
-            publish({"type": "message_edited", "payload": serialize_message(reminder_msg, None)})
+        reminder_msg.msg_metadata = {
+            **reminder_msg.msg_metadata,
+            "responded": True,
+            "response": action,
+        }
+        reminder_msg.save()
+        publish({"type": "message_edited", "payload": serialize_message(reminder_msg, None)})
 
     if action == "yes":
         if presence:
@@ -1508,6 +1587,12 @@ def _free_spot_for_declining_player(
                     [vacancy], instance, coach.id, config, now=now
                 )
         else:
+            # PAD-94: if this exact spot already has invitations in flight, the
+            # engine has nothing new to do — re-driving it would just re-send
+            # them. Normal first declines create a brand-new vacancy with zero
+            # events, so this never suppresses a real fan-out.
+            if _vacancy_has_live_invitations(vacancy):
+                return
             invite_start_dt = _compute_invite_start_dt(instance, config.get_invitation_start_timing())
             _now = now or utcnow_naive()
             if invite_start_dt is None or _now >= invite_start_dt:
