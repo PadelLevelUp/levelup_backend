@@ -700,8 +700,15 @@ def create_conversation():
 @bp.post("/add_class")
 @jwt_required()
 def add_class():
+    from padel_app.services.lesson_service import NoSeasonCoversDateError
+
     data = request.get_json() or {}
-    lesson = add_class_service(data, current_coach(), current_club())
+    try:
+        lesson = add_class_service(data, current_coach(), current_club())
+    except NoSeasonCoversDateError as e:
+        # PAD-90: "recurs until season end" with no covering season is rejected
+        # rather than creating an unbounded recurring class.
+        return jsonify({"error": str(e), "code": e.code}), 400
     return jsonify(serialize_calendar_event(lesson))
 
 
