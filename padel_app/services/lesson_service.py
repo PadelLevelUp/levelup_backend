@@ -774,7 +774,14 @@ def _remove_single_occurrence_from_lesson(*, lesson, date):
 
 
 def remove_class_service(data):
-    """Scope-aware class removal. Returns (result_dict, http_status_code)."""
+    """Scope-aware class removal. Returns (result_dict, http_status_code).
+
+    PAD-75: before removing the class, snapshot the enrolled students + coach so
+    that, once the removal succeeds, every enrolled student is notified the class
+    was cancelled — reusing the notification-engine's message/push channel. The
+    notification is best-effort: it must never turn a successful removal into an
+    error response.
+    """
     models_map = {
         "Lesson": Lesson,
         "LessonInstance": LessonInstance,
@@ -795,6 +802,37 @@ def remove_class_service(data):
 
     obj = models_map[model_name].query.get_or_404(class_id)
 
+    # Snapshot cancellation recipients BEFORE removal — the roster/coach relations
+    # are cascade-deleted as part of the removal below.
+    cancellation_recipients = []
+    try:
+        from padel_app.services.notification_service import (
+            collect_cancellation_recipients,
+        )
+        cancellation_recipients = collect_cancellation_recipients(obj)
+    except Exception:
+        cancellation_recipients = []
+
+    result, status = _dispatch_remove_class(obj, model_name, scope, event_date)
+
+    if 200 <= status < 300 and cancellation_recipients:
+        try:
+            from padel_app.services.notification_service import (
+                notify_students_of_cancellation,
+            )
+            notify_students_of_cancellation(cancellation_recipients)
+        except Exception:
+            pass  # never fail a successful removal because notification failed
+
+    return result, status
+
+
+def _dispatch_remove_class(obj, model_name, scope, event_date):
+    """Execute the scope-aware removal for a resolved class object (PAD-75 split).
+
+    Extracted verbatim from ``remove_class_service`` so the notification snapshot
+    can wrap it without threading through every early return.
+    """
     from padel_app.scheduler import _maybe_cancel_instance
 
     if model_name == "LessonInstance":

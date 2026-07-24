@@ -849,6 +849,100 @@ def _format_class_when(instance: LessonInstance, locale: str = "en") -> str:
     return f" at {time_str}"
 
 
+def collect_cancellation_recipients(source) -> list[dict]:
+    """Snapshot what's needed to tell each enrolled student a class was cancelled.
+
+    PAD-75: when a coach cancels/removes a scheduled class, every enrolled student
+    should be told. This resolves the coach, the coach's locale + message
+    templates, and each enrolled student's user id and personalised message text
+    into plain dicts, so the caller can send the notifications AFTER the class (and
+    its relations) has been removed.
+
+    Works uniformly for a ``Lesson`` or a ``LessonInstance`` — both expose
+    ``coaches_relations``, ``players_relations``, ``title``, ``start_datetime`` and
+    ``level``. MUST be called BEFORE removal, because removal cascade-deletes those
+    relations. Returns ``[]`` when there is no coach or no enrolled student, so the
+    caller sends nothing.
+    """
+    from padel_app.models import Coach, LessonInstance, Player
+
+    coach_rels = list(getattr(source, "coaches_relations", []) or [])
+    coach = None
+    if coach_rels:
+        coach = getattr(coach_rels[0], "coach", None) or Coach.query.get(
+            coach_rels[0].coach_id
+        )
+    coach_user_id = coach.user_id if coach else None
+    if not coach_user_id:
+        return []
+
+    locale = _resolve_locale(coach)
+    config = get_or_create_config(coach.id)
+    templates = config.get_message_templates(locale)
+
+    level = getattr(source, "level", None)
+    level_code = level.code if level else ""
+    start_dt = getattr(source, "start_datetime", None)
+    weekday = _format_weekday(start_dt, locale)
+    time_str = start_dt.strftime("%H:%M") if start_dt else ""
+
+    # Only a materialized LessonInstance carries an id the mobile app can route to.
+    instance_id = source.id if isinstance(source, LessonInstance) else None
+
+    recipients: list[dict] = []
+    for rel in list(getattr(source, "players_relations", []) or []):
+        player = getattr(rel, "player", None) or Player.query.get(rel.player_id)
+        player_user_id = player.user_id if player else None
+        if not player_user_id:
+            continue
+        first_name = (
+            (player.user.name or "").split()[0]
+            if player and player.user and player.user.name
+            else ""
+        )
+        text = _format_template(
+            resolve_message_template(templates, "class_cancelled", locale),
+            name=first_name,
+            level=level_code,
+            weekday=weekday,
+            time=time_str,
+        )
+        recipients.append(
+            {
+                "coach_user_id": coach_user_id,
+                "player_user_id": player_user_id,
+                "text": text,
+                "instance_id": instance_id,
+            }
+        )
+    return recipients
+
+
+def notify_students_of_cancellation(recipients: list[dict]) -> int:
+    """Send each pre-computed cancellation notification (PAD-75).
+
+    Reuses ``_send_system_message`` — the same coach→student conversation channel
+    (in-app message + push) used by every other class notification. Returns the
+    number of messages actually sent.
+    """
+    sent = 0
+    for r in recipients or []:
+        metadata = {"classCancellation": True}
+        if r.get("instance_id") is not None:
+            metadata["lessonInstanceId"] = r["instance_id"]
+        msg = _send_system_message(
+            coach_user_id=r["coach_user_id"],
+            player_user_id=r["player_user_id"],
+            text=r["text"],
+            message_type="text",
+            msg_metadata=metadata,
+            class_instance_id=r.get("instance_id"),
+        )
+        if msg is not None:
+            sent += 1
+    return sent
+
+
 def _user_id_for_player(player_id: int) -> int | None:
     from padel_app.models import Player
     player = Player.query.get(player_id)
