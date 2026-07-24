@@ -154,6 +154,78 @@ def _is_semi_auto(config: NotificationConfig) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Level resolution (PAD-86)
+# ---------------------------------------------------------------------------
+
+def effective_level_id(obj) -> int | None:
+    """The level a class is matched against, resolved the SAME way everywhere.
+
+    PAD-86: a ``LessonInstance`` often carries no ``level_id`` of its own — the
+    level lives on the parent ``Lesson`` as ``default_level_id``. Resolving that
+    fallback in some call sites but not others meant a structural vacancy could
+    be created with ``level_id = None``, which every level rule then read as
+    "the level filter is switched off" — a level-only invitation group silently
+    matched the coach's entire roster.
+
+    Accepts a ``LessonInstance`` (instance level, falling back to its lesson's
+    default level) or a ``Lesson`` (its default level). Returns ``None`` only
+    when there is genuinely no level anywhere — which callers must treat as
+    "nobody qualifies", never as "no filter".
+    """
+    if obj is None:
+        return None
+    direct = getattr(obj, "level_id", None)
+    if direct:
+        return direct
+    lesson = getattr(obj, "lesson", None)
+    if lesson is not None:
+        return getattr(lesson, "default_level_id", None)
+    return getattr(obj, "default_level_id", None)
+
+
+def effective_level(obj):
+    """The ``CoachLevel`` behind :func:`effective_level_id`, or ``None``."""
+    level_id = effective_level_id(obj)
+    if level_id is None:
+        return None
+    direct = getattr(obj, "level", None)
+    if direct is not None and getattr(direct, "id", None) == level_id:
+        return direct
+    from padel_app.models.coach_levels import CoachLevel
+    return CoachLevel.query.get(level_id)
+
+
+def _vacancy_level(vacancy, instance=None):
+    """The ``(level_id, level)`` a vacancy is matched on — PAD-86.
+
+    Prefers the vacancy's own snapshot and falls back to the class's effective
+    level. The fallback matters for vacancy rows created BEFORE this fix (their
+    ``level_id`` is NULL even though the class has a level): without it they
+    would now fail closed and invite nobody.
+    """
+    level_id = getattr(vacancy, "level_id", None)
+    if level_id:
+        level = getattr(vacancy, "level", None)
+        if level is None:
+            from padel_app.models.coach_levels import CoachLevel
+            level = CoachLevel.query.get(level_id)
+        return level_id, level
+    return effective_level_id(instance), effective_level(instance)
+
+
+def effective_level_code(obj) -> str:
+    """The ``{level}`` message placeholder — empty string when there is no level.
+
+    Same fallback as :func:`effective_level_id`, so an invitation/reminder for a
+    class whose level lives on the parent lesson no longer renders a blank
+    ``{level}`` slot (notifications.templates rule 7 keeps the empty string for
+    a class with genuinely no level).
+    """
+    level = effective_level(obj)
+    return getattr(level, "code", "") or ""
+
+
+# ---------------------------------------------------------------------------
 # Student ranking helpers
 # ---------------------------------------------------------------------------
 
@@ -342,32 +414,49 @@ def _compare(value, op: str, threshold) -> bool:
     return True
 
 
-def _passes_group_rules(rules: list, cp: Association_CoachPlayer, vacancy: Vacancy, coach_id: int) -> bool:
-    """Apply all rules in an invitation group with AND logic."""
+def _passes_group_rules(
+    rules: list,
+    cp: Association_CoachPlayer,
+    vacancy: Vacancy,
+    coach_id: int,
+    instance: LessonInstance | None = None,
+) -> bool:
+    """Apply all rules in an invitation group with AND logic.
+
+    ``instance`` (PAD-86) lets the level rules fall back to the class's
+    effective level when the vacancy carries no snapshot of its own.
+    """
+    vacancy_level_id, vacancy_level = _vacancy_level(vacancy, instance)
+
     for rule in rules:
         attr = rule.get("attribute")
         op = rule.get("operation")
         val = rule.get("value")
 
         if attr == "level":
-            if vacancy.level_id is None or vacancy.level is None:
-                continue  # No level on vacancy → skip this filter
+            if vacancy_level_id is None or vacancy_level is None:
+                # PAD-86: fail CLOSED. A vacancy with no level anywhere (not on
+                # the vacancy, not on the class, not on the parent lesson)
+                # cannot satisfy a level rule, so nobody passes. Skipping the
+                # filter here (the old behaviour) turned a level-only group
+                # into "invite the coach's whole roster".
+                return False
             if cp.level is None:
                 return False
             if op == "same_as_vacancy":
-                if cp.level_id != vacancy.level_id:
+                if cp.level_id != vacancy_level_id:
                     return False
             elif op == "one_above_vacancy":
-                if cp.level_id not in _level_ids_one_above(vacancy.level, coach_id):
+                if cp.level_id not in _level_ids_one_above(vacancy_level, coach_id):
                     return False
             elif op == "one_below_vacancy":
-                if cp.level_id not in _level_ids_one_below(vacancy.level, coach_id):
+                if cp.level_id not in _level_ids_one_below(vacancy_level, coach_id):
                     return False
             elif op in ("all_above_vacancy", "all_below_vacancy"):
                 # PAD-70: compare ladder POSITIONS (0 = strongest), never the raw
                 # display_order values — see level_ladder.py.
                 ladder = get_level_ladder(coach_id)
-                vd = ladder_index(ladder, vacancy.level_id)
+                vd = ladder_index(ladder, vacancy_level_id)
                 cd = ladder_index(ladder, cp.level_id)
                 if vd is None or cd is None:
                     return False
@@ -441,7 +530,7 @@ def _get_eligible_students_for_group(
     coach_players = [
         cp for cp in Association_CoachPlayer.query.filter_by(coach_id=coach_id).all()
         if cp.player_id not in excluded_ids
-        and _passes_group_rules(rules, cp, vacancy, coach_id)
+        and _passes_group_rules(rules, cp, vacancy, coach_id, instance)
     ]
 
     restrictions = config.get_restrictions()
@@ -526,10 +615,15 @@ def get_eligible_students(
     criteria = round_cfg.get("criteria", [])
     criteria_values = round_cfg.get("criteria_values", {})
 
+    vacancy_level_id, _ = _vacancy_level(vacancy, instance)
+
     for criterion in criteria:
         if criterion == "same_level":
-            if vacancy.level_id is not None:
-                coach_players = [cp for cp in coach_players if cp.level_id == vacancy.level_id]
+            # PAD-86: fail closed — no level anywhere means nobody matches.
+            if vacancy_level_id is None:
+                coach_players = []
+            else:
+                coach_players = [cp for cp in coach_players if cp.level_id == vacancy_level_id]
 
         elif criterion == "same_side":
             if vacancy.side is not None:
@@ -976,7 +1070,10 @@ def _create_vacancy_for_absent_player(
         coach_id=coach_id, player_id=absent_player_id
     ).first()
     side = cp.side if cp else None
-    level_id = cp.level_id if cp else None
+    # PAD-86: snapshot the departing player's level, falling back to the class's
+    # effective level when the player has none — never leave the vacancy
+    # level-less, which would disable every level rule downstream.
+    level_id = (cp.level_id if cp else None) or effective_level_id(instance)
 
     config = get_or_create_config(coach_id)
 
@@ -1015,7 +1112,8 @@ def _create_structural_vacancies(instance: LessonInstance, coach_id: int) -> lis
             coach_id=coach_id,
             original_player_id=None,
             side=None,
-            level_id=instance.level_id,
+            # PAD-86: the level often lives only on the parent lesson.
+            level_id=effective_level_id(instance),
             status="open",
             approval_status=approval_status,
         )
@@ -1099,7 +1197,7 @@ def send_class_reminders(instance_id: int, *, now: datetime | None = None) -> di
     templates = config.get_message_templates(locale)
     reminder_count = config.get_reminder_count()
 
-    level_code = instance.level.code if getattr(instance, "level", None) else ""
+    level_code = effective_level_code(instance)
     weekday = _format_weekday(instance.start_datetime, locale)
     time_str = instance.start_datetime.strftime("%H:%M") if instance.start_datetime else ""
 
@@ -1742,7 +1840,7 @@ def _send_invitation_batch(
     coach_user_id = coach_obj.user_id if coach_obj else None
     locale = _resolve_locale(coach_obj)
     templates = config.get_message_templates(locale)
-    level_code = instance.level.code if getattr(instance, "level", None) else ""
+    level_code = effective_level_code(instance)
     weekday = _format_weekday(instance.start_datetime, locale)
     time_str = instance.start_datetime.strftime("%H:%M") if instance.start_datetime else ""
 
@@ -2285,7 +2383,7 @@ def send_manual_notifications(
         if coach_user_id and player_user_id:
             player = Player.query.get(player_id)
             player_name = (player.user.name if player and player.user else "there").split()[0]
-            level_code = instance.level.code if getattr(instance, "level", None) else ""
+            level_code = effective_level_code(instance)
             weekday = _format_weekday(instance.start_datetime, locale)
             time_str = instance.start_datetime.strftime("%H:%M") if instance.start_datetime else ""
 
@@ -2498,7 +2596,9 @@ def _check_waiting_list(
             passes = True
             for criterion in criteria:
                 if criterion == "same_level":
-                    if vacancy.level_id is not None and cp.level_id != vacancy.level_id:
+                    # PAD-86: fail closed — no level anywhere, nobody passes.
+                    vacancy_level_id, _ = _vacancy_level(vacancy, instance)
+                    if vacancy_level_id is None or cp.level_id != vacancy_level_id:
                         passes = False
                         break
                 elif criterion == "same_side":
@@ -2573,7 +2673,7 @@ def _fill_from_waiting_list(
     templates = config.get_message_templates(locale)
     player = Player.query.get(entry.player_id)
     player_name = (player.user.name if player and player.user else "there").split()[0]
-    level_code = instance.level.code if getattr(instance, "level", None) else ""
+    level_code = effective_level_code(instance)
     weekday = _format_weekday(instance.start_datetime, locale)
     time_str = instance.start_datetime.strftime("%H:%M") if instance.start_datetime else ""
 
@@ -2655,7 +2755,7 @@ def get_notification_groups(
         obj = LessonInstance.query.get(original_id)
         if obj is None:
             return []
-        level_id = obj.level_id or (obj.lesson.default_level_id if obj.lesson else None)
+        level_id = effective_level_id(obj)
         enrolled_ids = {rel.player_id for rel in obj.players_relations}
         already_notified_ids = {
             e.player_id
@@ -2669,7 +2769,7 @@ def get_notification_groups(
         obj = Lesson.query.get(original_id)
         if obj is None:
             return []
-        level_id = obj.default_level_id
+        level_id = effective_level_id(obj)
         enrolled_ids = {rel.player_id for rel in obj.players_relations}
 
     all_coach_players = [
