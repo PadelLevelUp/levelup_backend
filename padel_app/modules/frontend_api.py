@@ -1549,3 +1549,23 @@ def confirm_training():
     return jsonify({
         "plannedExerciseIds": [str(t.exercise_id) for t in training],
     })
+
+
+# -------------------------------------------------------------------
+# Dashboard – manual notification for pending confirmations (PAD-78)
+# -------------------------------------------------------------------
+# NOTE: added at the end of the file (frontend_api.py is also touched by the
+# open PR #54); import is local to keep the top-of-file import block untouched
+# and minimise merge conflicts.
+
+@bp.post("/dashboard/pending-confirmations/notify")
+@jwt_required()
+def notify_pending_confirmations_route():
+    from padel_app.helpers.dashboard.pending import notify_pending_confirmations
+
+    coach = current_coach()
+    if coach is None:
+        abort(403, "Only coaches can send confirmation reminders")
+
+    result = notify_pending_confirmations(coach_id=coach.id)
+    return jsonify(result)
