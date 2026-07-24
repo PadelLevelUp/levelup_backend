@@ -295,7 +295,13 @@ def create_conversation_service(data, user):
             _assert_messageable(user, other_id)
 
         payload = {
-            "is_group": len(participants) >= 2 or False,
+            # PAD-93: `participants` always includes the creator, so the old
+            # `len(participants) >= 2` was true for every 1-on-1 DM as well.
+            # It was masked for the whole life of the app because the Boolean
+            # form field coerced the real `True` back to `False` (PAD-69);
+            # now that booleans survive, the expression itself has to be
+            # right or every DM would be flagged as a group chat.
+            "is_group": len(set(participants)) > 2,
             "participant_ids": participants,
             "creator_id": user.id,
             "participant_key": key,
