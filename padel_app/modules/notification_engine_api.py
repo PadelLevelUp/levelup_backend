@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from flask import Blueprint, abort, jsonify, request
+from flask import Blueprint, abort, current_app, jsonify, request
 from flask_jwt_extended import jwt_required, get_jwt_identity
 
 from padel_app.models import Lesson, LessonInstance, User
@@ -261,13 +261,36 @@ def standing_waiting_list_remove(entry_id: int):
 
 
 # ---------------------------------------------------------------------------
-# Debug / E2E test helpers (only active when app.debug is True)
+# Debug / E2E test helpers
 # ---------------------------------------------------------------------------
+# PAD-92: this route fabricates lessons, enrolments and scheduler jobs. It is
+# gated twice, and both gates fail closed:
+#
+#   1. a deploy-time flag (`E2E_DEBUG_ENDPOINTS`, unset everywhere but the
+#      Playwright webServer) — without it the route 404s as if it did not exist;
+#   2. `@jwt_required()` — even in an environment where the flag IS on, an
+#      anonymous caller cannot reach it.
+#
+# The flag is read from `app.config` first, falling back to the environment, so
+# a test app can enable it via `create_app({...})` without touching os.environ.
+# It is deliberately NOT defined in `config.py`: absent means off.
+
+
+def _debug_endpoints_enabled():
+    import os as _os
+
+    flag = current_app.config.get("E2E_DEBUG_ENDPOINTS")
+    if flag is None:
+        flag = _os.getenv("E2E_DEBUG_ENDPOINTS")
+    return str(flag).strip().lower() in ("1", "true", "yes", "on")
+
 
 @bp.post("/debug/schedule_reminder_test")
+@jwt_required()
 def debug_schedule_reminder_test():
     """
-    E2E test helper — only active when E2E_DEBUG_ENDPOINTS env var is set.
+    E2E test helper — only active when the E2E_DEBUG_ENDPOINTS flag is set AND
+    the caller presents a valid JWT.
 
     Creates a LessonInstance for the e2e-coach with TWO enrolled students
     (e2e-student and e2e-student-2) whose start_datetime is
@@ -282,8 +305,7 @@ def debug_schedule_reminder_test():
         "studentIds": [int, int]
     }
     """
-    import os as _os
-    if not _os.getenv("E2E_DEBUG_ENDPOINTS"):
+    if not _debug_endpoints_enabled():
         abort(404)
 
     from datetime import timedelta

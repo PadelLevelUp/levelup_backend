@@ -1,10 +1,20 @@
-import requests
+"""Dev-only demo seeder.
+
+PAD-92: this script used to POST anonymously to the `/api/app/*` entity-creation
+routes and to `/api/delete/<model>/<id>`. Those `/api/app/*` shortcuts have been
+deleted (they were unauthenticated) and the generic CRUD API requires an admin
+JWT since PAD-88, so everything now goes through `_seed_auth`, authenticated as
+an administrator. Export SEED_ADMIN_USERNAME / SEED_ADMIN_PASSWORD first.
+"""
 import json
 from datetime import datetime, timedelta
 from dateutil.relativedelta import relativedelta
 
-BASE_URL = "http://127.0.0.1:5000/api"
+from _seed_auth import admin_session, create as api_create, delete as api_delete
+
 PASSWORD = "test1234"
+
+SESSION = admin_session()
 
 created_objects = []
 
@@ -20,20 +30,14 @@ def cleanup():
     print("\n⚠️  Cleaning up created objects...")
     for model, obj_id in reversed(created_objects):
         try:
-            r = requests.post(f"http://127.0.0.1:5000/api/delete/{model}/{obj_id}")
-            if r.status_code not in (200, 201):
-                print("ERROR:", r.status_code, r.text)
-                raise ValueError('Expected 200 or 201')
+            api_delete(SESSION, model, obj_id)
             print(f"Deleted {model} {obj_id}")
         except Exception as e:
             print(f"Failed to delete {model} {obj_id}: {e}")
 
-def post(path, payload):
-    r = requests.post(f"{BASE_URL}{path}", json=payload)
-    if r.status_code not in (200, 201):
-        print("ERROR:", path, r.status_code, r.text)
-        raise ValueError('Expected 200 or 201')
-    return r.json()
+def post(model, payload):
+    """Create an entity through the admin CRUD API."""
+    return api_create(SESSION, model, payload)
 
 def today():
     return datetime.utcnow().date()
@@ -46,7 +50,7 @@ try:
     # 0. CLUB
     # -----------------------------
 
-    club = track("Club", post("/app/club", {
+    club = track("Club", post("club", {
         "name": "Douro Padel",
     }))
 
@@ -57,7 +61,7 @@ try:
     # 1. COACH USER + COACH
     # -----------------------------
 
-    coach_user = track("User", post("/app/user", {
+    coach_user = track("User", post("user", {
         "name": "Bernardo Terroso",
         "username": "bernardo_terroso",
         "email": "bernardo@academy.pt",
@@ -65,7 +69,7 @@ try:
         "password": PASSWORD,
     }))
     
-    coach_user2 = track("User", post("/app/user", {
+    coach_user2 = track("User", post("user", {
         "name": "Catarina Vilela",
         "username": "catarina_vilela",
         "email": "catarina_vilela@academy.pt",
@@ -78,11 +82,11 @@ try:
     print("User ID:", USER_ID)
     print("User ID:", USER2_ID)
 
-    coach = track("Coach", post("/app/coach", {
+    coach = track("Coach", post("coach", {
         "user": USER_ID
     }))
     
-    coach2 = track("Coach", post("/app/coach", {
+    coach2 = track("Coach", post("coach", {
         "user": USER2_ID
     }))
 
@@ -98,19 +102,19 @@ try:
 
     levels = {}
 
-    levels["beginner"] = track("CoachLevel", post("/app/coach_level", {
+    levels["beginner"] = track("CoachLevel", post("coachlevel", {
         "coach": COACH_ID,
         "label": "Beginner",
         "code": "B",
     }))
 
-    levels["intermediate"] = track("CoachLevel", post("/app/coach_level", {
+    levels["intermediate"] = track("CoachLevel", post("coachlevel", {
         "coach": COACH_ID,
         "label": "Intermediate",
         "code": "I",
     }))
 
-    levels["advanced"] = track("CoachLevel", post("/app/coach_level", {
+    levels["advanced"] = track("CoachLevel", post("coachlevel", {
         "coach": COACH_ID,
         "label": "Advanced",
         "code": "A",
@@ -136,7 +140,7 @@ try:
     player_ids = []
 
     for name, email, phone in players_data:
-        user =  track("User", post("/app/user", {
+        user =  track("User", post("user", {
             "name": name,
             "email": email,
             "phone": phone,
@@ -144,7 +148,7 @@ try:
             "status": "active" if email in ["tomaspacheco@gmail.com", "dudasbf@gmail.com", "diogom@gmail.com"] else None,
             "username": email.split("@")[0],
         }))
-        player = track("Player", post("/app/player", {
+        player = track("Player", post("player", {
             "user": user["id"],
             "coach": COACH_ID
         }))
@@ -160,7 +164,7 @@ try:
     lessons = {}
 
     # 4.1 Academy – 1 month
-    lessons["academy_1_month"] = track("Lesson", post("/app/lesson", {
+    lessons["academy_1_month"] = track("Lesson", post("lesson", {
         "title": "Academia Principiantes",
         "description": "Academia para iniciantes",
         "type": "academy",
@@ -182,7 +186,7 @@ try:
     }))
 
     # 4.2 Academy – 2 weeks
-    lessons["academy_2_weeks"] = track("Lesson", post("/app/lesson", {
+    lessons["academy_2_weeks"] = track("Lesson", post("lesson", {
         "title": "Academia Intermédios",
         "description": "Grupo intermédio",
         "type": "academy",
@@ -204,7 +208,7 @@ try:
     }))
 
     # 4.3 Academy – 3 months
-    lessons["academy_3_months"] = track("Lesson", post("/app/lesson", {
+    lessons["academy_3_months"] = track("Lesson", post("lesson", {
         "title": "Academia Avançados",
         "description": "Treino avançado",
         "type": "academy",
@@ -226,7 +230,7 @@ try:
     }))
 
     # 4.4 Private – no recurrence
-    lessons["private_single"] = track("Lesson", post("/app/lesson", {
+    lessons["private_single"] = track("Lesson", post("lesson", {
         "title": "Aula Privada António",
         "description": "Sessão individual",
         "type": "private",
@@ -249,7 +253,7 @@ try:
     # -----------------------------
 
     # Recurring block
-    track("CalendarBlock", post("/app/calendar_block", {
+    track("CalendarBlock", post("calendarblock", {
         "user": USER_ID,
         "title": "Almoço",
         "type": "break",
@@ -264,7 +268,7 @@ try:
     }))
 
     # One-off block
-    track("CalendarBlock", post("/app/calendar_block", {
+    track("CalendarBlock", post("calendarblock", {
         "user": USER_ID,
         "title": "Consulta médico",
         "type": "personal",
@@ -273,11 +277,9 @@ try:
         "is_recurring": False,
     }))
     
-    track("AssociationCoachClub", post("/create/association_coachclub",{
-        "values":{            
-            "coach": COACH_ID,
-            "club": CLUB_ID
-        }
+    track("AssociationCoachClub", post("association_coachclub", {
+        "coach": COACH_ID,
+        "club": CLUB_ID,
     }))
 
     print("\n✅ FRONTEND DEMO DATA SEEDED SUCCESSFULLY")

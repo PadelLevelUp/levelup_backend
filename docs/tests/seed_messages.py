@@ -1,7 +1,21 @@
-import requests
+"""Dev-only conversation/message seeder.
+
+PAD-92: this script used to POST anonymously to `/api/delete/<model>/<id>`
+(rejected with 401 since PAD-88) and to the JWT-guarded `/api/app/conversation`
+and `/api/app/message` routes without a token. It now authenticates as an
+administrator and writes the rows through the admin CRUD API.
+
+Going through the admin CRUD API rather than `/api/app/*` is deliberate: those
+routes derive the sender and the timestamp from the calling JWT and "now", but a
+demo transcript needs backdated messages attributed to several different people.
+
+Export SEED_ADMIN_USERNAME / SEED_ADMIN_PASSWORD before running.
+"""
 from datetime import datetime
 
-BASE_URL = "http://127.0.0.1:5000/api/app"
+from _seed_auth import admin_session, create as api_create, delete as api_delete
+
+SESSION = admin_session()
 
 created_objects = []
 
@@ -13,25 +27,21 @@ def cleanup():
     print("\n⚠️  Cleaning up created objects...")
     for model, obj_id in reversed(created_objects):
         try:
-            r = requests.post(
-                f"http://127.0.0.1:5000/api/delete/{model}/{obj_id}"
-            )
-            if r.status_code not in (200, 201):
-                print("ERROR:", r.status_code, r.text)
-            else:
-                print(f"Deleted {model} {obj_id}")
+            api_delete(SESSION, model, obj_id)
+            print(f"Deleted {model} {obj_id}")
         except Exception as e:
             print(f"Failed to delete {model} {obj_id}: {e}")
 
-def post(path, payload):
-    r = requests.post(f"{BASE_URL}{path}", json=payload)
-    if r.status_code not in (200, 201):
-        print("ERROR:", path, r.status_code, r.text)
-        raise ValueError("Expected 200 or 201")
-    return r.json()
+def post(model, payload):
+    """Create an entity through the admin CRUD API."""
+    return api_create(SESSION, model, payload)
 
 def iso(ts):
     return datetime.fromisoformat(ts).isoformat()
+
+def participant_key(participant_ids):
+    """Mirrors Conversation.build_participant_key (RULES.md #17)."""
+    return ",".join(map(str, sorted(set(participant_ids))))
 
 try:
     # -------------------------------------------------
@@ -101,10 +111,11 @@ try:
         # -------------------------
         participant_ids = [users[p] for p in conv["participants"]]
 
-        conversation = track("Conversation", post("/conversation", {
+        conversation = track("Conversation", post("conversation", {
             "is_group": False,
             "participant_ids": participant_ids,
             "creator_id": COACH_USER_ID,
+            "participant_key": participant_key(participant_ids),
         }))
 
         CONV_ID = conversation["id"]
@@ -113,7 +124,7 @@ try:
         # Create messages
         # -------------------------
         for sender_id, text, timestamp in conv["messages"]:
-            track("Message", post("/message", {
+            track("Message", post("message", {
                 "conversation": CONV_ID,
                 "sender": sender_id,
                 "text": text,
