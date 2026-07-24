@@ -1233,13 +1233,13 @@ def check_field_available():
         # JWT. Previously it came from the request body, which let an anonymous
         # caller probe any coach's roster for the names on it. The legacy body
         # field is still accepted, but only as an assertion.
-        assert_acting_coach_scope = data.get("scope", data.get("coach"))
+        claimed_scope = data.get("scope", data.get("coach"))
         caller_coach = current_coach()
         if caller_coach is None:
             # A student has no roster to check against — skip the warn rather
             # than falling back to a global match.
             return jsonify({"available": True})
-        assert_acting_coach(caller_coach, assert_acting_coach_scope)
+        assert_acting_coach(caller_coach, claimed_scope)
         coach_id = caller_coach.id
 
         exists = (
