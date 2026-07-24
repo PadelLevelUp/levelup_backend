@@ -32,6 +32,21 @@ def get_engine_url():
         return str(get_engine().url).replace('%', '%%')
 
 
+def guard_migration_target():
+    """Fail closed when a non-production process targets a production DB.
+
+    See PAD-95. Override with ALLOW_PRODUCTION_MIGRATIONS=1 when this is
+    genuinely intended.
+    """
+    from padel_app.config import assert_safe_migration_target
+
+    host = get_engine().url.host
+    assert_safe_migration_target(host)
+    logger.info('Running migrations against database host %s', host)
+
+
+guard_migration_target()
+
 # add your model's MetaData object here
 # for 'autogenerate' support
 # from myapp import mymodel
