@@ -10,7 +10,6 @@ from padel_app.models import *
 from padel_app.realtime import subscribe, unsubscribe
 from padel_app.serializers.calendar_event import serialize_calendar_event
 from padel_app.serializers.lesson import (
-    serialize_lesson,
     serialize_lesson_instance,
     serialize_class_instance,
 )
@@ -41,17 +40,13 @@ from padel_app.helpers.dashboard_services import build_dashboard_payload
 
 from padel_app.services.lesson_service import (
     get_or_materialize_instance,
-    create_lesson_helper,
     add_class_service,
-    edit_lesson_from_data,
     confirm_presences_service,
-    update_lesson_status_service,
     get_lesson_instances_in_range,
     edit_class_service,
     remove_class_service,
 )
 from padel_app.services.player_service import (
-    create_player_service,
     get_players_list,
     get_player_profile,
     add_player_service,
@@ -61,13 +56,9 @@ from padel_app.services.player_service import (
     get_coach_players_paginated,
 )
 from padel_app.services.user_service import (
-    create_user_service,
-    edit_user_service,
     activate_user_service,
 )
 from padel_app.services.club_service import (
-    create_club_service,
-    edit_club_service,
     create_coach_invitation_service,
     get_coach_invitation_service,
     accept_coach_invitation_service,
@@ -81,8 +72,6 @@ from padel_app.services.player_invitation_service import (
     revoke_player_invitation_service,
 )
 from padel_app.services.coach_service import (
-    create_coach_service,
-    create_coach_level_service,
     upsert_coach_levels,
     upsert_evaluation_categories,
     add_coach_note_service,
@@ -104,8 +93,6 @@ from padel_app.services.messaging_service import (
     report_message_service,
 )
 from padel_app.services.calendar_service import (
-    create_calendar_block_service,
-    edit_calendar_block_service,
     add_event_service,
     edit_event_service,
     reschedule_block_service,
@@ -193,6 +180,105 @@ def current_player():
 def current_club():
     coach = current_coach()
     return coach.current_club
+
+
+# -------------------------------------------------------------------
+# Authorization helpers (PAD-92)
+# -------------------------------------------------------------------
+# Until PAD-92 a large part of this blueprint carried no auth decorator at all,
+# and the services behind it read `coachId` / `playerId` / `id` straight out of
+# the request body. Adding `@jwt_required()` on its own would only have turned an
+# anonymous hole into an IDOR: any logged-in user could still edit or delete
+# another coach's players, classes, levels and notes.
+#
+# The rule these helpers enforce, matching RULES.md #2 ("coach-scoped data"):
+#   * the acting coach is always derived from the JWT, never from the body;
+#   * a body-supplied owner id is only ever accepted when it matches the JWT's;
+#   * touching a row owned by somebody else is 403, not 404, and never mutates.
+
+
+def require_coach():
+    """Return the calling ``Coach``, or 403 when the caller has no coach profile."""
+    coach = current_coach()
+    if coach is None:
+        abort(403, "User is not a coach")
+    return coach
+
+
+def assert_acting_coach(coach, claimed_coach_id):
+    """Reject a request whose body claims to act as a *different* coach.
+
+    The body value is legacy payload shape — the apps still send `coachId`. We
+    keep accepting it, but only as an assertion: it must agree with the JWT.
+    """
+    if claimed_coach_id in (None, ""):
+        return
+    try:
+        claimed = int(claimed_coach_id)
+    except (TypeError, ValueError):
+        abort(400, "coachId must be an integer")
+    if claimed != coach.id:
+        abort(403, "Not authorized to act on behalf of another coach")
+
+
+def _required_int_id(data, key="id"):
+    """Read a required integer id out of a JSON body (400 when absent/invalid)."""
+    raw = (data or {}).get(key)
+    if raw in (None, ""):
+        abort(400, f"{key} is required")
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        abort(400, f"{key} must be an integer")
+
+
+def coach_owns_lesson(coach, lesson):
+    if lesson is None:
+        return False
+    return any(rel.coach_id == coach.id for rel in lesson.coaches_relations)
+
+
+def coach_owns_instance(coach, instance):
+    """A coach owns an instance directly, or through its parent lesson."""
+    if instance is None:
+        return False
+    if any(rel.coach_id == coach.id for rel in instance.coaches_relations):
+        return True
+    return coach_owns_lesson(coach, instance.lesson)
+
+
+def require_owned_class(coach, model_name, class_id):
+    """Load a Lesson/LessonInstance and assert the calling coach owns it."""
+    normalized = (model_name or "").strip().lower()
+    if normalized == "lesson":
+        obj = Lesson.query.get_or_404(class_id)
+        owned = coach_owns_lesson(coach, obj)
+    elif normalized in ("lessoninstance", "lesson_instance"):
+        obj = LessonInstance.query.get_or_404(class_id)
+        owned = coach_owns_instance(coach, obj)
+    else:
+        abort(400, "Unsupported model")
+
+    if not owned:
+        abort(403, "Not authorized to modify this class")
+    return obj
+
+
+def require_own_roster_relation(coach, player_id):
+    """Load the caller's Association_CoachPlayer row for ``player_id`` (403 if none)."""
+    if player_id in (None, ""):
+        abort(400, "playerId is required")
+    try:
+        pid = int(player_id)
+    except (TypeError, ValueError):
+        abort(400, "playerId must be an integer")
+
+    rel = Association_CoachPlayer.query.filter_by(
+        coach_id=coach.id, player_id=pid
+    ).first()
+    if rel is None:
+        abort(403, "Not authorized to modify this player")
+    return rel
 
 
 # -------------------------------------------------------------------
@@ -481,16 +567,12 @@ def get_seasons():
     return jsonify([serialize_season(s) for s in list_seasons(coach)])
 
 
-@bp.get("/lessons")
-def get_lessons():
-    return jsonify([serialize_lesson(lesson) for lesson in Lesson.query.all()])
-
-
-@bp.get("/calendar_block")
-def calendar_block():
-    return jsonify([
-        serialize_calendar_block(b) for b in CalendarBlock.query.all()
-    ])
+# PAD-92: `GET /lessons` and `GET /calendar_block` used to dump EVERY lesson and
+# EVERY calendar block in the database to an anonymous caller. Nothing in the web
+# app, the mobile app, the issue bot, the Playwright specs or the seed scripts
+# referenced them, so they are removed rather than guarded — the scoped
+# equivalents (`/calendar`, `/lesson_instances`, `/calendar_block/<id>`) already
+# cover every real use case.
 
 
 @bp.get("/evaluation_categories")
@@ -534,6 +616,7 @@ def lesson_instance_presences(instance_id):
 
 
 @bp.get("/calendar_event")
+@jwt_required()
 def calendar_event():
     event_types = {
         "lesson": Lesson,
@@ -545,8 +628,37 @@ def calendar_event():
 
     if not model:
         abort(400, "model is required")
+    if model not in event_types:
+        abort(400, "Unsupported model")
 
     current_event = event_types[model].query.get_or_404(id)
+
+    # PAD-92: this route used to hand any calendar row to any caller, by id.
+    # A coach may read their own lessons/instances; a student may read the ones
+    # they are enrolled in; calendar blocks belong to a single user.
+    coach = current_coach()
+    player = current_player()
+
+    if model == "calendar_block":
+        if current_event.user_id != current_user().id:
+            abort(403, "Not authorized to view this calendar event")
+    elif model == "lesson":
+        allowed = coach_owns_lesson(coach, current_event) if coach else False
+        if not allowed and player is not None:
+            allowed = any(
+                rel.player_id == player.id for rel in current_event.players_relations
+            )
+        if not allowed:
+            abort(403, "Not authorized to view this calendar event")
+    else:  # lesson_instance
+        allowed = coach_owns_instance(coach, current_event) if coach else False
+        if not allowed and player is not None:
+            allowed = any(
+                rel.player_id == player.id for rel in current_event.players_relations
+            )
+        if not allowed:
+            abort(403, "Not authorized to view this calendar event")
+
     return jsonify(serialize_calendar_event(current_event))
 
 
@@ -609,53 +721,18 @@ def player_profile(player_id):
 # CREATE
 # -------------------------------------------------------------------
 
-@bp.post("/club")
-def create_club():
-    data = request.get_json() or {}
-    club = create_club_service(data)
-    return jsonify({"id": club.id}), 201
-
-
-@bp.post("/user")
-def create_user():
-    data = request.get_json() or {}
-    user = create_user_service(data)
-    return jsonify({"id": user.id}), 201
-
-
-@bp.post("/player")
-def create_player():
-    data = request.get_json() or {}
-    player = create_player_service(data)
-    return jsonify({"id": player.id}), 201
-
-
-@bp.post("/coach")
-def create_coach():
-    data = request.get_json() or {}
-    coach = create_coach_service(data)
-    return jsonify({"id": coach.id}), 201
-
-
-@bp.post("/coach_level")
-def create_coach_level():
-    data = request.get_json() or {}
-    coach_level = create_coach_level_service(data)
-    return jsonify({"id": coach_level.id}), 201
-
-
-@bp.post("/lesson")
-def create_lesson():
-    data = request.get_json() or {}
-    lesson = create_lesson_helper(data)
-    return jsonify(serialize_lesson(lesson)), 201
-
-
-@bp.post("/calendar_block")
-def create_calendar_block():
-    data = request.get_json() or {}
-    block = create_calendar_block_service(data)
-    return jsonify(serialize_calendar_block(block)), 201
+# PAD-92: the raw entity-creation routes below this line were removed.
+#
+#   POST /club, /user, /player, /coach, /coach_level, /lesson, /calendar_block
+#
+# All seven were unauthenticated thin wrappers around a create-service, letting
+# an anonymous caller mint clubs, users, coaches and lessons at will. None of
+# them had a caller in `apps/web`, `apps/mobile`, `packages/api`,
+# `levelup_issue_bot`, the Playwright specs or `e2e/scripts/seed.py`; the real
+# clients use the scoped routes (`/add_player`, `/incomplete_player`,
+# `/add_coach_level`, `/add_class`, `/add_event`), which derive the owning coach
+# from the JWT. Deleting them removes the attack surface entirely rather than
+# guarding a route nobody uses.
 
 
 @bp.post("/message")
@@ -862,18 +939,10 @@ def add_evaluation_entry():
 # EDIT / DOMAIN ACTIONS
 # -------------------------------------------------------------------
 
-@bp.post("/user/<int:user_id>")
-def edit_user(user_id):
-    data = request.get_json() or {}
-    edit_user_service(user_id, data)
-    return jsonify(success=True)
-
-
-@bp.post("/club/<int:club_id>")
-def edit_club(club_id):
-    data = request.get_json() or {}
-    edit_club_service(club_id, data)
-    return jsonify(success=True)
+# PAD-92: `POST /user/<id>` and `POST /club/<id>` were unauthenticated arbitrary
+# edits of any user or club row, by id — an anonymous caller could rewrite any
+# account. Neither had a caller anywhere in the repos; profile edits go through
+# `/api/account/profile` and club edits through the admin editor. Removed.
 
 
 # -------------------------------------------------------------------
@@ -954,8 +1023,15 @@ def revoke_coach_invitation(token):
 # -------------------------------------------------------------------
 
 @bp.post("/incomplete_player")
+@jwt_required()
 def create_incomplete_player():
     data = request.get_json() or {}
+    # PAD-92: the invitation is always issued by the CALLING coach. The body's
+    # legacy `coachId` is kept for payload compatibility but only as an
+    # assertion — it may not name a different coach.
+    coach = require_coach()
+    assert_acting_coach(coach, data.get("coachId"))
+    data["coachId"] = coach.id
     invitation = create_incomplete_player_service(data)
     return jsonify({
         "token": invitation.token,
@@ -990,19 +1066,10 @@ def revoke_player_invitation(token):
     return jsonify({"success": True})
 
 
-@bp.post("/lesson/<int:lesson_id>")
-def edit_lesson(lesson_id):
-    lesson = Lesson.query.get_or_404(lesson_id)
-    data = request.get_json() or {}
-    lesson = edit_lesson_from_data(lesson, data)
-    return jsonify(serialize_lesson(lesson))
-
-
-@bp.post("/calendar_block/<int:block_id>")
-def edit_calendar_block(block_id):
-    data = request.get_json() or {}
-    block = edit_calendar_block_service(block_id, data)
-    return jsonify(serialize_calendar_block(block))
+# PAD-92: `POST /lesson/<id>` and `POST /calendar_block/<id>` were
+# unauthenticated edits of any lesson or block by id. Both are dead legacy
+# duplicates — the apps edit classes through `/edit_class` and blocks through the
+# `@jwt_required()` `PUT /calendar_block/<id>`. Removed.
 
 
 @bp.post("/class_instance/presences/confirm")
@@ -1064,23 +1131,42 @@ def confirm_presences():
     })
 
 
-@bp.post("/lesson/<int:lesson_id>/status")
-def update_lesson_status(lesson_id):
-    data = request.get_json()
-    instance = update_lesson_status_service(lesson_id, data)
-    return jsonify(serialize_lesson_instance(instance))
+# PAD-92: `POST /lesson/<id>/status` was an unauthenticated status mutation on
+# any lesson by id, with no caller in any repo. Removed.
+
+
+def _assert_owns_class_payload(coach, data):
+    """Shared guard for /edit_class and /remove_class (PAD-92).
+
+    Both take ``{"event": {"model": ..., "originalId": ...}, "scope": ...}`` and
+    hand it straight to a service that resolves the row by id. Resolve and
+    ownership-check the target here, BEFORE the service mutates anything.
+    """
+    event = data.get("event") or {}
+    model = event.get("model")
+    original_id = event.get("originalId")
+
+    # Payload-shape errors stay 400 — the services already return that, and we
+    # must not turn a malformed body into a misleading 403.
+    if not model or original_id in (None, ""):
+        return None
+    return require_owned_class(coach, model, original_id)
 
 
 @bp.post("/edit_class")
+@jwt_required()
 def edit_class():
     data = request.get_json() or {}
+    _assert_owns_class_payload(require_coach(), data)
     result, status = edit_class_service(data)
     return jsonify(result), status
 
 
 @bp.post("/remove_class")
+@jwt_required()
 def remove_class():
     data = request.get_json() or {}
+    _assert_owns_class_payload(require_coach(), data)
     result, status = remove_class_service(data)
     return jsonify(result), status
 
@@ -1105,6 +1191,7 @@ WARN_DUPLICATE_CHECKS = {
 
 
 @bp.post("/check_field_available")
+@jwt_required()
 def check_field_available():
     """Check whether a field value is available for any whitelisted model.
 
@@ -1149,16 +1236,18 @@ def check_field_available():
         # to the requesting coach's roster.
         from sqlalchemy import func
 
-        scope_raw = data.get("scope", data.get("coach"))
-        try:
-            coach_id = int(scope_raw) if scope_raw not in (None, "") else None
-        except (TypeError, ValueError):
-            coach_id = None
-
-        # Without a coach scope we cannot tell whose roster to check, so we skip
-        # the warn entirely rather than emit a false global duplicate.
-        if coach_id is None:
+        # PAD-92: the roster scope is the CALLER's own coach id, taken from the
+        # JWT. Previously it came from the request body, which let an anonymous
+        # caller probe any coach's roster for the names on it. The legacy body
+        # field is still accepted, but only as an assertion.
+        claimed_scope = data.get("scope", data.get("coach"))
+        caller_coach = current_coach()
+        if caller_coach is None:
+            # A student has no roster to check against — skip the warn rather
+            # than falling back to a global match.
             return jsonify({"available": True})
+        assert_acting_coach(caller_coach, claimed_scope)
+        coach_id = caller_coach.id
 
         exists = (
             ModelClass.query
@@ -1179,58 +1268,87 @@ def check_field_available():
 
 
 @bp.post("/add_player")
+@jwt_required()
 def add_player():
     data = request.get_json() or {}
+    # PAD-92: the new player joins the CALLING coach's roster.
+    coach = require_coach()
+    assert_acting_coach(coach, data.get("coachId"))
+    data["coachId"] = coach.id
     coach_player_info = add_player_service(data)
     return jsonify(coach_player_info)
 
 
 @bp.post("/edit_player")
+@jwt_required()
 def edit_player():
     data = request.get_json() or {}
+    # PAD-92: `player.coachId` used to select which coach-player relation to
+    # edit, straight from the body — so any caller could rewrite any coach's
+    # notes/level/side for any player. Pin it to the JWT and require the player
+    # to actually be on the caller's roster.
+    coach = require_coach()
+    player_info = data.get("player") or {}
+    assert_acting_coach(coach, player_info.get("coachId"))
+    require_own_roster_relation(coach, player_info.get("playerId"))
+    player_info["coachId"] = coach.id
+    data["player"] = player_info
     coach_player_info = edit_player_service(data)
     return jsonify(coach_player_info)
 
 
 @bp.post("/remove_player")
+@jwt_required()
 def remove_player():
     data = request.get_json() or {}
+    # PAD-92: a coach may only remove a player from their OWN roster.
+    coach = require_coach()
+    assert_acting_coach(coach, data.get("coachId"))
+    require_own_roster_relation(coach, data.get("playerId"))
+    data["coachId"] = coach.id
     result, status = remove_player_service(data)
     return jsonify(result), status
 
 
 @bp.post("/delete/coach_level")
+@jwt_required()
 def delete_coach_level():
+    """PAD-92: previously an anonymous `id`-only delete of any coach's level."""
     data = request.get_json() or {}
-    # PAD-101 belt-and-braces: a client that deletes a just-added, not-yet-saved
-    # row can send a temporary non-numeric id (e.g. "new-1753..."). Reject it as
-    # a clean 400 instead of letting int() raise a 500.
-    try:
-        level_id = int(data.get('id'))
-    except (TypeError, ValueError):
-        return jsonify({"error": "id must be numeric"}), 400
-    rel = CoachLevel.query.filter_by(id=level_id).first_or_404()
+    coach = require_coach()
+    rel = CoachLevel.query.filter_by(id=_required_int_id(data)).first_or_404()
+    if rel.coach_id != coach.id:
+        abort(403, "Not authorized to delete this level")
     rel.delete()
     return jsonify({"status": "Removed coach levels"}), 200
 
 
 @bp.post("/delete/evaluation_category")
+@jwt_required()
 def delete_evaluation_category():
+    """PAD-92: previously an anonymous `id`-only delete of any coach's category."""
     data = request.get_json() or {}
-    rel = EvaluationCategory.query.filter_by(id=int(data['id'])).first_or_404()
+    coach = require_coach()
+    rel = EvaluationCategory.query.filter_by(id=_required_int_id(data)).first_or_404()
+    if rel.coach_id != coach.id:
+        abort(403, "Not authorized to delete this evaluation category")
     rel.delete()
     return jsonify({"status": "Removed evaluation categories"}), 200
 
 
 @bp.post("/delete/coach_note")
+@jwt_required()
 def delete_coach_note():
+    """PAD-92: previously an anonymous `id`-only delete of any coach's note.
+
+    A note hangs off an ``Association_CoachPlayer`` row, so ownership is that
+    relation's ``coach_id``.
+    """
     data = request.get_json() or {}
-    # PAD-101 belt-and-braces: guard against a non-numeric id (see delete_coach_level).
-    try:
-        note_id = int(data.get('id'))
-    except (TypeError, ValueError):
-        return jsonify({"error": "id must be numeric"}), 400
-    rel = CoachPlayerNote.query.filter_by(id=note_id).first_or_404()
+    coach = require_coach()
+    rel = CoachPlayerNote.query.filter_by(id=_required_int_id(data)).first_or_404()
+    if rel.coach_player is None or rel.coach_player.coach_id != coach.id:
+        abort(403, "Not authorized to delete this note")
     rel.delete()
     return jsonify({"status": "Removed coach note"}), 200
 

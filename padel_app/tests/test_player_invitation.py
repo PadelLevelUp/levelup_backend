@@ -47,11 +47,14 @@ def _auth_header(app, user_id):
 # -------------------------------------------------------------------
 
 def test_create_incomplete_player_creates_invitation_and_inactive_user(client, app):
-    _, coach_id = make_coach(app)
+    user_id, coach_id = make_coach(app)
 
+    # PAD-92: /incomplete_player is now @jwt_required() — the inviting coach is
+    # taken from the token, not the body.
     resp = client.post(
         "/api/app/incomplete_player",
         json={"coachId": coach_id, "name": "Jane Player"},
+        headers=_auth_header(app, user_id),
     )
     assert resp.status_code == 201
     body = resp.get_json()
@@ -98,11 +101,12 @@ def test_create_incomplete_player_expires_in_7_days(app):
 # -------------------------------------------------------------------
 
 def test_resolve_valid_invitation_returns_player_name(client, app):
-    _, coach_id = make_coach(app)
+    user_id, coach_id = make_coach(app)
 
     create = client.post(
         "/api/app/incomplete_player",
         json={"coachId": coach_id, "name": "Resolve Me"},
+        headers=_auth_header(app, user_id),
     )
     token = create.get_json()["token"]
 
@@ -123,11 +127,12 @@ def test_resolve_unknown_token_404(client, app):
 # -------------------------------------------------------------------
 
 def test_accept_sets_credentials_and_activates_user(client, app):
-    _, coach_id = make_coach(app)
+    user_id, coach_id = make_coach(app)
 
     create = client.post(
         "/api/app/incomplete_player",
         json={"coachId": coach_id, "name": "Accept Me"},
+        headers=_auth_header(app, user_id),
     )
     token = create.get_json()["token"]
 
@@ -150,11 +155,12 @@ def test_accept_sets_credentials_and_activates_user(client, app):
 
 
 def test_accept_with_duplicate_username_409(client, app):
-    _, coach_id = make_coach(app, username="taken_username")
+    user_id, coach_id = make_coach(app, username="taken_username")
 
     create = client.post(
         "/api/app/incomplete_player",
         json={"coachId": coach_id, "name": "Dup Player"},
+        headers=_auth_header(app, user_id),
     )
     token = create.get_json()["token"]
 
@@ -195,3 +201,30 @@ def test_accept_expired_invitation_410(app):
                 data={"username": "late_player", "password": "pw123456"},
                 now=later,
             )
+
+
+# -------------------------------------------------------------------
+# PAD-92 — authorization on /incomplete_player
+# -------------------------------------------------------------------
+
+def test_incomplete_player_rejects_anonymous(client, app):
+    _, coach_id = make_coach(app, username="anon_guard_coach")
+
+    resp = client.post(
+        "/api/app/incomplete_player",
+        json={"coachId": coach_id, "name": "Anon Invite"},
+    )
+    assert resp.status_code == 401
+
+
+def test_incomplete_player_rejects_other_coachs_id(client, app):
+    """The body may not name a coach other than the token's (PAD-92)."""
+    _, victim_coach_id = make_coach(app, username="victim_coach")
+    attacker_user_id, _ = make_coach(app, username="attacker_coach")
+
+    resp = client.post(
+        "/api/app/incomplete_player",
+        json={"coachId": victim_coach_id, "name": "Injected Invite"},
+        headers=_auth_header(app, attacker_user_id),
+    )
+    assert resp.status_code == 403
