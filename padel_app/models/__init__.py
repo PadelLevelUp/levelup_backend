@@ -44,7 +44,11 @@ from .standing_waiting_list_entry import StandingWaitingListEntry
 from .bulk_import import BulkImport
 
 MODELS = {
-    "tokenblocklist": TokenBlocklist,
+    # NOTE: TokenBlocklist is deliberately excluded — it's internal JWT
+    # revocation plumbing (plain db.Model, no editor Model mixin), never
+    # meant to be exposed via the generic admin editor. Registering it here
+    # caused a 500 on GET /api/editor/tokenblocklist/schema because it has
+    # no get_create_form().
     "backend_app": Backend_App,
     "club": Club,
     "coachlevel": CoachLevel,
