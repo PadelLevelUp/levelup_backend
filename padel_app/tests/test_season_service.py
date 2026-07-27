@@ -110,7 +110,8 @@ def test_upsert_seasons_batch_overlap_rejected(app):
             )
 
 
-def test_upsert_seasons_creates_and_prunes(app):
+def test_upsert_seasons_creates_and_updates_in_place(app):
+    """PAD-89: upsert updates the addressed row; it never re-creates it."""
     coach_id = make_coach(app)
     with app.app_context():
         from padel_app.models import Coach
@@ -126,21 +127,133 @@ def test_upsert_seasons_creates_and_prunes(app):
         )
         assert len(coach.seasons) == 2
 
-        # Re-send only one — the other should be pruned.
         existing = season_service.list_seasons(coach)[0]
+        existing_id = existing.id
+
         result = season_service.upsert_seasons(
             coach,
             [
                 {
-                    "id": existing.id,
+                    "id": existing_id,
                     "name": "Spring Updated",
                     "startDate": "2026-03-01",
                     "endDate": "2026-05-31",
                 },
             ],
         )
+
+        # The addressed row was updated in place — same id, new name.
+        updated = [s for s in result if s.id == existing_id]
+        assert len(updated) == 1
+        assert updated[0].name == "Spring Updated"
+
+
+def test_upsert_seasons_does_not_delete_omitted_seasons(app):
+    """PAD-89 regression: a season absent from the payload must survive.
+
+    Before the fix, `upsert_seasons` deleted every persisted season whose id was
+    not in the incoming payload. Because the web client never sent `id` at all,
+    every "Save seasons" click wiped and re-created the whole set — silent data
+    loss for any client posting a partial list.
+    """
+    coach_id = make_coach(app)
+    with app.app_context():
+        from padel_app.models import Coach
+        from padel_app.services import season_service
+
+        coach = Coach.query.get(coach_id)
+        _seed_season(coach_id, "Existing", date(2026, 3, 1), date(2026, 5, 31))
+
+        result = season_service.upsert_seasons(
+            coach,
+            [{"name": "Autumn", "startDate": "2026-09-01", "endDate": "2026-12-31"}],
+        )
+
+        names = sorted(s.name for s in result)
+        assert names == ["Autumn", "Existing"], (
+            "the omitted season was destroyed instead of preserved"
+        )
+
+
+def test_upsert_seasons_rejects_overlap_with_persisted_season(app):
+    """PAD-89: the DB-aware validator must run on the create/update path.
+
+    A payload entry overlapping a persisted season that the payload does NOT
+    address is a conflict, not a licence to delete the persisted row.
+    """
+    coach_id = make_coach(app)
+    with app.app_context():
+        from padel_app.models import Coach, Season
+        from padel_app.services import season_service
+
+        coach = Coach.query.get(coach_id)
+        _seed_season(coach_id, "Existing", date(2026, 3, 1), date(2026, 5, 31))
+
+        import pytest
+
+        with pytest.raises(ValueError, match="Overlapping seasons"):
+            season_service.upsert_seasons(
+                coach,
+                [
+                    {
+                        "name": "New overlapping",
+                        "startDate": "2026-05-15",
+                        "endDate": "2026-08-01",
+                    }
+                ],
+            )
+
+        # Nothing was written and nothing was destroyed.
+        remaining = Season.query.filter_by(coach_id=coach_id).all()
+        assert [s.name for s in remaining] == ["Existing"]
+
+
+def test_upsert_seasons_allows_moving_a_season_over_its_own_range(app):
+    """PAD-89: a season must not be treated as overlapping itself."""
+    coach_id = make_coach(app)
+    with app.app_context():
+        from padel_app.models import Coach
+        from padel_app.services import season_service
+
+        coach = Coach.query.get(coach_id)
+        existing = _seed_season(
+            coach_id, "Spring", date(2026, 3, 1), date(2026, 5, 31)
+        )
+        existing_id = existing.id
+
+        result = season_service.upsert_seasons(
+            coach,
+            [
+                {
+                    "id": existing_id,
+                    "name": "Spring",
+                    "startDate": "2026-03-15",
+                    "endDate": "2026-06-30",
+                }
+            ],
+        )
+
         assert len(result) == 1
-        assert result[0].name == "Spring Updated"
+        assert result[0].id == existing_id
+        assert result[0].start_date == date(2026, 3, 15)
+        assert result[0].end_date == date(2026, 6, 30)
+
+
+def test_delete_season_is_the_only_way_to_remove_a_season(app):
+    """PAD-89: removal is explicit — via delete_season, never via omission."""
+    coach_id = make_coach(app)
+    with app.app_context():
+        from padel_app.models import Coach, Season
+        from padel_app.services import season_service
+
+        coach = Coach.query.get(coach_id)
+        doomed = _seed_season(coach_id, "Doomed", date(2026, 3, 1), date(2026, 5, 31))
+        _seed_season(coach_id, "Kept", date(2026, 9, 1), date(2026, 12, 31))
+
+        assert season_service.delete_season(coach, doomed.id) is True
+
+        remaining = Season.query.filter_by(coach_id=coach_id).all()
+        assert [s.name for s in remaining] == ["Kept"]
 
 
 def test_add_class_service_sets_recurrence_end_to_season_end(app):

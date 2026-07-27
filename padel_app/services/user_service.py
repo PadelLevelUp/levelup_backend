@@ -5,12 +5,32 @@ from padel_app.sql_db import db
 from padel_app.tools.request_adapter import JsonRequestAdapter
 
 
+#: PAD-93 — privilege flags that must never be settable from an app-facing
+#: JSON payload. `User.get_create_form()` declares them as Boolean fields, so
+#: before the PAD-69 coercion fix a payload of `{"is_admin": true}` was
+#: harmlessly coerced to False. Now that real booleans survive the form layer,
+#: the very same payload would actually grant admin — and these services sit
+#: behind the unauthenticated `POST /api/app/user`, `POST /api/app/user/<id>`
+#: and `POST /api/app/activate/user/<id>` routes. Stripping them here keeps the
+#: guard in the service layer, so it holds regardless of which route calls in.
+#: Admin flags remain settable through the authenticated generic editor
+#: (`modules/editor.py` / `modules/api.py`), which is admin-only by design.
+PRIVILEGE_FIELDS = ("is_admin", "is_superadmin")
+
+
+def _strip_privilege_fields(values):
+    """Drop admin flags from form-derived values (see PRIVILEGE_FIELDS)."""
+    for field in PRIVILEGE_FIELDS:
+        values.pop(field, None)
+    return values
+
+
 def create_user_service(data):
     user = User()
     form = user.get_create_form()
 
     fake_request = JsonRequestAdapter(data, form)
-    values = form.set_values(fake_request)
+    values = _strip_privilege_fields(form.set_values(fake_request))
 
     user.update_with_dict(values)
     user.create()
@@ -22,7 +42,7 @@ def edit_user_service(user_id, data):
 
     form = user.get_edit_form()
     fake_request = JsonRequestAdapter(data, form)
-    values = form.set_values(fake_request)
+    values = _strip_privilege_fields(form.set_values(fake_request))
 
     user.update_with_dict(values)
     user.save()
@@ -36,7 +56,7 @@ def activate_user_service(user_id, data):
 
     form = user.get_edit_form()
     fake_request = JsonRequestAdapter(data, form)
-    values = form.set_values(fake_request)
+    values = _strip_privilege_fields(form.set_values(fake_request))
 
     user.update_with_dict(values)
     user.save()

@@ -55,8 +55,14 @@ class ConversationParticipant(db.Model, model.Model):
             fields=[
                 get_field("user", "User", "Text"),
                 get_field("conversation", "Conversation", "Text"),
-                get_field("last_read_at", "Is group", "Boolean"),
-                get_field("joined_at", "Validated", "Boolean"),
+                # PAD-93: these are DateTime columns, not booleans. They were
+                # declared as "Boolean" (with copy-pasted labels from
+                # Conversation), so the generic editor rendered them as
+                # checkboxes and every save wrote `False` into a timestamp
+                # column — and `get_edit_form()` fed a datetime back into a
+                # Boolean field. Declared with their real type now.
+                get_field("joined_at", "Joined at", "DateTime"),
+                get_field("last_read_at", "Last read at", "DateTime"),
             ],
         )
         form.add_block(info_block)

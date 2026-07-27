@@ -30,14 +30,35 @@ def create_app(test_config=None):
     env = os.getenv("FLASK_ENV", "development")
     if test_config:
         app.config.from_mapping(test_config)
-    elif env == "production":
-        from .config import ProdConfig
-
-        app.config.from_object(ProdConfig)
     else:
-        from .config import DevConfig
+        from .config import (
+            assert_safe_migration_target,
+            get_config_class,
+            is_migration_invocation,
+        )
 
-        app.config.from_object(DevConfig)
+        config_cls = get_config_class(env)
+        # Resolve the database settings from the *selected* config class, and
+        # from the environment as it stands at startup, before copying them in
+        # — the URI must follow the class's host override (PAD-95).
+        config_cls.refresh_database_settings()
+        app.config.from_object(config_cls)
+
+        # Never log the URI itself — it carries the password.
+        app.logger.info(
+            "Config %s (FLASK_ENV=%s) using database %s@%s:%s/%s",
+            config_cls.__name__,
+            env,
+            config_cls.POSTGRES_USER,
+            config_cls.POSTGRES_HOST,
+            config_cls.POSTGRES_PORT,
+            config_cls.POSTGRES_DB,
+        )
+
+        # Fail closed before anything opens a connection: never migrate a
+        # production database from a non-production process (PAD-95).
+        if is_migration_invocation():
+            assert_safe_migration_target(config_cls.POSTGRES_HOST, env)
 
     # Ensure responses aren't cached + refresh nearly-expired JWT tokens
     @app.after_request

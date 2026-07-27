@@ -69,7 +69,11 @@ class Conversation(db.Model, model.Model):
             fields=[
                 get_field("group_name", "Group name", "Text"),
                 get_field("is_group", "Is group", "Boolean"),
-                get_field("validated", "Validated", "Boolean"),
+                # PAD-93: there is no `validated` column on Conversation. The
+                # phantom field made `get_edit_form()` raise AttributeError
+                # (it does `getattr(self, field.name)` for every field) and
+                # `update_with_dict` set a stray instance attribute on create.
+                # Removed.
                 get_field("participant_key", "Participant key", "Text"),
             ],
         )

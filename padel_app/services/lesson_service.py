@@ -21,6 +21,32 @@ from padel_app.helpers.calendar_helpers import (
 
 
 # ---------------------------------------------------------------------------
+# Errors
+# ---------------------------------------------------------------------------
+
+class NoSeasonCoversDateError(ValueError):
+    """Raised when "recurs until season end" cannot be resolved to a season.
+
+    PAD-90 — fail closed. If no season of the coach covers the class's start
+    date there is no end to snapshot into ``lessons.recurrence_end``, and a
+    NULL ``recurrence_end`` means "recurs forever" everywhere downstream
+    (``helpers/calendar_helpers.py`` treats it as an open range). Rather than
+    silently creating an unbounded class, the create is rejected and the coach
+    is told to set a season or pick an explicit end date.
+    """
+
+    #: Machine-readable discriminator the web client keys its message off.
+    code = "no_season_covers_date"
+
+    def __init__(self, on_date=None):
+        self.on_date = on_date
+        super().__init__(
+            "No season covers this date. Set a season in Settings, or choose "
+            "an end date for the recurrence."
+        )
+
+
+# ---------------------------------------------------------------------------
 # Internal utilities
 # ---------------------------------------------------------------------------
 
@@ -57,10 +83,36 @@ def transform_to_datetime(obj, data):
 # ---------------------------------------------------------------------------
 
 def get_or_materialize_instance(lesson: Lesson, date):
-    instance = LessonInstance.query.filter_by(
-        lesson_id=lesson.id,
-        start_datetime=datetime.combine(date, lesson.start_datetime.time()),
-    ).first()
+    # An occurrence's identity is (lesson_id, occurrence date), NOT the parent
+    # lesson's time-of-day. A "this occurrence only" edit can move an instance's
+    # start_datetime off the parent's time; keying the lookup on
+    # datetime.combine(date, lesson.start_datetime.time()) then misses and
+    # materializes a duplicate LessonInstance for the same date, with a fresh set
+    # of unconfirmed Presence rows — the reminder-double-send path in PAD-85/69.
+    #
+    # Match on original_lesson_occurence_date (the canonical occurrence key, same
+    # as calendar_helpers), falling back to any instance whose start_datetime
+    # lands on that calendar day for legacy rows where the column is unset.
+    from sqlalchemy import and_, or_
+
+    day_start = datetime.combine(date, time.min)
+    day_end = day_start + timedelta(days=1)
+    instance = (
+        LessonInstance.query
+        .filter(LessonInstance.lesson_id == lesson.id)
+        .filter(
+            or_(
+                LessonInstance.original_lesson_occurence_date == date,
+                and_(
+                    LessonInstance.original_lesson_occurence_date.is_(None),
+                    LessonInstance.start_datetime >= day_start,
+                    LessonInstance.start_datetime < day_end,
+                ),
+            )
+        )
+        .order_by(LessonInstance.id.asc())
+        .first()
+    )
 
     if instance:
         return instance
@@ -486,8 +538,13 @@ def add_class_service(data, coach, club):
             lesson_payload["recurs_until_season_end"] = True
             start_date = datetime.strptime(data["date"], "%Y-%m-%d").date()
             season_end = season_service.resolve_season_end_for_coach(coach, start_date)
-            if season_end is not None:
-                lesson_payload["recurrence_end"] = season_end
+            # PAD-90 — fail closed. Falling through with recurrence_end unset
+            # would leave it NULL, which every downstream reader interprets as
+            # "no end": the class would recur forever and materialise instances
+            # and reminder jobs indefinitely, with nothing shown to the coach.
+            if season_end is None:
+                raise NoSeasonCoversDateError(start_date)
+            lesson_payload["recurrence_end"] = season_end
 
     lesson = create_lesson_helper(lesson_payload)
 
@@ -774,7 +831,14 @@ def _remove_single_occurrence_from_lesson(*, lesson, date):
 
 
 def remove_class_service(data):
-    """Scope-aware class removal. Returns (result_dict, http_status_code)."""
+    """Scope-aware class removal. Returns (result_dict, http_status_code).
+
+    PAD-75: before removing the class, snapshot the enrolled students + coach so
+    that, once the removal succeeds, every enrolled student is notified the class
+    was cancelled — reusing the notification-engine's message/push channel. The
+    notification is best-effort: it must never turn a successful removal into an
+    error response.
+    """
     models_map = {
         "Lesson": Lesson,
         "LessonInstance": LessonInstance,
@@ -795,6 +859,37 @@ def remove_class_service(data):
 
     obj = models_map[model_name].query.get_or_404(class_id)
 
+    # Snapshot cancellation recipients BEFORE removal — the roster/coach relations
+    # are cascade-deleted as part of the removal below.
+    cancellation_recipients = []
+    try:
+        from padel_app.services.notification_service import (
+            collect_cancellation_recipients,
+        )
+        cancellation_recipients = collect_cancellation_recipients(obj)
+    except Exception:
+        cancellation_recipients = []
+
+    result, status = _dispatch_remove_class(obj, model_name, scope, event_date)
+
+    if 200 <= status < 300 and cancellation_recipients:
+        try:
+            from padel_app.services.notification_service import (
+                notify_students_of_cancellation,
+            )
+            notify_students_of_cancellation(cancellation_recipients)
+        except Exception:
+            pass  # never fail a successful removal because notification failed
+
+    return result, status
+
+
+def _dispatch_remove_class(obj, model_name, scope, event_date):
+    """Execute the scope-aware removal for a resolved class object (PAD-75 split).
+
+    Extracted verbatim from ``remove_class_service`` so the notification snapshot
+    can wrap it without threading through every early return.
+    """
     from padel_app.scheduler import _maybe_cancel_instance
 
     if model_name == "LessonInstance":

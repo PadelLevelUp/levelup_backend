@@ -1,12 +1,30 @@
-from datetime import datetime, date
+from datetime import datetime
 from typing import Optional, Union
 from padel_app.tools.calendar_tools import _format_date, _format_time
+from padel_app.utils.dates import utcnow_naive
 
 def _compute_status(
     start_dt: datetime,
+    end_dt: datetime,
     *,
     override_date: Optional[Union[str, datetime]] = None,
+    now: Optional[datetime] = None,
 ) -> str:
+    """An event is ``completed`` once its END datetime has passed, otherwise
+    ``scheduled``.
+
+    PAD-96: the comparison uses the real end datetime (the event's date combined
+    with its end time-of-day), NOT just the date. Previously it compared the
+    DATE against ``today()``, so a class that already ended earlier *today*
+    stayed ``scheduled`` while previous days' classes correctly read
+    ``completed``.
+
+    ``now`` defaults to the same naive-UTC clock the scheduler uses to compare
+    stored class datetimes (``utcnow_naive``); it is injectable for tests.
+    """
+    if now is None:
+        now = utcnow_naive()
+
     if override_date:
         if isinstance(override_date, datetime):
             event_date = override_date.date()
@@ -24,9 +42,14 @@ def _compute_status(
     else:
         event_date = start_dt.date()
 
-    return "completed" if event_date < date.today() else "scheduled"
+    # The effective end is the event's day combined with its end time-of-day —
+    # exactly what the UI shows as ``endTime`` on the ``date`` day. ``.time()``
+    # drops any tzinfo, keeping the comparison naive on both sides.
+    effective_end = datetime.combine(event_date, end_dt.time())
 
-def serialize_calendar_event(obj, *, override_id: str | None = None, override_date: str | None = None) -> dict:
+    return "completed" if effective_end <= now else "scheduled"
+
+def serialize_calendar_event(obj, *, override_id: str | None = None, override_date: str | None = None, now: Optional[datetime] = None) -> dict:
     """
     Serialize LessonInstance, Lesson or CalendarBlock into a CalendarEvent-compatible dict.
     """
@@ -41,7 +64,7 @@ def serialize_calendar_event(obj, *, override_id: str | None = None, override_da
         "startTime": _format_time(obj.start_datetime),
         "endTime": _format_time(obj.end_datetime),
         "status": _compute_status(
-            obj.start_datetime, override_date=override_date
+            obj.start_datetime, obj.end_datetime, override_date=override_date, now=now
         ),
     }
 
