@@ -21,6 +21,32 @@ from padel_app.helpers.calendar_helpers import (
 
 
 # ---------------------------------------------------------------------------
+# Errors
+# ---------------------------------------------------------------------------
+
+class NoSeasonCoversDateError(ValueError):
+    """Raised when "recurs until season end" cannot be resolved to a season.
+
+    PAD-90 — fail closed. If no season of the coach covers the class's start
+    date there is no end to snapshot into ``lessons.recurrence_end``, and a
+    NULL ``recurrence_end`` means "recurs forever" everywhere downstream
+    (``helpers/calendar_helpers.py`` treats it as an open range). Rather than
+    silently creating an unbounded class, the create is rejected and the coach
+    is told to set a season or pick an explicit end date.
+    """
+
+    #: Machine-readable discriminator the web client keys its message off.
+    code = "no_season_covers_date"
+
+    def __init__(self, on_date=None):
+        self.on_date = on_date
+        super().__init__(
+            "No season covers this date. Set a season in Settings, or choose "
+            "an end date for the recurrence."
+        )
+
+
+# ---------------------------------------------------------------------------
 # Internal utilities
 # ---------------------------------------------------------------------------
 
@@ -512,8 +538,13 @@ def add_class_service(data, coach, club):
             lesson_payload["recurs_until_season_end"] = True
             start_date = datetime.strptime(data["date"], "%Y-%m-%d").date()
             season_end = season_service.resolve_season_end_for_coach(coach, start_date)
-            if season_end is not None:
-                lesson_payload["recurrence_end"] = season_end
+            # PAD-90 — fail closed. Falling through with recurrence_end unset
+            # would leave it NULL, which every downstream reader interprets as
+            # "no end": the class would recur forever and materialise instances
+            # and reminder jobs indefinitely, with nothing shown to the coach.
+            if season_end is None:
+                raise NoSeasonCoversDateError(start_date)
+            lesson_payload["recurrence_end"] = season_end
 
     lesson = create_lesson_helper(lesson_payload)
 
