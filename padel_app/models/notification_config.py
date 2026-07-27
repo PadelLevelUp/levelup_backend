@@ -67,6 +67,7 @@ DEFAULT_MESSAGE_TEMPLATES = {
     "waiting_list_offer": "This spot was just taken, but we can put you on the waiting list and notify you if another opens up. Interested?",
     "waiting_list_confirm": "You're on the waiting list! We'll let you know if a spot opens.",
     "waiting_list_placed": "Good news {name}! A spot opened up in the {level} class on {weekday} at {time} and you've been added. See you there! 🎾",
+    "class_cancelled": "Hi {name}, your {level} class on {weekday} at {time} has been cancelled. Sorry for the inconvenience!",
 }
 
 DEFAULT_MESSAGE_TEMPLATES_PT = {
@@ -81,6 +82,7 @@ DEFAULT_MESSAGE_TEMPLATES_PT = {
     "waiting_list_offer": "Esta vaga acabou de ser ocupada, mas podemos pôr-te na lista de espera e avisar-te se abrir outra. Interessa?",
     "waiting_list_confirm": "Estás na lista de espera! Avisamos-te se abrir uma vaga.",
     "waiting_list_placed": "Boas notícias {name}! Abriu uma vaga na aula de {level} na {weekday} às {time} e foste adicionado. Até já! 🎾",
+    "class_cancelled": "Olá {name}, a tua aula de {level} de {weekday} às {time} foi cancelada. Pedimos desculpa pelo incómodo!",
 }
 
 
