@@ -14,6 +14,9 @@ from padel_app.models.lesson_instance_training import LessonInstanceTraining
 
 def get_exercises_for_coach(coach):
     """Returns all exercises the coach can access (owned + followed)."""
+    if coach is None:
+        abort(403, "Only a coach can access exercises")
+
     relations = (
         Association_CoachExercise.query
         .filter_by(coach_id=coach.id)
@@ -24,6 +27,9 @@ def get_exercises_for_coach(coach):
 
 def get_exercise_for_coach(coach, exercise_id):
     """Returns a single exercise if the coach has access to it."""
+    if coach is None:
+        abort(403, "Only a coach can access exercises")
+
     rel = (
         Association_CoachExercise.query
         .filter_by(coach_id=coach.id, exercise_id=int(exercise_id))
@@ -33,6 +39,9 @@ def get_exercise_for_coach(coach, exercise_id):
 
 
 def create_exercise_service(coach, data):
+    if coach is None:
+        abort(403, "Only a coach can create exercises")
+
     exercise = Exercise(
         name=data["name"],
         description=data.get("description"),
@@ -59,6 +68,9 @@ def create_exercise_service(coach, data):
 
 
 def update_exercise_service(exercise_id, coach, data):
+    if coach is None:
+        abort(403, "You don't have permission to edit this exercise")
+
     rel = (
         Association_CoachExercise.query
         .filter_by(coach_id=coach.id, exercise_id=int(exercise_id), role="owner")
@@ -90,6 +102,9 @@ def update_exercise_service(exercise_id, coach, data):
 
 
 def delete_exercise_service(exercise_id, coach):
+    if coach is None:
+        abort(403, "You don't have permission to delete this exercise")
+
     rel = (
         Association_CoachExercise.query
         .filter_by(coach_id=coach.id, exercise_id=int(exercise_id), role="owner")
@@ -108,6 +123,9 @@ def delete_exercise_service(exercise_id, coach):
 
 def get_exercise_groups_for_coach(coach):
     """Returns all exercise groups the coach can access (owned + followed)."""
+    if coach is None:
+        abort(403, "Only a coach can access exercise groups")
+
     relations = (
         Association_CoachExerciseGroup.query
         .filter_by(coach_id=coach.id)
@@ -117,6 +135,9 @@ def get_exercise_groups_for_coach(coach):
 
 
 def create_exercise_group_service(coach, data):
+    if coach is None:
+        abort(403, "Only a coach can create exercise groups")
+
     group = ExerciseGroup(
         name=data["name"],
         description=data.get("description"),
@@ -145,6 +166,9 @@ def create_exercise_group_service(coach, data):
 
 
 def update_exercise_group_service(group_id, coach, data):
+    if coach is None:
+        abort(403, "You don't have permission to edit this group")
+
     rel = (
         Association_CoachExerciseGroup.query
         .filter_by(coach_id=coach.id, exercise_group_id=int(group_id), role="owner")
@@ -173,6 +197,9 @@ def update_exercise_group_service(group_id, coach, data):
 
 
 def delete_exercise_group_service(group_id, coach):
+    if coach is None:
+        abort(403, "You don't have permission to delete this group")
+
     rel = (
         Association_CoachExerciseGroup.query
         .filter_by(coach_id=coach.id, exercise_group_id=int(group_id), role="owner")
