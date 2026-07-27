@@ -1431,17 +1431,25 @@ class TestCancelAttendance:
 
     def test_cancel_after_deadline_notifies_coach_marked_late(self, app):
         """PAD-44: a late cancel produces exactly one coach-facing notification
-        MARKED as a late cancellation (text + metadata), no duplicate."""
+        MARKED as a late cancellation (text + metadata), no duplicate.
+
+        PAD-100: a coach with no explicit language resolves to Portuguese, so
+        this English-string assertion pins the coach to English to test the EN
+        variant. The PT variant is covered by
+        ``test_late_cancellation_message_localized_pt`` below.
+        """
         from padel_app.services.notification_service import (
             cancel_attendance,
             get_or_create_config,
         )
+        from padel_app.models.users import User
 
         ids = _seed_coach_and_student(app)
         instance_id = _seed_instance(app, ids["coach_id"], ids["student_id"], start_offset_hours=48)
         self._confirmed_presence(app, instance_id, ids["student_id"])
 
         with app.app_context():
+            User.query.get(ids["coach_user_id"]).language = "en"
             config = get_or_create_config(ids["coach_id"])
             config.auto_notify_enabled = True
             db.session.commit()
@@ -1468,6 +1476,81 @@ class TestCancelAttendance:
                 if c.kwargs.get("user_id") == ids["coach_user_id"]
             ]
             assert len(coach_pushes) == 1
+
+    def test_late_cancellation_message_localized_pt(self, app):
+        """PAD-100: when the coach's language is Portuguese, a LATE cancellation
+        notification must be fully localized — no leftover English template words
+        mixed with the PT-formatted weekday/name/class."""
+        from padel_app.services.notification_service import (
+            cancel_attendance,
+            get_or_create_config,
+        )
+        from padel_app.models.users import User
+
+        ids = _seed_coach_and_student(app)
+        instance_id = _seed_instance(app, ids["coach_id"], ids["student_id"], start_offset_hours=48)
+        self._confirmed_presence(app, instance_id, ids["student_id"])
+
+        with app.app_context():
+            User.query.get(ids["coach_user_id"]).language = "pt"
+            config = get_or_create_config(ids["coach_id"])
+            config.auto_notify_enabled = True
+            db.session.commit()
+
+            # now = +30h → 18h before start → past the 24h deadline → late.
+            now = datetime.utcnow() + timedelta(hours=30)
+            with patch(PATCHES[0]), patch(PATCHES[1]):
+                cancel_attendance(instance_id, ids["student_user_id"], now=now)
+
+            msgs = self._coach_cancellation_messages(
+                app, ids["coach_user_id"], ids["student_user_id"], instance_id
+            )
+            assert len(msgs) == 1
+            text = msgs[0].text
+            # Fully Portuguese template words (weekday-independent assertions).
+            assert "cancelou" in text
+            assert "(ATRASADO)" in text
+            assert "para" in text
+            assert "às" in text
+            assert "Test Student" in text
+            assert "Test Class" in text
+            # No English template words leaked in.
+            for en in ("cancelled", "(LATE)", " for ", " on ", " at "):
+                assert en not in text, f"English fragment {en!r} leaked into PT text: {text!r}"
+
+    def test_non_late_cancellation_message_localized_pt(self, app):
+        """PAD-100: a non-late cancellation is also fully localized to PT."""
+        from padel_app.services.notification_service import (
+            cancel_attendance,
+            get_or_create_config,
+        )
+        from padel_app.models.users import User
+
+        ids = _seed_coach_and_student(app)
+        instance_id = _seed_instance(app, ids["coach_id"], ids["student_id"], start_offset_hours=48)
+        self._confirmed_presence(app, instance_id, ids["student_id"])
+
+        with app.app_context():
+            User.query.get(ids["coach_user_id"]).language = "pt"
+            config = get_or_create_config(ids["coach_id"])
+            config.auto_notify_enabled = True
+            db.session.commit()
+
+            with patch(PATCHES[0]), patch(PATCHES[1]):
+                cancel_attendance(instance_id, ids["student_user_id"])
+
+            msgs = self._coach_cancellation_messages(
+                app, ids["coach_user_id"], ids["student_user_id"], instance_id
+            )
+            assert len(msgs) == 1
+            text = msgs[0].text
+            assert "cancelou" in text
+            assert "para" in text
+            assert "às" in text
+            # Not late → no lateness marker in either language.
+            assert "(ATRASADO)" not in text
+            for en in ("cancelled", "(LATE)", " for ", " on ", " at "):
+                assert en not in text, f"English fragment {en!r} leaked into PT text: {text!r}"
 
     def test_cancellation_deadline_hours_defaults_to_24_and_round_trips(self, app):
         """cancellationDeadlineHours defaults to 24 and round-trips through
