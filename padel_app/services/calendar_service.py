@@ -135,6 +135,11 @@ def edit_event_service(block_id, user_id, data):
     form = block.get_create_form()
     fake_request = JsonRequestAdapter(_build_payload(data), form)
     values = form.set_values(fake_request)
+    # PAD-93: `_build_payload` never carries `blocks_auto_invitations`, but the
+    # form writes every Boolean field on every submit — so editing a calendar
+    # event silently cleared the student-availability-blocker flag (PAD-28).
+    # Attendance marking has the same guard for the reminder flags (PAD-69).
+    values.pop("blocks_auto_invitations", None)
     block.update_with_dict(values)
     block.save()
     return block
