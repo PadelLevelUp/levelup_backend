@@ -790,14 +790,22 @@ def _notify_coach_of_cancellation(
     if not coach_user_id or not player_user_id:
         return None
 
-    player_name = player.user.name if player and player.user else "A player"
-    class_title = instance.title or "the class"
+    is_pt = (locale or "").startswith("pt")
+    player_name = player.user.name if player and player.user else (
+        "Um jogador" if is_pt else "A player"
+    )
+    class_title = instance.title or ("a aula" if is_pt else "the class")
     when = _format_class_when(instance, locale)
 
-    if is_late:
-        text = (
-            f"{player_name} cancelled (LATE) for {class_title}{when}."
-        )
+    # PAD-100: the whole notification string must be localized to the coach's
+    # language. Previously only the interpolated fields (name, class, weekday)
+    # were localized while the template words stayed English, producing a mixed
+    # "cancelled (LATE) for ... on <weekday-in-pt>" message for PT coaches.
+    if is_pt:
+        marker = " (ATRASADO)" if is_late else ""
+        text = f"{player_name} cancelou{marker} para {class_title}{when}."
+    elif is_late:
+        text = f"{player_name} cancelled (LATE) for {class_title}{when}."
     else:
         text = f"{player_name} cancelled for {class_title}{when}."
 
@@ -820,9 +828,14 @@ def _notify_coach_of_cancellation(
         "payload": serialize_message(msg, None),
     })
 
+    if is_pt:
+        push_title = "Cancelamento tardio" if is_late else "Cancelamento"
+    else:
+        push_title = "Late cancellation" if is_late else "Cancellation"
+
     send_push_notification(
         user_id=coach_user_id,
-        title="Late cancellation" if is_late else "Cancellation",
+        title=push_title,
         body=text[:100],
         url=f"/messages/{conv.id}",
     )
@@ -830,7 +843,7 @@ def _notify_coach_of_cancellation(
     from padel_app.utils.expo_push import send_expo_push_to_user
     send_expo_push_to_user(
         coach_user_id,
-        title="Late cancellation" if is_late else "Cancellation",
+        title=push_title,
         body=text[:100],
         data={"type": "class", "classInstanceId": instance.id},
     )
@@ -839,11 +852,25 @@ def _notify_coach_of_cancellation(
 
 
 def _format_class_when(instance: LessonInstance, locale: str = "en") -> str:
-    """Human-readable ' on <weekday> at <time>' suffix for a class instance."""
+    """Human-readable ' on <weekday> at <time>' suffix for a class instance.
+
+    PAD-100: fully localized. For Portuguese coaches this renders
+    ' na <weekday> às <time>' (or ' no <weekday> …' for sábado/domingo, which
+    are masculine), so the suffix no longer leaks English prepositions into an
+    otherwise-Portuguese notification.
+    """
     if instance.start_datetime is None:
         return ""
-    weekday = _format_weekday(instance.start_datetime, locale)
-    time_str = instance.start_datetime.strftime("%H:%M")
+    dt = instance.start_datetime
+    weekday = _format_weekday(dt, locale)
+    time_str = dt.strftime("%H:%M")
+    if (locale or "").startswith("pt"):
+        if weekday:
+            # Weekdays segunda–sexta are feminine ("na"); sábado/domingo (5, 6)
+            # are masculine ("no").
+            prep = "no" if dt.weekday() >= 5 else "na"
+            return f" {prep} {weekday} às {time_str}"
+        return f" às {time_str}"
     if weekday:
         return f" on {weekday} at {time_str}"
     return f" at {time_str}"
