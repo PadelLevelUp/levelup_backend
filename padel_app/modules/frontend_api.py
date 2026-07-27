@@ -1195,7 +1195,14 @@ def remove_player():
 @bp.post("/delete/coach_level")
 def delete_coach_level():
     data = request.get_json() or {}
-    rel = CoachLevel.query.filter_by(id=int(data['id'])).first_or_404()
+    # PAD-101 belt-and-braces: a client that deletes a just-added, not-yet-saved
+    # row can send a temporary non-numeric id (e.g. "new-1753..."). Reject it as
+    # a clean 400 instead of letting int() raise a 500.
+    try:
+        level_id = int(data.get('id'))
+    except (TypeError, ValueError):
+        return jsonify({"error": "id must be numeric"}), 400
+    rel = CoachLevel.query.filter_by(id=level_id).first_or_404()
     rel.delete()
     return jsonify({"status": "Removed coach levels"}), 200
 
@@ -1211,7 +1218,12 @@ def delete_evaluation_category():
 @bp.post("/delete/coach_note")
 def delete_coach_note():
     data = request.get_json() or {}
-    rel = CoachPlayerNote.query.filter_by(id=int(data['id'])).first_or_404()
+    # PAD-101 belt-and-braces: guard against a non-numeric id (see delete_coach_level).
+    try:
+        note_id = int(data.get('id'))
+    except (TypeError, ValueError):
+        return jsonify({"error": "id must be numeric"}), 400
+    rel = CoachPlayerNote.query.filter_by(id=note_id).first_or_404()
     rel.delete()
     return jsonify({"status": "Removed coach note"}), 200
 
