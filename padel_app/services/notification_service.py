@@ -3118,7 +3118,17 @@ def get_standing_waiting_list(coach_id: int) -> list[dict]:
 
 
 def _sync_standing_entries_for_new_instance(instance: LessonInstance, coach_id: int) -> None:
-    """Called when a new instance is created — add it to all active standing entries."""
+    """Called when a new instance is created — add it to all active standing entries.
+
+    Callers (e.g. ``get_or_materialize_instance``) invoke this from inside their
+    own SAVEPOINT (``db.session.begin_nested()``), so this function must only
+    stage/flush changes and must NOT commit — ``Model.create()`` issues a full
+    ``db.session.commit()``, which ends the caller's savepoint (or, on a later
+    iteration, the outer transaction itself) out from under it and leaves the
+    caller's transaction handle closed, raising ``ResourceClosedError`` when it
+    later tries to commit/rollback. Use ``add_to_session()`` instead so the
+    caller's savepoint/commit continues to control the transaction boundary.
+    """
     active_entries = StandingWaitingListEntry.query.filter_by(
         coach_id=coach_id, is_active=True
     ).all()
@@ -3135,7 +3145,8 @@ def _sync_standing_entries_for_new_instance(instance: LessonInstance, coach_id: 
             player_id=entry.player_id,
             coach_id=coach_id,
             standing_entry_id=entry.id,
-        ).create()
+        ).add_to_session()
+    db.session.flush()
 
 
 # ---------------------------------------------------------------------------
