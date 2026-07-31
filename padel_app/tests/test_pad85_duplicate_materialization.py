@@ -151,6 +151,76 @@ def test_time_diverged_occurrence_is_not_re_materialized(app, recurring_with_coa
         )
 
 
+def test_materialize_with_standing_waiting_list_entry_does_not_close_transaction(
+    app, recurring_with_coach
+):
+    """Regression for the 2026-07-27 prod incident: reminder_for_lesson_occurrence
+    crashed with sqlalchemy.exc.ResourceClosedError ("This transaction is closed")
+    for any lesson with an assigned coach, because
+    `_sync_standing_entries_for_new_instance` called `WaitingListEntry(...).create()`
+    — which issues a full `db.session.commit()` — from inside the caller's
+    `db.session.begin_nested()` SAVEPOINT in `get_or_materialize_instance`. That
+    commit ended the savepoint out from under the caller, so the caller's later
+    `sp.commit()` raised ResourceClosedError.
+
+    This only reproduces when there's an active StandingWaitingListEntry for the
+    coach, since that's what drives `_sync_standing_entries_for_new_instance` to
+    actually create a WaitingListEntry row.
+    """
+    coach_id, lesson_id, first_start = recurring_with_coach
+    from padel_app.models import Lesson, Player, User
+    from padel_app.models.standing_waiting_list_entry import StandingWaitingListEntry
+    from padel_app.services.lesson_service import get_or_materialize_instance
+
+    occ_date = (first_start + timedelta(weeks=3)).date()
+
+    with app.app_context():
+        puser = User(name="Waiter", username="pad85_waiter", password="x")
+        db.session.add(puser)
+        db.session.flush()
+        player = Player(user_id=puser.id)
+        db.session.add(player)
+        db.session.flush()
+
+        entry = StandingWaitingListEntry(
+            coach_id=coach_id,
+            player_id=player.id,
+            credits_total=5,
+            credits_used=0,
+            expires_at=datetime.utcnow() + timedelta(days=30),
+            is_active=True,
+        )
+        db.session.add(entry)
+        db.session.commit()
+        player_id = player.id
+
+    # This must not raise sqlalchemy.exc.ResourceClosedError.
+    with app.app_context():
+        lesson = Lesson.query.get(lesson_id)
+        instance = get_or_materialize_instance(lesson, occ_date)
+        assert instance is not None
+        assert instance.lesson_id == lesson_id
+        instance_id = instance.id
+
+        # The outer session/transaction must still be usable afterward — proof
+        # the savepoint used by `_sync_standing_entries_for_new_instance` did not
+        # close the caller's transaction.
+        db.session.commit()
+        from padel_app.models import LessonInstance
+
+        assert LessonInstance.query.get(instance_id) is not None
+
+    # A WaitingListEntry was actually synced for the standing entry (confirms
+    # the code path under test executed, not just skipped).
+    with app.app_context():
+        from padel_app.models.waiting_list_entry import WaitingListEntry
+
+        wle = WaitingListEntry.query.filter_by(
+            lesson_instance_id=instance_id, player_id=player_id, is_active=True
+        ).first()
+        assert wle is not None, "standing entry was not fanned out to the new instance"
+
+
 def test_reminder_reuses_instance_after_student_declined(app, recurring_with_coach):
     """Full PAD-69 shape: student declines on instance A, a follow-up
     materialization pass must not spawn instance B with a fresh (unconfirmed)
