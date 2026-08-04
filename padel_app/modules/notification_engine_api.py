@@ -25,6 +25,7 @@ from padel_app.services.notification_service import (
     add_standing_waiting_list_entry,
     remove_standing_waiting_list_entry,
 )
+from padel_app.services.player_service import search_coach_players
 
 bp = Blueprint("notification_engine_api", __name__, url_prefix="/api/app/notify")
 
@@ -45,6 +46,20 @@ def _resolve_instance(model: str, original_id: int, date_str: str | None) -> Les
         abort(400, "date is required for Lesson events")
     date = datetime.strptime(date_str, "%Y-%m-%d").date()
     return get_or_materialize_instance(lesson, date)
+
+
+@bp.get("/player_search")
+@jwt_required()
+def player_search():
+    """PAD-109: type-ahead player search for the notification settings screens.
+
+    Feeds the "add a student" boxes in Settings > Notifications — the standing
+    (permanent) waiting list and the excluded-players restriction. Scoped to the
+    authenticated coach's own roster; returns Player ids.
+    """
+    coach = _current_coach()
+    query = request.args.get("q", default="", type=str)
+    return jsonify({"players": search_coach_players(coach.id, query)})
 
 
 @bp.get("/config")

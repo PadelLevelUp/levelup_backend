@@ -160,6 +160,49 @@ def get_coach_players_list(coach):
     return [_serialize_coach_player_relation(rel) for rel in relations]
 
 
+def search_coach_players(coach_id, term, limit=20):
+    """PAD-109: type-ahead search over a single coach's own roster.
+
+    Returns ``[{"id": <Player.id as str>, "name": <User.name>}]`` — the id is the
+    ``Player.id``, which is what the standing-waiting-list and notification
+    restriction endpoints expect (never the ``User.id``).
+
+    A blank/whitespace-only term returns an empty list rather than the whole
+    roster, so an empty search box never dumps every student into the dropdown.
+    Inactive players (invited but not yet registered) are included: the coach can
+    legitimately put them on a waiting list.
+    """
+    term = (term or "").strip()
+    if not term:
+        return []
+
+    # Escape LIKE wildcards so a literal "%" or "_" typed by the coach doesn't
+    # turn into a match-everything pattern.
+    escaped = term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+    relations = (
+        Association_CoachPlayer.query.options(
+            joinedload(Association_CoachPlayer.player).joinedload(Player.user)
+        )
+        .filter_by(coach_id=coach_id)
+        .join(Association_CoachPlayer.player)
+        .join(Player.user)
+        .filter(User.name.ilike(f"%{escaped}%", escape="\\"))
+        .order_by(User.name.asc())
+        .limit(limit)
+        .all()
+    )
+
+    results = []
+    for rel in relations:
+        player = rel.player
+        user = player.user if player else None
+        if not player or not user:
+            continue
+        results.append({"id": str(player.id), "name": user.name})
+    return results
+
+
 def get_coach_players_paginated(coach, page=1, per_page=25, search=None,
                                 sort_by="name", sort_dir="asc",
                                 missing_level=False, missing_side=False):
