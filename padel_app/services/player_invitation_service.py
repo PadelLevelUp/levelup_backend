@@ -12,15 +12,9 @@ from padel_app.models import (
     User,
 )
 from padel_app.sql_db import db
+from padel_app.tools.username_tools import unique_placeholder_username
 
 PLAYER_INVITATION_VALID_DAYS = 7
-
-
-def _unique_placeholder_username():
-    while True:
-        candidate = f"pending-{secrets.token_hex(8)}"
-        if User.query.filter_by(username=candidate).first() is None:
-            return candidate
 
 
 def create_incomplete_player_service(data, now=None):
@@ -31,7 +25,7 @@ def create_incomplete_player_service(data, now=None):
 
     user = User(
         name=data["name"],
-        username=_unique_placeholder_username(),
+        username=unique_placeholder_username(),
         email=data.get("email") or None,
         password=None,
         status="inactive",

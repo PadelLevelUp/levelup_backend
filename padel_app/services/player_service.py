@@ -7,6 +7,7 @@ from padel_app.models import (
 from sqlalchemy.orm import joinedload
 from sqlalchemy import func, case
 from padel_app.tools.request_adapter import JsonRequestAdapter
+from padel_app.tools.username_tools import unique_placeholder_username
 
 
 # ---------------------------------------------------------------------------
@@ -253,7 +254,14 @@ def get_player_profile(coach, player_id):
 
 
 def add_player_service(data):
-    """Builds the full player creation payload and delegates to create_player_helper."""
+    """Builds the full player creation payload and delegates to create_player_helper.
+
+    PAD-105: a coach never chooses the player's username — that is the player's
+    own credential, picked when they activate their account. Any `username` in
+    the payload is therefore ignored and a placeholder is generated instead
+    (same mechanism as the invite flow, `players.invite-completion`), which the
+    player replaces at activation.
+    """
     payload = {
         'coach': int(data['coachId']) if data['coachId'] else None,
         'level': int(data['levelId']) if data.get('levelId', None) else None,
@@ -261,7 +269,7 @@ def add_player_service(data):
         'notes': data.get('notes', None),
         'user': {
             'name': data.get('name', None),
-            'username': data.get('username', None),
+            'username': unique_placeholder_username(),
             'email': data.get('email', None),
             'phone': data.get('phone', None),
         },
@@ -276,6 +284,8 @@ def edit_player_service(data):
 
     changes = {k: v for k, v in updates.items() if v != player_info.get(k)}
 
+    # PAD-105: `username` is deliberately absent — a coach cannot set or change
+    # a player's username, only the player themselves can (at activation).
     payload = {
         'coach': player_info['coachId'],
         'relation': {
@@ -285,7 +295,6 @@ def edit_player_service(data):
         },
         'user': {
             'name': changes.get('name', None),
-            'username': changes.get('username', None),
             'email': changes.get('email', None),
             'phone': changes.get('phone', None),
         },
