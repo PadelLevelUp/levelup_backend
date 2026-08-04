@@ -109,3 +109,38 @@ def test_unique_placeholder_username_skips_taken_values(app):
         db.session.commit()
 
         assert unique_placeholder_username() != taken
+
+
+def test_registration_form_is_not_prefilled_with_the_placeholder(app, coach_id, client):
+    """The activation form is where the user PICKS a username.
+
+    Handing back the generated placeholder prefills their username box with
+    `pending-<hex>`, which leaks an internal detail and invites them to keep a
+    machine-generated login. The field must come back empty instead.
+    """
+    from padel_app.models import Player
+
+    info = _add_player(app, coach_id)
+
+    with app.app_context():
+        user_id = Player.query.get(info["playerId"]).user_id
+
+    res = client.get(f"/api/app/register/user/{user_id}")
+
+    assert res.status_code == 200
+    assert res.get_json()["username"] is None
+
+
+def test_registration_form_keeps_a_real_username(app, client):
+    """A user who already chose a username still sees it prefilled."""
+    from padel_app.models import User
+
+    with app.app_context():
+        user = User(name="Chose Already", username="chosen-by-me")
+        db.session.add(user)
+        db.session.commit()
+        user_id = user.id
+
+    res = client.get(f"/api/app/register/user/{user_id}")
+
+    assert res.get_json()["username"] == "chosen-by-me"

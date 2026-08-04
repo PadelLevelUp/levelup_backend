@@ -14,6 +14,7 @@ from padel_app.serializers.lesson import (
     serialize_class_instance,
 )
 from padel_app.serializers.user import serialize_user
+from padel_app.tools.username_tools import is_placeholder_username
 from padel_app.serializers.presence import serialize_presence
 from padel_app.serializers.calendar import serialize_calendar_block
 from padel_app.serializers.message import serialize_message
@@ -379,7 +380,15 @@ def lesson_instance_detail(instance_id):
 @bp.get("/register/user/<user_id>")
 def get_user_for_registration(user_id):
     user = User.query.get_or_404(user_id)
-    return jsonify(serialize_user(user))
+    payload = serialize_user(user)
+    # PAD-105: a coach-created account carries a generated `pending-…`
+    # placeholder username. This form is precisely where the user picks their
+    # own, so hand back an empty field rather than the placeholder — prefilling
+    # it leaks an internal detail and nudges the user into keeping a
+    # machine-generated login.
+    if is_placeholder_username(payload.get("username")):
+        payload["username"] = None
+    return jsonify(payload)
 
 
 @bp.post("/activate/user/<user_id>")
