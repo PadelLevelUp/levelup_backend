@@ -3044,12 +3044,26 @@ def _fan_out_standing_entry(entry: StandingWaitingListEntry) -> None:
             continue
         if instance.status in ("canceled", "completed"):
             continue
+        # PAD-109: match on the (lesson_instance_id, player_id) pair the
+        # uq_waiting_session_player constraint covers — NOT on is_active, which
+        # is not part of it. Removing a standing entry only flips its per-class
+        # rows to is_active=False, so re-adding the same player to the same
+        # upcoming class used to fall through to an INSERT and blow up with a
+        # UniqueViolation (500). Reactivate the row we already have instead.
         existing = WaitingListEntry.query.filter_by(
             lesson_instance_id=instance_id,
             player_id=entry.player_id,
-            is_active=True,
         ).first()
         if existing:
+            if existing.is_active:
+                # Already queued for this class — either by this coach's earlier
+                # standing entry or because the player joined the list themselves.
+                # Leave the existing row (and its origin) untouched.
+                continue
+            existing.is_active = True
+            existing.coach_id = entry.coach_id
+            existing.standing_entry_id = entry.id
+            existing.save()
             continue
         WaitingListEntry(
             lesson_instance_id=instance_id,
