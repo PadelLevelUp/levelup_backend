@@ -135,8 +135,12 @@ def availability_conflicts():
 
     Deliberately returns names only — the student's blocker title, description
     and exact hours are their private calendar and are never exposed to a coach.
+
+    Scoped to the caller's OWN roster: ids belonging to another coach's students
+    are dropped silently, so this cannot be used to probe whether an arbitrary
+    player is free at a given hour.
     """
-    _current_coach()
+    coach = _current_coach()
     data = request.get_json() or {}
     date_str = data.get("date")
     start_time = data.get("startTime")
@@ -158,7 +162,18 @@ def availability_conflicts():
     if window_end <= window_start:
         return jsonify({"blocked": []})
 
-    from padel_app.models import Player
+    from padel_app.models import Association_CoachPlayer, Player
+
+    # Being a coach is not enough — a coach may only ask about THEIR OWN
+    # students. Foreign ids are dropped rather than rejected, so the response
+    # reveals nothing about whether such a player exists.
+    own_player_ids = {
+        cp.player_id
+        for cp in Association_CoachPlayer.query.filter_by(coach_id=coach.id).all()
+    }
+    player_ids = [pid for pid in player_ids if pid in own_player_ids]
+    if not player_ids:
+        return jsonify({"blocked": []})
 
     blocked_ids = blocked_player_ids_for_window(player_ids, window_start, window_end)
     blocked = []

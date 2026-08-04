@@ -381,3 +381,44 @@ def test_pad107_blocked_players_for_instance_reports_names_only(app):
         assert blocked_list == [
             {"playerId": blocked.id, "name": "Blocked Student"}
         ]
+
+
+def test_pad107_availability_conflicts_only_sees_own_roster(app, client):
+    """A coach cannot probe another coach's student's private calendar."""
+    from flask_jwt_extended import create_access_token
+
+    with app.app_context():
+        app.config["JWT_SECRET_KEY"] = "test-jwt-secret"
+
+        owner, instance, (blocked, blocked_user), _free = _setup_two_students("authz")
+
+        # A second, unrelated coach with no link to `blocked`.
+        stranger_user = _create_user("Stranger Coach", "stranger-authz")
+        stranger = _create_coach(stranger_user)
+        db.session.commit()
+
+        date_str = instance.start_datetime.strftime("%Y-%m-%d")
+        payload = {
+            "date": date_str,
+            "startTime": instance.start_datetime.strftime("%H:%M"),
+            "endTime": instance.end_datetime.strftime("%H:%M"),
+            "playerIds": [blocked.id],
+        }
+
+        def _post(user_id):
+            token = create_access_token(identity=str(user_id))
+            return client.post(
+                "/api/app/notify/availability_conflicts",
+                json=payload,
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        # The owning coach legitimately sees the conflict...
+        own = _post(owner.user_id)
+        assert own.status_code == 200
+        assert [b["playerId"] for b in own.get_json()["blocked"]] == [blocked.id]
+
+        # ...the stranger learns nothing, not even that the player exists.
+        other = _post(stranger.user_id)
+        assert other.status_code == 200
+        assert other.get_json()["blocked"] == []
