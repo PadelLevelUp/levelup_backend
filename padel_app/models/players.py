@@ -140,8 +140,17 @@ class Player(db.Model, model.Model):
         return form
 
     def coach_player_info(self, coach_id):
+        # PAD-112: same block fields as `_serialize_coach_player_relation`, from
+        # the same helper. `add_player`/`edit_player` return THIS dict, so the
+        # coach's "notifications cut" signal would disappear right after an edit
+        # if the two ever drifted.
+        from padel_app.services.student_notification_preferences import (
+            notification_block_payload,
+        )
+
         rel = next((r for r in self.coaches_relations if r.coach_id == coach_id), None)
         return {
+            **notification_block_payload(self.user),
             "id": f"p-{self.id}_c-{coach_id}",
             "coachId": coach_id,
             "playerId": self.id,

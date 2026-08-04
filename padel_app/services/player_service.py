@@ -137,6 +137,13 @@ def _serialize_coach_player_relation(rel):
         # not conflate with isActive.
         "validated": (user.password is not None) if user else False,
     }
+    # PAD-112: the student's own notification block preferences + reason, so the
+    # coach can tell "deliberately silent" from "ignoring me". Shared helper —
+    # `Player.coach_player_info` must return the identical keys.
+    from padel_app.services.student_notification_preferences import (
+        notification_block_payload,
+    )
+    result.update(notification_block_payload(user))
     if level:
         result["level"] = {
             "id": str(level.id),

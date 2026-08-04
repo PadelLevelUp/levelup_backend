@@ -465,7 +465,10 @@ class TestRepeatReminders:
             numbers = sorted(m.msg_metadata.get("reminderNumber") for m in msgs)
             assert numbers == [1, 2, 3]
             assert all(m.msg_metadata.get("instanceId") == instance_id for m in msgs)
-            assert fourth == {"sent": 0, "more_due": False}
+            # PAD-112: `send_class_reminders` now also reports the students it
+            # deliberately skipped (those who blocked all notifications), so the
+            # contract carries a `blocked` list. Nobody is blocked here.
+            assert fourth == {"sent": 0, "more_due": False, "blocked": []}
 
     def test_stops_early_when_student_responds(self, app):
         """If the student confirms after the 1st reminder, the next call sends nothing."""
@@ -490,7 +493,7 @@ class TestRepeatReminders:
             msgs = Message.query.filter_by(message_type="notification_reminder").all()
             assert len(msgs) == 1
             assert first["sent"] == 1
-            assert second == {"sent": 0, "more_due": False}
+            assert second == {"sent": 0, "more_due": False, "blocked": []}
 
     def test_stops_early_when_student_declines(self, app):
         """A decline also halts further reminders."""
@@ -530,9 +533,9 @@ class TestRepeatReminders:
                 r2 = send_class_reminders(instance_id, now=t0 + timedelta(hours=2))
                 r3 = send_class_reminders(instance_id, now=t0 + timedelta(hours=4))
 
-            assert r1 == {"sent": 1, "more_due": True}
-            assert r2 == {"sent": 1, "more_due": True}
-            assert r3 == {"sent": 1, "more_due": False}
+            assert r1 == {"sent": 1, "more_due": True, "blocked": []}
+            assert r2 == {"sent": 1, "more_due": True, "blocked": []}
+            assert r3 == {"sent": 1, "more_due": False, "blocked": []}
 
 
 # ---------------------------------------------------------------------------

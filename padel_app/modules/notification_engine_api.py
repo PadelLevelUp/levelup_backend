@@ -25,6 +25,9 @@ from padel_app.services.notification_service import (
     add_standing_waiting_list_entry,
     remove_standing_waiting_list_entry,
 )
+from padel_app.services.student_notification_preferences import (
+    preference_blocked_players,
+)
 
 bp = Blueprint("notification_engine_api", __name__, url_prefix="/api/app/notify")
 
@@ -91,8 +94,12 @@ def manual_notify():
     if not player_ids:
         return jsonify({"error": "No player IDs provided"}), 400
     instance = _resolve_instance(model, original_id, date_str)
+    # PAD-112: work out who will be skipped BEFORE sending, so the coach is told
+    # by name (and with the student's own reason) exactly who could not be
+    # reached, instead of just seeing a count that is quietly short.
+    blocked = preference_blocked_players(player_ids, kind="manual")
     events = send_manual_notifications(instance.id, player_ids, coach.id)
-    return jsonify({"sent": len(events)})
+    return jsonify({"sent": len(events), "blocked": blocked})
 
 
 @bp.post("/send_reminders")
@@ -105,9 +112,15 @@ def send_reminders():
     original_id = int(data.get("originalId"))
     date_str = data.get("date")
     instance = _resolve_instance(model, original_id, date_str)
-    send_class_reminders(instance.id)
-    sent = len(instance.players_relations)
-    return jsonify({"sent": sent})
+    result = send_class_reminders(instance.id)
+    # PAD-112: report what the service actually sent. This used to return
+    # ``len(instance.players_relations)`` — the enrolment count — which lies as
+    # soon as anyone is skipped, and a student who blocked all notifications is
+    # now skipped. ``blocked`` names them so the short count is explainable.
+    return jsonify({
+        "sent": result.get("sent", 0),
+        "blocked": result.get("blocked", []),
+    })
 
 
 @bp.get("/groups")
