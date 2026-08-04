@@ -192,7 +192,10 @@ def blocked_players_for_instance(instance, player_ids=None):
             continue
         player = Player.query.get(player_id)
         name = player.user.name if player and player.user else ""
-        out.append({"playerId": int(player_id), "name": name})
+        # ``cause`` distinguishes this from a PAD-112 preference block once both
+        # kinds share one ``blocked`` array on the notify routes. No ``reason``
+        # key here, deliberately: the blocker's details are private.
+        out.append({"playerId": int(player_id), "name": name, "cause": "unavailable"})
     return out
 
 

@@ -159,11 +159,18 @@ def filter_preference_blocked_coach_players(coach_players):
 
 
 def _blocked_entry(player_id):
-    """``{"playerId", "name", "reason"}`` for a preference-blocked player.
+    """``{"playerId", "name", "reason", "cause"}`` for a preference-blocked player.
 
     The shape matches ``student_availability_service.blocked_players_for_instance``
     (PAD-107) so both kinds of block land in the SAME ``blocked`` array on the
-    notify routes; ``reason`` is the extra key, empty for an availability block.
+    notify routes; ``reason`` is the extra key, absent for an availability block.
+
+    ``cause`` is what lets the client tell the two apart inside that shared
+    array: ``"preference"`` here, ``"unavailable"`` for PAD-107. The coach is
+    told a different thing in each case — "they marked themselves unavailable at
+    this hour" versus "they turned invitations off, and here is why" — so the
+    distinction has to survive the merge into one list. Do NOT infer it from
+    ``reason`` being empty: a student can block notifications without giving one.
     """
     from padel_app.models import Player
 
@@ -173,6 +180,7 @@ def _blocked_entry(player_id):
         "playerId": int(player_id),
         "name": user.name if user else "",
         "reason": (user.notif_block_reason or "").strip() if user else "",
+        "cause": "preference",
     }
 
 

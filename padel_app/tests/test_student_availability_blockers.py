@@ -378,9 +378,15 @@ def test_pad107_blocked_players_for_instance_reports_names_only(app):
 
         blocked_list = blocked_players_for_instance(instance)
 
+        # ``cause`` was added during the PAD-107/PAD-112 batch merge: both
+        # tickets now feed one shared ``blocked`` array on the notify routes and
+        # the coach is shown different wording for each, so an entry has to say
+        # which kind of block it is. It is a category, not blocker detail.
         assert blocked_list == [
-            {"playerId": blocked.id, "name": "Blocked Student"}
+            {"playerId": blocked.id, "name": "Blocked Student", "cause": "unavailable"}
         ]
+        # The point of this test: still no title, description or hours.
+        assert set(blocked_list[0]) == {"playerId", "name", "cause"}
 
 
 def test_pad107_availability_conflicts_only_sees_own_roster(app, client):

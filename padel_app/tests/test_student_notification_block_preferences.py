@@ -270,10 +270,15 @@ def test_manual_block_reports_the_student_and_their_reason(app):
         blocked = preference_blocked_players(
             [w["p1"].id, w["p2"].id], kind="manual",
         )
+        # ``cause`` was added during the PAD-107/PAD-112 batch merge: both
+        # tickets now feed one shared ``blocked`` array on the notify routes,
+        # and the coach is shown different wording for each, so the entries have
+        # to say which kind of block they are.
         assert blocked == [{
             "playerId": w["p1"].id,
             "name": "Ana Silva",
             "reason": "Estou lesionado",
+            "cause": "preference",
         }]
 
 
