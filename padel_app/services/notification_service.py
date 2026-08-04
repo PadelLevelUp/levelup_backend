@@ -67,6 +67,16 @@ from padel_app.services.level_ladder import (
 from padel_app.utils.push_notifications import send_push_notification
 
 
+# PAD-107: message types that ASK a student to play in a specific class slot.
+# These are the only sends an availability blocker suppresses — see the backstop
+# in ``_send_system_message``.
+_BLOCKABLE_MESSAGE_TYPES = frozenset({
+    "notification_invite",
+    "notification_reminder",
+    "waiting_list_offer",
+})
+
+
 # ---------------------------------------------------------------------------
 # Config helpers
 # ---------------------------------------------------------------------------
@@ -816,6 +826,37 @@ def _send_system_message(
             )
         return None
 
+    # PAD-107 hard backstop — "em nenhuma circunstância". A student who marked
+    # themselves unavailable must never be solicited about a class that falls in
+    # that window, whatever fired the send: the coach's "Lembrar"/notify buttons,
+    # the APScheduler reminder job, an auto-invitation round, or the waiting-list
+    # cascade. Enforcing it at the single delivery choke point means no future
+    # caller can bypass it by accident.
+    #
+    # Scope is deliberately narrow: only the three CLASS-SLOT SOLICITATION types.
+    # Plain chat, cancellation notices and "you got the spot" confirmations still
+    # go through — being unavailable means "don't ask me to play at that hour",
+    # not "cut me off from my coach".
+    resolved_instance_id = class_instance_id
+    if resolved_instance_id is None and msg_metadata:
+        resolved_instance_id = msg_metadata.get("lessonInstanceId") or msg_metadata.get("instanceId")
+
+    if message_type in _BLOCKABLE_MESSAGE_TYPES and resolved_instance_id is not None:
+        from padel_app.services.student_availability_service import (
+            instance_window_is_blocked_for_user,
+        )
+
+        _blocked_instance = LessonInstance.query.get(resolved_instance_id)
+        if instance_window_is_blocked_for_user(player_user_id, _blocked_instance):
+            from flask import current_app, has_app_context
+            if has_app_context():
+                current_app.logger.info(
+                    "_send_system_message: suppressing %s for user %s — availability "
+                    "blocker overlaps lesson instance %s (PAD-107)",
+                    message_type, player_user_id, resolved_instance_id,
+                )
+            return None
+
     conv = _get_or_create_direct_conversation(coach_user_id, player_user_id)
     msg = Message(
         text=text,
@@ -842,10 +883,8 @@ def _send_system_message(
     # in this module is a class/notification-engine event (reminder, invite,
     # spot-filled, waiting list, etc.), so it always carries a lesson instance id
     # for mobile tap-routing to class/[id]. Falls back to msg_metadata's
-    # lessonInstanceId/instanceId when the caller didn't pass it explicitly.
-    resolved_instance_id = class_instance_id
-    if resolved_instance_id is None and msg_metadata:
-        resolved_instance_id = msg_metadata.get("lessonInstanceId") or msg_metadata.get("instanceId")
+    # lessonInstanceId/instanceId when the caller didn't pass it explicitly
+    # (``resolved_instance_id`` was computed above for the PAD-107 backstop).
     if resolved_instance_id is not None:
         send_expo_push_to_user(
             player_user_id,
@@ -1271,7 +1310,7 @@ def send_class_reminders(instance_id: int, *, now: datetime | None = None) -> di
     _log = current_app.logger if has_app_context() else None
 
     _now = now or utcnow_naive()
-    _no_send = {"sent": 0, "more_due": False}
+    _no_send = {"sent": 0, "more_due": False, "blocked": []}
 
     instance = LessonInstance.query.get(instance_id)
     if not instance:
@@ -1327,10 +1366,27 @@ def send_class_reminders(instance_id: int, *, now: datetime | None = None) -> di
     sent_this_round = 0
     more_due = False
 
+    # PAD-107: students who marked themselves unavailable for this class slot are
+    # skipped entirely — but everyone else is still reminded. A single blocked
+    # student must not silence the whole class.
+    from padel_app.services.student_availability_service import (
+        blocked_players_for_instance,
+    )
+    blocked = blocked_players_for_instance(instance)
+    blocked_ids = {b["playerId"] for b in blocked}
+    if blocked and _log:
+        _log.info(
+            "send_class_reminders: instance %s — skipping %d unavailable student(s) (PAD-107)",
+            instance_id, len(blocked),
+        )
+
     for rel in instance.players_relations:
         player_id = rel.player_id
         player_user_id = _user_id_for_player(player_id)
         if not player_user_id or not coach_user_id:
+            continue
+
+        if int(player_id) in blocked_ids:
             continue
 
         # Ensure a Presence record exists for this player
@@ -1423,7 +1479,7 @@ def send_class_reminders(instance_id: int, *, now: datetime | None = None) -> di
         if (sent_count + 1) < reminder_count:
             more_due = True
 
-    return {"sent": sent_this_round, "more_due": more_due}
+    return {"sent": sent_this_round, "more_due": more_due, "blocked": blocked}
 
 
 def _expire_stale_reminders(instance: LessonInstance, player_user_id: int) -> None:
@@ -2572,8 +2628,21 @@ def send_manual_notifications(
     locale = _resolve_locale(coach)
     templates = config.get_message_templates(locale)
 
+    # PAD-107: a manually picked student who marked themselves unavailable for
+    # this class slot is skipped — no NotificationEvent, no message, no push.
+    # The rest of the selection is still notified. The caller surfaces who was
+    # skipped via ``blocked_players_for_instance``.
+    from padel_app.services.student_availability_service import (
+        blocked_player_ids_for_window,
+    )
+    blocked_ids = blocked_player_ids_for_window(
+        player_ids, instance.start_datetime, instance.end_datetime
+    )
+
     events = []
     for player_id in player_ids:
+        if int(player_id) in blocked_ids:
+            continue
         player_user_id = _user_id_for_player(player_id)
 
         event = NotificationEvent(

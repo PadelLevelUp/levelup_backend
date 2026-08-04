@@ -143,6 +143,68 @@ def user_is_blocked_for_window(user_id, window_start, window_end):
     return False
 
 
+def blocked_player_ids_for_window(player_ids, window_start, window_end):
+    """
+    PAD-107: subset of ``player_ids`` whose owning User has an availability
+    blocker overlapping [window_start, window_end).
+
+    Returns a ``set`` of player ids (ints). Players with no user account can
+    never be blocked (they have no way to declare unavailability).
+    """
+    from padel_app.models import Player
+
+    blocked = set()
+    for player_id in player_ids or []:
+        player = Player.query.get(player_id)
+        user_id = player.user_id if player else None
+        if user_is_blocked_for_window(user_id, window_start, window_end):
+            blocked.add(int(player_id))
+    return blocked
+
+
+def blocked_players_for_instance(instance, player_ids=None):
+    """
+    PAD-107: ``[{"playerId": <int>, "name": <str>}]`` for the players who are
+    unavailable during ``instance``'s window.
+
+    The class INSTANCE window is what matters — not the moment the notification
+    is sent — matching the ticket's "neste horário" (this class slot) and
+    ``filter_blocked_coach_players``.
+
+    Only the player id and display name are returned. A coach must never see
+    the student's blocker title, description or exact hours: that is the
+    student's private calendar.
+    """
+    from padel_app.models import Player
+
+    if instance is None:
+        return []
+    if player_ids is None:
+        player_ids = [rel.player_id for rel in instance.players_relations]
+
+    blocked_ids = blocked_player_ids_for_window(
+        player_ids, instance.start_datetime, instance.end_datetime
+    )
+
+    out = []
+    for player_id in player_ids:
+        if int(player_id) not in blocked_ids:
+            continue
+        player = Player.query.get(player_id)
+        name = player.user.name if player and player.user else ""
+        out.append({"playerId": int(player_id), "name": name})
+    return out
+
+
+def instance_window_is_blocked_for_user(user_id, instance):
+    """PAD-107 delivery backstop: is ``user_id`` unavailable for this class slot?"""
+    if instance is None or user_id is None:
+        return False
+    return user_is_blocked_for_window(
+        user_id, instance.start_datetime, instance.end_datetime
+    )
+
+
 def filter_blocked_coach_players(coach_players, instance):
     """
     Given a list of Association_CoachPlayer candidates for an auto-invitation,

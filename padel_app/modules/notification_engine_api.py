@@ -25,6 +25,10 @@ from padel_app.services.notification_service import (
     add_standing_waiting_list_entry,
     remove_standing_waiting_list_entry,
 )
+from padel_app.services.student_availability_service import (
+    blocked_player_ids_for_window,
+    blocked_players_for_instance,
+)
 
 bp = Blueprint("notification_engine_api", __name__, url_prefix="/api/app/notify")
 
@@ -91,8 +95,11 @@ def manual_notify():
     if not player_ids:
         return jsonify({"error": "No player IDs provided"}), 400
     instance = _resolve_instance(model, original_id, date_str)
+    # PAD-107: compute the blocked subset BEFORE sending so the coach is told,
+    # by name, exactly who could not be reached.
+    blocked = blocked_players_for_instance(instance, player_ids)
     events = send_manual_notifications(instance.id, player_ids, coach.id)
-    return jsonify({"sent": len(events)})
+    return jsonify({"sent": len(events), "blocked": blocked})
 
 
 @bp.post("/send_reminders")
@@ -105,9 +112,65 @@ def send_reminders():
     original_id = int(data.get("originalId"))
     date_str = data.get("date")
     instance = _resolve_instance(model, original_id, date_str)
-    send_class_reminders(instance.id)
-    sent = len(instance.players_relations)
-    return jsonify({"sent": sent})
+    result = send_class_reminders(instance.id)
+    # PAD-107: report what the service actually sent. This used to return
+    # ``len(instance.players_relations)`` — the enrolment count — which lied
+    # whenever a student had already responded, had hit their reminder cap, or
+    # (now) is unavailable for this slot.
+    return jsonify({
+        "sent": result.get("sent", 0),
+        "blocked": result.get("blocked", []),
+    })
+
+
+@bp.post("/availability_conflicts")
+@jwt_required()
+def availability_conflicts():
+    """
+    PAD-107: which of these players marked themselves unavailable for a
+    proposed class window?
+
+    Body: ``{date: "YYYY-MM-DD", startTime: "HH:MM", endTime: "HH:MM",
+    playerIds: [..]}``. Returns ``{"blocked": [{"playerId", "name"}]}``.
+
+    Deliberately returns names only — the student's blocker title, description
+    and exact hours are their private calendar and are never exposed to a coach.
+    """
+    _current_coach()
+    data = request.get_json() or {}
+    date_str = data.get("date")
+    start_time = data.get("startTime")
+    end_time = data.get("endTime")
+    raw_ids = data.get("playerIds") or []
+
+    if not date_str or not start_time or not end_time:
+        return jsonify({"error": "date, startTime and endTime are required"}), 400
+    if not raw_ids:
+        return jsonify({"blocked": []})
+
+    try:
+        player_ids = [int(pid) for pid in raw_ids]
+        window_start = datetime.strptime(f"{date_str} {start_time}", "%Y-%m-%d %H:%M")
+        window_end = datetime.strptime(f"{date_str} {end_time}", "%Y-%m-%d %H:%M")
+    except (TypeError, ValueError):
+        return jsonify({"error": "invalid date/time or playerIds"}), 400
+
+    if window_end <= window_start:
+        return jsonify({"blocked": []})
+
+    from padel_app.models import Player
+
+    blocked_ids = blocked_player_ids_for_window(player_ids, window_start, window_end)
+    blocked = []
+    for player_id in player_ids:
+        if player_id not in blocked_ids:
+            continue
+        player = Player.query.get(player_id)
+        blocked.append({
+            "playerId": player_id,
+            "name": player.user.name if player and player.user else "",
+        })
+    return jsonify({"blocked": blocked})
 
 
 @bp.get("/groups")
