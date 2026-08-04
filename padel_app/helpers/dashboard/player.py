@@ -32,15 +32,25 @@ def build_player_dashboard_blocks(*, player) -> List[Dict[str, Any]]:
             "data": {
                 "items": [
                     # NOTE (PAD-76): `href` is only set when a matching frontend
-                    # route actually exists. There is no attendance-history page
-                    # (`/presences`) nor an invites page (`/invites`) yet, so
-                    # those KPIs ship without a link and render as inert cards
-                    # instead of dropping the player on the 404 page.
+                    # route actually exists. There is no invites page
+                    # (`/invites`) yet, so that KPI ships without a link and
+                    # renders as an inert card instead of dropping the player on
+                    # the 404 page.
+                    #
+                    # PAD-114 gave "Attended" a destination: `/attendance` is the
+                    # student's attendance-history page and this KPI is its
+                    # dashboard entry point (dashboard.navigation rule 11). It
+                    # counts the same `status == "present"` presences the page
+                    # charts, so the two can never disagree.
                     {
                         "label": "Attended",
                         "value": int(kpis.lessons_attended),
                         "icon": "check_circle",
+                        "href": "/attendance",
                     },
+                    # "Missed" stays inert: the attendance page shows attendance
+                    # only and is explicitly NOT a missed-classes page, so PAD-76
+                    # still applies here.
                     {
                         "label": "Missed",
                         "value": int(kpis.lessons_missed),

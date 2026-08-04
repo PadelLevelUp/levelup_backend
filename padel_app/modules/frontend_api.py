@@ -58,6 +58,10 @@ from padel_app.services.player_service import (
 from padel_app.services.user_service import (
     activate_user_service,
 )
+from padel_app.services.attendance_history_service import (
+    build_attendance_history,
+    default_range as default_attendance_range,
+)
 from padel_app.services.club_service import (
     create_coach_invitation_service,
     get_coach_invitation_service,
@@ -715,6 +719,84 @@ def class_instance():
 def player_profile(player_id):
     coach = current_coach()
     return jsonify(get_player_profile(coach, player_id))
+
+
+def _resolve_attendance_subject(raw_player_id):
+    """Authorize `/attendance_history` and return the player whose data to read.
+
+    Spec `attendance.history` rule 3. The page has two entry points — a student
+    reading their own history and a coach reading a roster player's — so the
+    guard lives HERE, on the data endpoint, not on the frontend route. PAD-88 and
+    PAD-115 are the precedent: a `RoleRoute` in the SPA is UX, not authorization.
+
+    Resolution order matters. The SELF case is checked first so a user who holds
+    both a player and a coach profile is never 403'd on their own data — the
+    coach-first ordering used elsewhere in this blueprint would do exactly that.
+    """
+    player = current_player()
+
+    if raw_player_id in (None, ""):
+        if player is None:
+            abort(403, "Not authorized to view this attendance history")
+        return player
+
+    try:
+        target_id = int(raw_player_id)
+    except (TypeError, ValueError):
+        abort(400, "playerId must be an integer")
+
+    # 1. Own data.
+    if player is not None and player.id == target_id:
+        return player
+
+    # 2. A coach may read any player on their own roster, and nobody else's.
+    coach = current_coach()
+    if coach is not None:
+        require_own_roster_relation(coach, target_id)
+        return Player.query.get_or_404(target_id)
+
+    abort(403, "Not authorized to view this attendance history")
+
+
+def _parse_attendance_bound(raw, *, end_of_day):
+    """Parse a `from`/`to` query param; a bare date means the whole day."""
+    parsed = parser.isoparse(raw)
+    if len(raw.strip()) <= 10 and end_of_day:
+        parsed = parsed.replace(hour=23, minute=59, second=59)
+    return parsed
+
+
+@bp.get("/attendance_history")
+@jwt_required()
+def attendance_history():
+    """Attended-class history for one player (PAD-114).
+
+    Query params: `playerId` (defaults to the caller), `from`/`to` (ISO-8601,
+    default = current month) and an optional `granularity` pin. The response
+    always echoes the granularity actually used so the chart labels its axis from
+    the payload rather than re-deriving the rule client-side.
+    """
+    subject = _resolve_attendance_subject(request.args.get("playerId"))
+
+    raw_from = request.args.get("from")
+    raw_to = request.args.get("to")
+    if raw_from and raw_to:
+        try:
+            range_start = _parse_attendance_bound(raw_from, end_of_day=False)
+            range_end = _parse_attendance_bound(raw_to, end_of_day=True)
+        except (ValueError, OverflowError):
+            abort(400, "from/to must be ISO-8601 datetimes")
+    else:
+        range_start, range_end = default_attendance_range()
+
+    payload = build_attendance_history(
+        player_id=subject.id,
+        range_start=range_start,
+        range_end=range_end,
+        granularity=request.args.get("granularity"),
+    )
+    payload["playerName"] = subject.user.name if subject.user else None
+    return jsonify(payload)
 
 
 # -------------------------------------------------------------------
