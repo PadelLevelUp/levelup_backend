@@ -66,7 +66,30 @@ def activate_user_service(user_id, data):
 # ── PAD-81: self-service profile editing ─────────────────────────────────────
 
 #: Fields a user is allowed to change on their own account via PATCH /api/auth/me.
-OWN_PROFILE_FIELDS = ("name", "abbreviation", "email", "phone", "language")
+#: PAD-112 adds the four notification block preferences — they are per-user, so
+#: they belong on this surface (open to both roles) and must not be swept up by
+#: the coach-only role check (settings.role-scope rule 8).
+OWN_PROFILE_FIELDS = (
+    "name",
+    "abbreviation",
+    "email",
+    "phone",
+    "language",
+    "blockAutoInvitations",
+    "blockManualInvitations",
+    "blockAllNotifications",
+    "notificationBlockReason",
+)
+
+#: PAD-112: payload key → `users` column, for the three block toggles.
+NOTIFICATION_BLOCK_FIELDS = {
+    "blockAutoInvitations": "notif_block_auto_invitations",
+    "blockManualInvitations": "notif_block_manual_invitations",
+    "blockAllNotifications": "notif_block_all",
+}
+
+#: Free-text reason the student attaches to a block; deliberately coach-visible.
+NOTIFICATION_BLOCK_REASON_MAX_LENGTH = 500
 
 SUPPORTED_LANGUAGES = ("pt", "en")
 
@@ -135,5 +158,32 @@ def update_own_profile_service(user_id, data):
             raise ProfileValidationError("Unsupported language")
         user.language = language
 
+    # PAD-112: the three block toggles. Membership-checked, never truthiness-
+    # checked — an explicit `false` MUST clear the flag. The PAD-93 backfill
+    # migration exists because booleans elsewhere were being silently dropped on
+    # a partial update; do not reintroduce that here.
+    for key, column in NOTIFICATION_BLOCK_FIELDS.items():
+        if key in data:
+            setattr(user, column, _coerce_bool(data.get(key), key))
+
+    if "notificationBlockReason" in data:
+        reason = (data.get("notificationBlockReason") or "").strip()
+        user.notif_block_reason = reason[:NOTIFICATION_BLOCK_REASON_MAX_LENGTH] or None
+
     db.session.commit()
     return user
+
+
+def _coerce_bool(value, key):
+    """Accept a real boolean, or the JSON-ish strings/ints a client may send.
+
+    Rejects anything else rather than falling back to `bool(value)`, so a typo
+    can never be read as "block everything".
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str) and value.strip().lower() in ("true", "false"):
+        return value.strip().lower() == "true"
+    raise ProfileValidationError(f"'{key}' must be a boolean")

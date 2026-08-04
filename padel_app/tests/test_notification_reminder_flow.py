@@ -465,9 +465,11 @@ class TestRepeatReminders:
             numbers = sorted(m.msg_metadata.get("reminderNumber") for m in msgs)
             assert numbers == [1, 2, 3]
             assert all(m.msg_metadata.get("instanceId") == instance_id for m in msgs)
-            assert (fourth["sent"], fourth["more_due"]) == (0, False)
-            # PAD-107: nobody was skipped for unavailability here.
-            assert fourth["blocked"] == []
+            # PAD-107 + PAD-112: `send_class_reminders` now also reports the
+            # students it deliberately skipped — unavailable for this slot
+            # (PAD-107) or blocking all notifications (PAD-112) — so the
+            # contract carries a `blocked` list. Nobody is blocked here.
+            assert fourth == {"sent": 0, "more_due": False, "blocked": []}
 
     def test_stops_early_when_student_responds(self, app):
         """If the student confirms after the 1st reminder, the next call sends nothing."""
@@ -492,8 +494,7 @@ class TestRepeatReminders:
             msgs = Message.query.filter_by(message_type="notification_reminder").all()
             assert len(msgs) == 1
             assert first["sent"] == 1
-            assert (second["sent"], second["more_due"]) == (0, False)
-            assert second["blocked"] == []
+            assert second == {"sent": 0, "more_due": False, "blocked": []}
 
     def test_stops_early_when_student_declines(self, app):
         """A decline also halts further reminders."""
@@ -533,9 +534,9 @@ class TestRepeatReminders:
                 r2 = send_class_reminders(instance_id, now=t0 + timedelta(hours=2))
                 r3 = send_class_reminders(instance_id, now=t0 + timedelta(hours=4))
 
-            assert (r1["sent"], r1["more_due"]) == (1, True)
-            assert (r2["sent"], r2["more_due"]) == (1, True)
-            assert (r3["sent"], r3["more_due"]) == (1, False)
+            assert r1 == {"sent": 1, "more_due": True, "blocked": []}
+            assert r2 == {"sent": 1, "more_due": True, "blocked": []}
+            assert r3 == {"sent": 1, "more_due": False, "blocked": []}
 
 
 # ---------------------------------------------------------------------------

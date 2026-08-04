@@ -67,9 +67,17 @@ from padel_app.services.level_ladder import (
 from padel_app.utils.push_notifications import send_push_notification
 
 
-# PAD-107: message types that ASK a student to play in a specific class slot.
-# These are the only sends an availability blocker suppresses — see the backstop
-# in ``_send_system_message``.
+# PAD-107 + PAD-112: message types that ASK a student to play in a specific
+# class slot. These are the only sends a suppression rule may drop — both an
+# availability blocker (PAD-107) and a student's own block preference (PAD-112)
+# are enforced against exactly this vocabulary, via two additive guards in
+# ``_send_system_message``. Both tickets introduced this constant independently,
+# with the same name and the same three values; the batch merge kept one
+# definition and both guards.
+#
+# Plain chat, class-cancellation notices and "you got the spot" confirmations
+# are deliberately NOT in here: silencing invitations must never cut a student
+# off from their coach.
 _BLOCKABLE_MESSAGE_TYPES = frozenset({
     "notification_invite",
     "notification_reminder",
@@ -558,6 +566,17 @@ def _get_eligible_students_for_group(
     from padel_app.services.student_availability_service import filter_blocked_coach_players
     coach_players = filter_blocked_coach_players(coach_players, instance)
 
+    # PAD-112: drop students who switched off AUTOMATIC invitations outright.
+    # Additive with the line above and deliberately separate: that one asks "are
+    # they free at THIS hour?", this one asks "do they want to be asked at all?".
+    # Filtering here — rather than at delivery — is what keeps the engine from
+    # creating a NotificationEvent for someone it will never message, which
+    # would leave the vacancy waiting on a reply that can never arrive.
+    from padel_app.services.student_notification_preferences import (
+        filter_preference_blocked_coach_players,
+    )
+    coach_players = filter_preference_blocked_coach_players(coach_players)
+
     player_stats = {}
     for cp in coach_players:
         att_rate, just_rate = _attendance_stats(cp.player_id)
@@ -621,6 +640,17 @@ def get_eligible_students(
     # this class window (AUTO invitations only — manual add is unaffected).
     from padel_app.services.student_availability_service import filter_blocked_coach_players
     coach_players = filter_blocked_coach_players(coach_players, instance)
+
+    # PAD-112: drop students who switched off AUTOMATIC invitations outright.
+    # Additive with the line above and deliberately separate: that one asks "are
+    # they free at THIS hour?", this one asks "do they want to be asked at all?".
+    # Filtering here — rather than at delivery — is what keeps the engine from
+    # creating a NotificationEvent for someone it will never message, which
+    # would leave the vacancy waiting on a reply that can never arrive.
+    from padel_app.services.student_notification_preferences import (
+        filter_preference_blocked_coach_players,
+    )
+    coach_players = filter_preference_blocked_coach_players(coach_players)
 
     criteria = round_cfg.get("criteria", [])
     criteria_values = round_cfg.get("criteria_values", {})
@@ -854,6 +884,36 @@ def _send_system_message(
                     "_send_system_message: suppressing %s for user %s — availability "
                     "blocker overlaps lesson instance %s (PAD-107)",
                     message_type, player_user_id, resolved_instance_id,
+                )
+            return None
+
+    # PAD-112 backstop — a student who blocked ALL notifications is never
+    # solicited about a class slot, whatever fired the send: the coach's
+    # notify/remind buttons, the APScheduler reminder job, an auto-invitation
+    # round, or the waiting-list cascade. Enforcing it at the single delivery
+    # choke point means no future caller can bypass it by accident.
+    #
+    # This is a SAFETY NET, not the primary enforcement. The auto path filters
+    # in `get_eligible_students`, the manual path filters before it creates the
+    # NotificationEvent, and `send_class_reminders` filters before it sends —
+    # because blocking only here would leave events marked "sent" with no
+    # message behind them.
+    #
+    # Purely a per-recipient lookup: unlike the PAD-107 availability backstop it
+    # needs no lesson instance, so the two guards simply sit in sequence — a
+    # send is suppressed if EITHER says so.
+    if message_type in _BLOCKABLE_MESSAGE_TYPES:
+        from padel_app.services.student_notification_preferences import (
+            user_blocks_all_notifications,
+        )
+
+        if user_blocks_all_notifications(player_user_id):
+            from flask import current_app, has_app_context
+            if has_app_context():
+                current_app.logger.info(
+                    "_send_system_message: suppressing %s for user %s — they "
+                    "blocked all notifications (PAD-112)",
+                    message_type, player_user_id,
                 )
             return None
 
@@ -1387,27 +1447,50 @@ def send_class_reminders(instance_id: int, *, now: datetime | None = None) -> di
     sent_this_round = 0
     more_due = False
 
-    # PAD-107: students who marked themselves unavailable for this class slot are
-    # skipped entirely — but everyone else is still reminded. A single blocked
-    # student must not silence the whole class.
+    # PAD-107 + PAD-112: two independent reasons a student is skipped for this
+    # class's reminders — they marked themselves unavailable for the slot
+    # (PAD-107), or they blocked ALL notifications (PAD-112). Both apply. A
+    # student hit by both appears once, carrying the PAD-112 entry, because that
+    # reason is the student's own coach-visible words; an availability blocker's
+    # details stay private.
+    #
+    # Only the "all" preference level reaches this far — blocking just the
+    # automatic or manual INVITATIONS leaves reminders alone, because a reminder
+    # is about a class they are already enrolled in, not an invitation to a new
+    # one.
+    #
+    # Everyone else in the class is still reminded: one silenced student must
+    # not silence the whole class. Skipped students are reported so the coach
+    # knows the count is deliberately short.
     from padel_app.services.student_availability_service import (
         blocked_players_for_instance,
     )
-    blocked = blocked_players_for_instance(instance)
-    blocked_ids = {b["playerId"] for b in blocked}
+    from padel_app.services.student_notification_preferences import (
+        preference_blocked_players,
+    )
+    _blocked_by_id = {
+        entry["playerId"]: entry
+        for entry in blocked_players_for_instance(instance)
+    }
+    for entry in preference_blocked_players(
+        [rel.player_id for rel in instance.players_relations], kind="all",
+    ):
+        _blocked_by_id[entry["playerId"]] = entry
+    blocked = list(_blocked_by_id.values())
+    blocked_ids = set(_blocked_by_id)
     if blocked and _log:
         _log.info(
-            "send_class_reminders: instance %s — skipping %d unavailable student(s) (PAD-107)",
+            "send_class_reminders: instance %s — skipping %d student(s) who are "
+            "unavailable for this slot or blocked notifications (PAD-107/PAD-112)",
             instance_id, len(blocked),
         )
 
     for rel in instance.players_relations:
         player_id = rel.player_id
+        if int(player_id) in blocked_ids:
+            continue
         player_user_id = _user_id_for_player(player_id)
         if not player_user_id or not coach_user_id:
-            continue
-
-        if int(player_id) in blocked_ids:
             continue
 
         # Ensure a Presence record exists for this player
@@ -2788,12 +2871,23 @@ def send_manual_notifications(
     locale = _resolve_locale(coach)
     templates = config.get_message_templates(locale)
 
-    # PAD-107: a manually picked student who marked themselves unavailable for
-    # this class slot is skipped — no NotificationEvent, no message, no push.
-    # The rest of the selection is still notified. The caller surfaces who was
-    # skipped via ``blocked_players_for_instance``.
+    # PAD-107 + PAD-112: a manually picked student is skipped when they marked
+    # themselves unavailable for this class slot (PAD-107) or switched off
+    # MANUAL invitations / blocked everything (PAD-112) — no NotificationEvent,
+    # no message, no push.
+    #
+    # Both are applied BEFORE `event.create()` below, not at delivery. Creating
+    # the NotificationEvent first and then failing to send would leave an orphan
+    # row marked "sent" with no message behind it: the coach's UI would show a
+    # pending invite that never existed.
+    #
+    # The rest of the coach's selection is still notified; the caller surfaces
+    # who was skipped.
     from padel_app.services.student_availability_service import (
         blocked_player_ids_for_window,
+    )
+    from padel_app.services.student_notification_preferences import (
+        player_blocks_manual_invitations,
     )
     blocked_ids = blocked_player_ids_for_window(
         player_ids, instance.start_datetime, instance.end_datetime
@@ -2803,6 +2897,9 @@ def send_manual_notifications(
     for player_id in player_ids:
         if int(player_id) in blocked_ids:
             continue
+        if player_blocks_manual_invitations(player_id):
+            continue
+
         player_user_id = _user_id_for_player(player_id)
 
         event = NotificationEvent(

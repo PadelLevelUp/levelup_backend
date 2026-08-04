@@ -30,6 +30,9 @@ from padel_app.services.student_availability_service import (
     blocked_player_ids_for_window,
     blocked_players_for_instance,
 )
+from padel_app.services.student_notification_preferences import (
+    preference_blocked_players,
+)
 
 bp = Blueprint("notification_engine_api", __name__, url_prefix="/api/app/notify")
 
@@ -110,9 +113,21 @@ def manual_notify():
     if not player_ids:
         return jsonify({"error": "No player IDs provided"}), 400
     instance = _resolve_instance(model, original_id, date_str)
-    # PAD-107: compute the blocked subset BEFORE sending so the coach is told,
-    # by name, exactly who could not be reached.
-    blocked = blocked_players_for_instance(instance, player_ids)
+    # PAD-107 + PAD-112: work out who will be skipped BEFORE sending, so the
+    # coach is told by name exactly who could not be reached instead of just
+    # seeing a count that is quietly short. Two independent reasons a student is
+    # skipped — they marked themselves unavailable for this slot (PAD-107), or
+    # they opted out of coach-picked invitations (PAD-112) — so both lists are
+    # merged. A student hit by both appears once, carrying the PAD-112 reason:
+    # that one is the student's own words and is meant to be coach-visible,
+    # whereas an availability blocker's details stay private.
+    blocked_by_id = {
+        entry["playerId"]: entry
+        for entry in blocked_players_for_instance(instance, player_ids)
+    }
+    for entry in preference_blocked_players(player_ids, kind="manual"):
+        blocked_by_id[entry["playerId"]] = entry
+    blocked = list(blocked_by_id.values())
     events = send_manual_notifications(instance.id, player_ids, coach.id)
     return jsonify({"sent": len(events), "blocked": blocked})
 
@@ -128,10 +143,11 @@ def send_reminders():
     date_str = data.get("date")
     instance = _resolve_instance(model, original_id, date_str)
     result = send_class_reminders(instance.id)
-    # PAD-107: report what the service actually sent. This used to return
-    # ``len(instance.players_relations)`` — the enrolment count — which lied
-    # whenever a student had already responded, had hit their reminder cap, or
-    # (now) is unavailable for this slot.
+    # PAD-107 + PAD-112: report what the service actually sent. This used to
+    # return ``len(instance.players_relations)`` — the enrolment count — which
+    # lied whenever a student had already responded, had hit their reminder cap,
+    # is unavailable for this slot (PAD-107), or blocked all notifications
+    # (PAD-112). ``blocked`` names them so the short count is explainable.
     return jsonify({
         "sent": result.get("sent", 0),
         "blocked": result.get("blocked", []),

@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Boolean, ForeignKey, Enum
+from sqlalchemy import Column, Integer, String, Text, Boolean, ForeignKey, Enum
 from sqlalchemy.orm import relationship
 from padel_app.sql_db import db
 from padel_app import model
@@ -54,6 +54,41 @@ class User(db.Model, model.Model, UserMixin):
         server_default="pt",
         default="pt",
     )
+
+    # ── PAD-112: the student's standing block preferences ────────────────────
+    #
+    # Distinct from the per-window availability blockers of PAD-28/PAD-107
+    # (rows in `calendar_blocks`): a blocker says "not at THAT hour", these say
+    # "not at all". The three levels are independent — `notif_block_all` is a
+    # superset in EFFECT, but switching it on does not switch the other two on,
+    # and switching it off does not switch them off.
+    #
+    # These live on `users` rather than on `players` for the same reason
+    # `language` does: they are read and written through the per-user
+    # `GET`/`PATCH /api/auth/me` surface, which is open to both roles. Only a
+    # student has any use for them today, but nothing here is player-only.
+    notif_block_auto_invitations = Column(
+        Boolean, nullable=False, server_default="0", default=False,
+    )
+    notif_block_manual_invitations = Column(
+        Boolean, nullable=False, server_default="0", default=False,
+    )
+    notif_block_all = Column(
+        Boolean, nullable=False, server_default="0", default=False,
+    )
+    #: Free text written by the STUDENT and deliberately shown to their coach on
+    #: the player record — the opposite privacy posture to an availability
+    #: blocker's title/description, which the coach must never see (PAD-107).
+    notif_block_reason = Column(Text, nullable=True)
+
+    @property
+    def notifications_blocked(self):
+        """True when any of the three PAD-112 block levels is set."""
+        return bool(
+            self.notif_block_auto_invitations
+            or self.notif_block_manual_invitations
+            or self.notif_block_all
+        )
 
     #TODO: RETHINK THIS FUNCTION
     @property
