@@ -864,6 +864,7 @@ def _notify_coach_of_cancellation(
     player,
     *,
     is_late: bool,
+    is_proactive: bool = False,
     locale: str = "en",
 ) -> "object | None":
     """Create a single COACH-facing notification when a student cancels.
@@ -895,7 +896,22 @@ def _notify_coach_of_cancellation(
     # language. Previously only the interpolated fields (name, class, weekday)
     # were localized while the template words stayed English, producing a mixed
     # "cancelled (LATE) for ... on <weekday-in-pt>" message for PT coaches.
-    if is_pt:
+    # PAD-73: a proactive decline gets its own wording. The coach should be able
+    # to tell at a glance that this student spoke up EARLY — before they were
+    # even asked to confirm — because that is exactly the behaviour the feature
+    # is meant to encourage, and it reads very differently from a late drop-out.
+    if is_proactive:
+        if is_pt:
+            text = (
+                f"{player_name} avisou com antecedência que não vai comparecer "
+                f"a {class_title}{when}. A vaga foi libertada."
+            )
+        else:
+            text = (
+                f"{player_name} let you know in advance that they will not attend "
+                f"{class_title}{when}. The spot has been freed."
+            )
+    elif is_pt:
         marker = " (ATRASADO)" if is_late else ""
         text = f"{player_name} cancelou{marker} para {class_title}{when}."
     elif is_late:
@@ -912,6 +928,9 @@ def _notify_coach_of_cancellation(
         msg_metadata={
             "cancellation": True,
             "lateCancellation": bool(is_late),
+            # PAD-73: machine-readable marker so clients can style an early
+            # heads-up differently from a plain or late cancellation.
+            "proactiveDecline": bool(is_proactive),
             "lessonInstanceId": instance.id,
         },
     )
@@ -922,7 +941,9 @@ def _notify_coach_of_cancellation(
         "payload": serialize_message(msg, None),
     })
 
-    if is_pt:
+    if is_proactive:
+        push_title = "Aviso antecipado" if is_pt else "Advance notice"
+    elif is_pt:
         push_title = "Cancelamento tardio" if is_late else "Cancelamento"
     else:
         push_title = "Late cancellation" if is_late else "Cancellation"
@@ -1816,6 +1837,91 @@ def _free_spot_for_declining_player(
             _now = now or utcnow_naive()
             if invite_start_dt is None or _now >= invite_start_dt:
                 trigger_invitations(instance, coach.id)
+            elif vacancy is not None:
+                # PAD-73: the vacancy opens IMMEDIATELY, but inviting other
+                # students must still wait for the coach's configured
+                # "iniciar convites" instant — even when the decline lands days
+                # earlier than that.
+                #
+                # Skipping `trigger_invitations` above is not enough on its own:
+                # `process_invitation_batches` runs every two minutes over every
+                # open vacancy and fires a batch as soon as it sees one with
+                # `last_activity_at is None`. It only holds off for a vacancy
+                # that carries `invite_not_before`. Without stamping it here, a
+                # decline 10 days out would have the engine inviting replacements
+                # within two minutes — exactly the behaviour this ticket rules
+                # out. `invite_not_before` is the field the batch processor and
+                # `_send_invitation_batch` already honour (the semi-automatic
+                # approval path stamps it for the same reason), so this makes the
+                # timing guarantee hold on every path rather than just this one.
+                vacancy.invite_not_before = invite_start_dt
+                vacancy.save()
+
+
+def proactive_decline_deadline(
+    instance: LessonInstance,
+    config=None,
+) -> "datetime | None":
+    """PAD-73 — the instant the proactive-decline window closes.
+
+    A decline is "proactive" when the student volunteers it *before they would
+    normally have been asked to confirm*. That moment is precisely when the
+    attendance reminder for this instance would fire, so the cutoff is DERIVED
+    from the very same input the scheduler uses to arm the reminder job —
+    ``config.get_reminder_timing()`` fed through ``_compute_reminder_dt`` — and
+    is never a hardcoded interval. Change the coach's reminder timing and this
+    cutoff moves with it, automatically and in lockstep with the real reminder.
+
+    Returns ``None`` when no instant is computable (no start time, or a timing
+    shape ``_compute_timing_dt`` doesn't understand). Callers treat ``None`` as
+    "there is no proactive window", which keeps the pre-PAD-73 behaviour intact.
+    """
+    if instance is None or instance.start_datetime is None:
+        return None
+
+    from padel_app.models.notification_config import (
+        DEFAULT_REMINDER_TIMING,
+        NotificationConfig,
+    )
+    from padel_app.scheduler import _compute_reminder_dt
+
+    _config = config
+    if _config is None:
+        # Deliberately a plain query, NOT ``get_or_create_config``: this helper
+        # is called from the class-instance serializer on a read path, and a GET
+        # must not write a NotificationConfig row as a side effect.
+        coach_rel = Association_CoachLessonInstance.query.filter_by(
+            lesson_instance_id=instance.id
+        ).first()
+        if coach_rel is not None:
+            _config = NotificationConfig.query.filter_by(
+                coach_id=coach_rel.coach_id
+            ).first()
+
+    timing = (
+        _config.get_reminder_timing() if _config is not None
+        else DEFAULT_REMINDER_TIMING
+    )
+    return _compute_reminder_dt(instance, timing)
+
+
+def proactive_decline_window_is_open(
+    instance: LessonInstance,
+    config=None,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    """True while a decline for ``instance`` would still count as proactive.
+
+    Single source of truth for BOTH the ``cancel_attendance`` classification and
+    the ``canDeclineProactively`` flag in the class-instance payload, so the UI
+    can never offer the proactive action at a moment the server would classify
+    differently.
+    """
+    deadline = proactive_decline_deadline(instance, config)
+    if deadline is None:
+        return False
+    return (now or utcnow_naive()) < deadline
 
 
 def cancel_attendance(
@@ -1833,9 +1939,18 @@ def cancel_attendance(
     Cancellations at or after the coach's configured cancellation deadline
     (``cancellationDeadlineHours`` before start, default 24) are still allowed
     and still free the spot, but flag the Presence with ``late_cancellation``.
+
+    PAD-73 — this is ALSO the proactive-decline path. There is deliberately no
+    second endpoint: the server classifies the decline itself from its own clock
+    (``proactive_decline_window_is_open``) and reports which kind it was in the
+    ``proactive`` key of the response. A stale client therefore cannot mislabel
+    a decline, and there is exactly one place where enrolment is authorized.
     """
     from flask import abort
     from padel_app.models import Coach, Player
+    from padel_app.models.Association_PlayerLessonInstance import (
+        Association_PlayerLessonInstance,
+    )
 
     instance = LessonInstance.query.get_or_404(lesson_instance_id)
 
@@ -1847,10 +1962,41 @@ def cancel_attendance(
     if not player:
         abort(403)
 
+    # PAD-73 / PAD-88 / PAD-115: authorize on ENROLMENT, not on the presence row.
+    # Being a player is not enough — a student may only decline their OWN place
+    # in a class they are actually in. Previously this function proceeded even
+    # when no Presence existed, which let any signed-in student drive
+    # `_ensure_vacancy_for_player` (and, inside the invitation window, a real
+    # fan-out) against an arbitrary lesson instance.
+    is_enrolled = Association_PlayerLessonInstance.query.filter_by(
+        player_id=player.id,
+        lesson_instance_id=lesson_instance_id,
+    ).first() is not None
+    if not is_enrolled:
+        abort(403, description="You are not enrolled in this class.")
+
     presence = Presence.query.filter_by(
         player_id=player.id,
         lesson_instance_id=lesson_instance_id,
     ).first()
+    if presence is None:
+        # PAD-73, mirroring the PAD-69 fix in ``respond_to_reminder``: an
+        # enrolment does not guarantee a Presence row. ``create_lesson_instance_helper``
+        # writes ``Association_PlayerLessonInstance`` from the lesson's
+        # ``player_ids`` but no Presence — only ``get_or_materialize_instance``
+        # does that, on a different path. Without this, a student enrolled in a
+        # coach-created one-off instance would have their decline accepted and
+        # their coach notified while ``status``/``justification`` were never
+        # written: the absence would not be justified and, because
+        # ``effective_filled_spots`` counts declines via ``status == "absent"``,
+        # the spot would never actually free up even though a vacancy was opened.
+        presence = Presence(
+            lesson_instance_id=lesson_instance_id,
+            player_id=player.id,
+            invited=True,
+            confirmed=False,
+        )
+        presence.create()
 
     coach_rel = Association_CoachLessonInstance.query.filter_by(
         lesson_instance_id=lesson_instance_id
@@ -1865,6 +2011,10 @@ def cancel_attendance(
         if config
         else dict(default_templates_for_locale(locale))
     )
+
+    # PAD-73: is this a PROACTIVE decline? The window closes at the instant the
+    # attendance reminder would fire, derived from the coach's reminder timing.
+    is_proactive = proactive_decline_window_is_open(instance, config, now=_now)
 
     # Flag late cancellations: at/after the deadline (start - cancellationDeadlineHours)
     # but still before start. The spot is freed either way.
@@ -1881,6 +2031,13 @@ def cancel_attendance(
         if instance.start_datetime is not None:
             deadline = instance.start_datetime - timedelta(hours=deadline_hours)
             is_late = _now >= deadline
+        # PAD-73: a proactive decline is never late. This only bites when a coach
+        # configures a first reminder that fires AFTER their own cancellation
+        # deadline (e.g. remind 12h before, deadline 24h before) — telling the
+        # coach at the earliest moment the system ever expected an answer cannot
+        # sensibly be penalised as a late cancellation.
+        if is_proactive:
+            is_late = False
         presence.late_cancellation = is_late
 
     # PAD-44: notify the COACH of the cancellation exactly once, flagging late
@@ -1895,6 +2052,7 @@ def cancel_attendance(
             instance,
             player,
             is_late=is_late,
+            is_proactive=is_proactive,
             locale=locale,
         )
 
@@ -1935,7 +2093,9 @@ def cancel_attendance(
         locale=locale,
         now=now,
     )
-    return {"action": "declined"}
+    # PAD-73: the caller is told which kind of decline this was so the UI can
+    # confirm it accurately without re-deriving the cutoff client-side.
+    return {"action": "declined", "proactive": is_proactive}
 
 
 def _trigger_vacancy_for_player(

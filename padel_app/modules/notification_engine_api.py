@@ -405,3 +405,73 @@ def debug_schedule_reminder_test():
         "studentIds": [student1_user.id, student2_user.id],
         "studentUsernames": ["e2e-student", "e2e-student-2"],
     })
+
+
+@bp.post("/debug/reset_presence")
+@jwt_required()
+def debug_reset_presence():
+    """
+    E2E test helper (PAD-73) — only active when E2E_DEBUG_ENDPOINTS is set AND
+    the caller presents a valid JWT.
+
+    Restores a seeded student to "enrolled, invited, not yet answered" on a
+    lesson instance: re-creates the enrolment row if a previous test removed it
+    and clears the presence back to ``invited=True, confirmed=False`` with no
+    status/justification/late flag.
+
+    The E2E seed DB is shared across every spec, so the proactive-decline tests
+    must hand the class back exactly as they found it. Doing that through a
+    debug endpoint keeps the assertions themselves honest — they never touch the
+    DB directly, only the same API surface the app uses.
+
+    POST body: { "lessonInstanceId": int, "username": str }
+    """
+    if not _debug_endpoints_enabled():
+        abort(404)
+
+    from padel_app.models.Association_PlayerLessonInstance import (
+        Association_PlayerLessonInstance,
+    )
+    from padel_app.models.presences import Presence
+    from padel_app.sql_db import db
+
+    data = request.get_json() or {}
+    lesson_instance_id = int(data.get("lessonInstanceId"))
+    username = data.get("username")
+
+    user = User.query.filter_by(username=username).first()
+    if not user or not user.player:
+        abort(404, "Seeded user not found")
+    player = user.player
+
+    LessonInstance.query.get_or_404(lesson_instance_id)
+
+    enrolment = Association_PlayerLessonInstance.query.filter_by(
+        player_id=player.id,
+        lesson_instance_id=lesson_instance_id,
+    ).first()
+    if enrolment is None:
+        db.session.add(Association_PlayerLessonInstance(
+            player_id=player.id,
+            lesson_instance_id=lesson_instance_id,
+        ))
+
+    presence = Presence.query.filter_by(
+        player_id=player.id,
+        lesson_instance_id=lesson_instance_id,
+    ).first()
+    if presence is None:
+        presence = Presence(
+            player_id=player.id,
+            lesson_instance_id=lesson_instance_id,
+        )
+        db.session.add(presence)
+    presence.invited = True
+    presence.confirmed = False
+    presence.validated = False
+    presence.status = None
+    presence.justification = None
+    presence.late_cancellation = False
+
+    db.session.commit()
+    return jsonify({"ok": True, "playerId": player.id})
