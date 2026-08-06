@@ -220,7 +220,23 @@ def current_club():
 
 
 def require_coach():
-    """Return the calling ``Coach``, or 403 when the caller has no coach profile."""
+    """Return the calling ``Coach``, or 403 when the caller has no coach profile.
+
+    Use this on every coach-only route. ``current_coach()`` returns ``None`` for
+    a user with only a player profile, and dereferencing that (``coach.id``, or
+    ``current_club()``) raises an unhandled AttributeError — the caller then gets
+    a 500 where the API means "not allowed" (PAD-103, PAD-116).
+
+    DO NOT convert these routes: they branch on ``current_coach() is None`` on
+    purpose, to serve students their own data. Hardening them would lock a
+    student out of their own calendar::
+
+        /calendar   /dashboard   /class_instance   /calendar_event
+        /lesson_instance/<id>/presences            /availability_blockers
+
+    ``test_training_players_role_authz.py`` asserts both halves of this comment,
+    so the list is executable rather than advisory.
+    """
     coach = current_coach()
     if coach is None:
         abort(403, "User is not a coach")
@@ -546,7 +562,7 @@ def coach_detail():
 @bp.get("/players")
 @jwt_required()
 def get_players():
-    coach = current_coach()
+    coach = require_coach()
     club = current_club()
     player_list = get_players_list(coach, club)
 
@@ -613,7 +629,7 @@ def report_message(message_id):
 @bp.get("/coach_players")
 @jwt_required()
 def coach_players():
-    coach = current_coach()
+    coach = require_coach()
     coach = Coach.query.get_or_404(coach.id)
     return jsonify(get_coach_players_list(coach))
 
@@ -621,7 +637,7 @@ def coach_players():
 @bp.get("/coach_players_paginated")
 @jwt_required()
 def coach_players_paginated():
-    coach = current_coach()
+    coach = require_coach()
     coach = Coach.query.get_or_404(coach.id)
 
     page = request.args.get("page", default=1, type=int)
@@ -809,7 +825,7 @@ def class_instance():
 @bp.get("/player_profile/<int:player_id>")
 @jwt_required()
 def player_profile(player_id):
-    coach = current_coach()
+    coach = require_coach()
     return jsonify(get_player_profile(coach, player_id))
 
 
@@ -1766,21 +1782,21 @@ from padel_app.services.training_service import (
 @bp.get("/exercises")
 @jwt_required()
 def exercises():
-    coach = current_coach()
+    coach = require_coach()
     return jsonify([serialize_exercise(ex) for ex in get_exercises_for_coach(coach)])
 
 
 @bp.get("/exercises/<int:exercise_id>")
 @jwt_required()
 def exercise_detail(exercise_id):
-    coach = current_coach()
+    coach = require_coach()
     return jsonify(serialize_exercise(get_exercise_for_coach(coach, exercise_id)))
 
 
 @bp.post("/exercises")
 @jwt_required()
 def create_exercise():
-    coach = current_coach()
+    coach = require_coach()
     data = request.get_json() or {}
     exercise = create_exercise_service(coach, data)
     return jsonify(serialize_exercise(exercise)), 201
@@ -1789,7 +1805,7 @@ def create_exercise():
 @bp.put("/exercises/<int:exercise_id>")
 @jwt_required()
 def update_exercise(exercise_id):
-    coach = current_coach()
+    coach = require_coach()
     data = request.get_json() or {}
     exercise = update_exercise_service(exercise_id, coach, data)
     return jsonify(serialize_exercise(exercise))
@@ -1798,7 +1814,7 @@ def update_exercise(exercise_id):
 @bp.delete("/exercises/<int:exercise_id>")
 @jwt_required()
 def delete_exercise(exercise_id):
-    coach = current_coach()
+    coach = require_coach()
     delete_exercise_service(exercise_id, coach)
     return "", 204
 
@@ -1810,14 +1826,14 @@ def delete_exercise(exercise_id):
 @bp.get("/exercise-groups")
 @jwt_required()
 def exercise_groups():
-    coach = current_coach()
+    coach = require_coach()
     return jsonify([serialize_exercise_group(g) for g in get_exercise_groups_for_coach(coach)])
 
 
 @bp.post("/exercise-groups")
 @jwt_required()
 def create_exercise_group():
-    coach = current_coach()
+    coach = require_coach()
     data = request.get_json() or {}
     group = create_exercise_group_service(coach, data)
     return jsonify(serialize_exercise_group(group)), 201
@@ -1826,7 +1842,7 @@ def create_exercise_group():
 @bp.put("/exercise-groups/<int:group_id>")
 @jwt_required()
 def update_exercise_group(group_id):
-    coach = current_coach()
+    coach = require_coach()
     data = request.get_json() or {}
     group = update_exercise_group_service(group_id, coach, data)
     return jsonify(serialize_exercise_group(group))
@@ -1835,7 +1851,7 @@ def update_exercise_group(group_id):
 @bp.delete("/exercise-groups/<int:group_id>")
 @jwt_required()
 def delete_exercise_group(group_id):
-    coach = current_coach()
+    coach = require_coach()
     delete_exercise_group_service(group_id, coach)
     return "", 204
 
