@@ -325,6 +325,77 @@ def test_extend_schedule_window_re_derives_missing_reminder_jobs(
     )
 
 
+def test_extend_schedule_window_heals_a_backdated_series(app, memory_scheduler):
+    """The shape the safety net actually has to heal.
+
+    A split leaves the new lesson with the *parent's* `start_datetime`, which is
+    backdated — prod lesson 45 started 2026-07-27, eight days before the split.
+    Its earliest occurrences are therefore already past, and
+    `schedule_lesson_reminder_jobs` skips any occurrence whose reminder time has
+    passed. This asserts the sweep still schedules the FUTURE occurrences, i.e.
+    that a backdated start does not suppress the whole series.
+    """
+    from padel_app.models import User
+    from padel_app.models.Association_CoachClub import Association_CoachClub
+    from padel_app.models.Association_CoachLesson import Association_CoachLesson
+    from padel_app.models.clubs import Club
+    from padel_app.models.coaches import Coach
+    from padel_app.models.lessons import Lesson
+    from padel_app.scheduler import _run_extend_schedule_window
+
+    with app.app_context():
+        coach_user = User(name="Coach", username="backdated_coach", password="x")
+        db.session.add(coach_user)
+        db.session.flush()
+        coach = Coach(user_id=coach_user.id)
+        db.session.add(coach)
+        db.session.flush()
+        club = Club(name="Backdated Club", description="c", location="x")
+        db.session.add(club)
+        db.session.flush()
+        db.session.add(Association_CoachClub(coach_id=coach.id, club_id=club.id))
+
+        # Backdated by 8 days, recurring Mon–Fri for months — lesson 45's shape.
+        start = (
+            datetime.utcnow().replace(hour=12, minute=0, second=0, microsecond=0)
+            - timedelta(days=8)
+        )
+        lesson = Lesson(
+            title="Backdated Series",
+            start_datetime=start,
+            end_datetime=start + timedelta(hours=1),
+            is_recurring=True,
+            recurrence_rule=json.dumps(
+                {"frequency": "weekly", "daysOfWeek": [1, 2, 3, 4, 5]}
+            ),
+            recurrence_end=(start + timedelta(days=150)).date(),
+            type="academy",
+            max_players=4,
+            status="active",
+            club_id=club.id,
+        )
+        db.session.add(lesson)
+        db.session.flush()
+        db.session.add(Association_CoachLesson(coach_id=coach.id, lesson_id=lesson.id))
+        db.session.commit()
+        lesson_id = lesson.id
+
+    assert not _reminder_job_ids(memory_scheduler, lesson_id)
+
+    _run_extend_schedule_window()
+
+    jobs = _reminder_job_ids(memory_scheduler, lesson_id)
+    assert jobs, (
+        "a backdated series got no jobs at all — the daily sweep would not heal "
+        "the very shape a series split produces"
+    )
+
+    # Only future reminders are armed; already-passed ones stay skipped so the
+    # sweep can never retro-fire a reminder for a class that has come and gone.
+    today = datetime.utcnow().date().isoformat()
+    assert all(job_id[len(f"reminder_lesson_{lesson_id}_"):] >= today for job_id in jobs)
+
+
 def test_future_edit_survives_a_scheduler_failure(
     app, memory_scheduler, recurring_series
 ):
