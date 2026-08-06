@@ -1,6 +1,8 @@
 from datetime import datetime, timedelta, time
 import json
 
+from flask import current_app
+
 from padel_app.sql_db import db
 from padel_app.models import (
     Lesson,
@@ -742,6 +744,21 @@ def edit_class_service(data):
         if scope == "future":
             parent_lesson = instance.lesson
             _ensure_date(payload, event_date)
+            # Cancel the parent's occurrence jobs from the split boundary before
+            # the split: _apply_future_edit_to_lesson truncates the parent's
+            # recurrence to `boundary - 1 day`, so any job at/after the boundary
+            # would fire for an occurrence the parent no longer produces.
+            # The boundary is `new_date or event_date` — mirroring the `from_date`
+            # that _apply_future_edit_to_lesson computes. Using event_date here
+            # would wrongly cancel jobs in [event_date, new_date) whenever the
+            # edit moves the date, and those occurrences DO survive on the parent.
+            from padel_app.scheduler import (
+                cancel_lesson_reminder_jobs,
+                schedule_lesson_reminder_jobs,
+            )
+            cancel_lesson_reminder_jobs(
+                parent_lesson.id, from_date=new_date or event_date
+            )
             lesson_to_edit, from_date = _apply_future_edit_to_lesson(
                 lesson=parent_lesson,
                 event_date=event_date,
@@ -756,6 +773,25 @@ def edit_class_service(data):
             if notifications_enabled is not None:
                 lesson_to_edit.notifications_enabled = notifications_enabled
                 lesson_to_edit.save()
+            # A "this and future" edit off a materialized occurrence splits the
+            # series into a *new* Lesson (duplicate_lesson_helper). Without this
+            # the new lesson carries no reminder jobs at all, so its classes
+            # silently send no reminders until the weekly extend_schedule_window
+            # pass happens to pick it up — up to 7 days later, and never
+            # retroactively for the occurrences missed in between.
+            # Best-effort (PAD-10): the edit is already committed, so a scheduler
+            # failure must not turn a successful edit into a false error response.
+            try:
+                if lesson_to_edit.coaches_relations:
+                    schedule_lesson_reminder_jobs(
+                        lesson_to_edit.id,
+                        lesson_to_edit.coaches_relations[0].coach_id,
+                    )
+            except Exception:
+                current_app.logger.exception(
+                    "edit_class_service: failed to schedule reminder jobs for lesson %s",
+                    lesson_to_edit.id,
+                )
             return {"id": lesson_to_edit.id}, 201
 
         return {"error": "Invalid scope"}, 400
@@ -776,9 +812,11 @@ def edit_class_service(data):
 
     if scope == "future":
         _ensure_date(payload, event_date)
-        # Cancel old lesson occurrence jobs from event_date before the split
+        # Cancel old lesson occurrence jobs from the split boundary. The boundary
+        # is `new_date or event_date` — the same `from_date` that
+        # _apply_future_edit_to_lesson truncates the parent's recurrence at.
         from padel_app.scheduler import cancel_lesson_reminder_jobs, schedule_lesson_reminder_jobs
-        cancel_lesson_reminder_jobs(lesson.id, from_date=event_date)
+        cancel_lesson_reminder_jobs(lesson.id, from_date=new_date or event_date)
         lesson_to_edit, _ = _apply_future_edit_to_lesson(
             lesson=lesson,
             event_date=event_date,
