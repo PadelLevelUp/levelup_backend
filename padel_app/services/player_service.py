@@ -7,6 +7,7 @@ from padel_app.models import (
 from sqlalchemy.orm import joinedload
 from sqlalchemy import func, case
 from padel_app.tools.request_adapter import JsonRequestAdapter
+from padel_app.tools.username_tools import unique_placeholder_username
 
 
 # ---------------------------------------------------------------------------
@@ -137,6 +138,13 @@ def _serialize_coach_player_relation(rel):
         # not conflate with isActive.
         "validated": (user.password is not None) if user else False,
     }
+    # PAD-112: the student's own notification block preferences + reason, so the
+    # coach can tell "deliberately silent" from "ignoring me". Shared helper —
+    # `Player.coach_player_info` must return the identical keys.
+    from padel_app.services.student_notification_preferences import (
+        notification_block_payload,
+    )
+    result.update(notification_block_payload(user))
     if level:
         result["level"] = {
             "id": str(level.id),
@@ -158,6 +166,49 @@ def get_coach_players_list(coach):
         .all()
     )
     return [_serialize_coach_player_relation(rel) for rel in relations]
+
+
+def search_coach_players(coach_id, term, limit=20):
+    """PAD-109: type-ahead search over a single coach's own roster.
+
+    Returns ``[{"id": <Player.id as str>, "name": <User.name>}]`` — the id is the
+    ``Player.id``, which is what the standing-waiting-list and notification
+    restriction endpoints expect (never the ``User.id``).
+
+    A blank/whitespace-only term returns an empty list rather than the whole
+    roster, so an empty search box never dumps every student into the dropdown.
+    Inactive players (invited but not yet registered) are included: the coach can
+    legitimately put them on a waiting list.
+    """
+    term = (term or "").strip()
+    if not term:
+        return []
+
+    # Escape LIKE wildcards so a literal "%" or "_" typed by the coach doesn't
+    # turn into a match-everything pattern.
+    escaped = term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+    relations = (
+        Association_CoachPlayer.query.options(
+            joinedload(Association_CoachPlayer.player).joinedload(Player.user)
+        )
+        .filter_by(coach_id=coach_id)
+        .join(Association_CoachPlayer.player)
+        .join(Player.user)
+        .filter(User.name.ilike(f"%{escaped}%", escape="\\"))
+        .order_by(User.name.asc())
+        .limit(limit)
+        .all()
+    )
+
+    results = []
+    for rel in relations:
+        player = rel.player
+        user = player.user if player else None
+        if not player or not user:
+            continue
+        results.append({"id": str(player.id), "name": user.name})
+    return results
 
 
 def get_coach_players_paginated(coach, page=1, per_page=25, search=None,
@@ -253,7 +304,14 @@ def get_player_profile(coach, player_id):
 
 
 def add_player_service(data):
-    """Builds the full player creation payload and delegates to create_player_helper."""
+    """Builds the full player creation payload and delegates to create_player_helper.
+
+    PAD-105: a coach never chooses the player's username — that is the player's
+    own credential, picked when they activate their account. Any `username` in
+    the payload is therefore ignored and a placeholder is generated instead
+    (same mechanism as the invite flow, `players.invite-completion`), which the
+    player replaces at activation.
+    """
     payload = {
         'coach': int(data['coachId']) if data['coachId'] else None,
         'level': int(data['levelId']) if data.get('levelId', None) else None,
@@ -261,7 +319,7 @@ def add_player_service(data):
         'notes': data.get('notes', None),
         'user': {
             'name': data.get('name', None),
-            'username': data.get('username', None),
+            'username': unique_placeholder_username(),
             'email': data.get('email', None),
             'phone': data.get('phone', None),
         },
@@ -276,6 +334,8 @@ def edit_player_service(data):
 
     changes = {k: v for k, v in updates.items() if v != player_info.get(k)}
 
+    # PAD-105: `username` is deliberately absent — a coach cannot set or change
+    # a player's username, only the player themselves can (at activation).
     payload = {
         'coach': player_info['coachId'],
         'relation': {
@@ -285,7 +345,6 @@ def edit_player_service(data):
         },
         'user': {
             'name': changes.get('name', None),
-            'username': changes.get('username', None),
             'email': changes.get('email', None),
             'phone': changes.get('phone', None),
         },

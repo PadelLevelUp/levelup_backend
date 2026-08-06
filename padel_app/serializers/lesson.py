@@ -196,6 +196,27 @@ def serialize_class_instance(obj, viewer_player_id=None) -> dict:
                 obj.start_datetime - timedelta(hours=deadline_hours)
             ).isoformat()
 
+        # PAD-73: the proactive-decline window. Computed by the SAME server
+        # helper that `cancel_attendance` uses to classify a decline, so the
+        # frontend can never offer the proactive action at a moment the server
+        # would refuse to treat as proactive. Imported lazily because
+        # notification_service imports serializers — a module-level import here
+        # would create a cycle.
+        from padel_app.services.notification_service import (
+            proactive_decline_deadline,
+            proactive_decline_window_is_open,
+        )
+
+        proactive_config = None
+        if coach_id is not None:
+            proactive_config = NotificationConfig.query.filter_by(
+                coach_id=coach_id
+            ).first()
+        proactive_deadline_dt = proactive_decline_deadline(obj, proactive_config)
+        can_decline_proactively = proactive_decline_window_is_open(
+            obj, proactive_config
+        )
+
         data.update(
             {
                 "parentClassId": str(lesson.id),
@@ -222,6 +243,12 @@ def serialize_class_instance(obj, viewer_player_id=None) -> dict:
                 "plannedExerciseIds": [str(t.exercise_id) for t in training_rows],
                 "cancellationDeadlineHours": deadline_hours,
                 "cancellationDeadline": cancellation_deadline,
+                "proactiveDeclineDeadline": (
+                    proactive_deadline_dt.isoformat()
+                    if proactive_deadline_dt is not None
+                    else None
+                ),
+                "canDeclineProactively": can_decline_proactively,
             }
         )
         data["levelId"] = str(obj.level_id) if obj.level_id else data["levelId"]

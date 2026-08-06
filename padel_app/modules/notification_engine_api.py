@@ -25,6 +25,14 @@ from padel_app.services.notification_service import (
     add_standing_waiting_list_entry,
     remove_standing_waiting_list_entry,
 )
+from padel_app.services.player_service import search_coach_players
+from padel_app.services.student_availability_service import (
+    blocked_player_ids_for_window,
+    blocked_players_for_instance,
+)
+from padel_app.services.student_notification_preferences import (
+    preference_blocked_players,
+)
 
 bp = Blueprint("notification_engine_api", __name__, url_prefix="/api/app/notify")
 
@@ -45,6 +53,20 @@ def _resolve_instance(model: str, original_id: int, date_str: str | None) -> Les
         abort(400, "date is required for Lesson events")
     date = datetime.strptime(date_str, "%Y-%m-%d").date()
     return get_or_materialize_instance(lesson, date)
+
+
+@bp.get("/player_search")
+@jwt_required()
+def player_search():
+    """PAD-109: type-ahead player search for the notification settings screens.
+
+    Feeds the "add a student" boxes in Settings > Notifications — the standing
+    (permanent) waiting list and the excluded-players restriction. Scoped to the
+    authenticated coach's own roster; returns Player ids.
+    """
+    coach = _current_coach()
+    query = request.args.get("q", default="", type=str)
+    return jsonify({"players": search_coach_players(coach.id, query)})
 
 
 @bp.get("/config")
@@ -91,8 +113,23 @@ def manual_notify():
     if not player_ids:
         return jsonify({"error": "No player IDs provided"}), 400
     instance = _resolve_instance(model, original_id, date_str)
+    # PAD-107 + PAD-112: work out who will be skipped BEFORE sending, so the
+    # coach is told by name exactly who could not be reached instead of just
+    # seeing a count that is quietly short. Two independent reasons a student is
+    # skipped — they marked themselves unavailable for this slot (PAD-107), or
+    # they opted out of coach-picked invitations (PAD-112) — so both lists are
+    # merged. A student hit by both appears once, carrying the PAD-112 reason:
+    # that one is the student's own words and is meant to be coach-visible,
+    # whereas an availability blocker's details stay private.
+    blocked_by_id = {
+        entry["playerId"]: entry
+        for entry in blocked_players_for_instance(instance, player_ids)
+    }
+    for entry in preference_blocked_players(player_ids, kind="manual"):
+        blocked_by_id[entry["playerId"]] = entry
+    blocked = list(blocked_by_id.values())
     events = send_manual_notifications(instance.id, player_ids, coach.id)
-    return jsonify({"sent": len(events)})
+    return jsonify({"sent": len(events), "blocked": blocked})
 
 
 @bp.post("/send_reminders")
@@ -105,9 +142,81 @@ def send_reminders():
     original_id = int(data.get("originalId"))
     date_str = data.get("date")
     instance = _resolve_instance(model, original_id, date_str)
-    send_class_reminders(instance.id)
-    sent = len(instance.players_relations)
-    return jsonify({"sent": sent})
+    result = send_class_reminders(instance.id)
+    # PAD-107 + PAD-112: report what the service actually sent. This used to
+    # return ``len(instance.players_relations)`` — the enrolment count — which
+    # lied whenever a student had already responded, had hit their reminder cap,
+    # is unavailable for this slot (PAD-107), or blocked all notifications
+    # (PAD-112). ``blocked`` names them so the short count is explainable.
+    return jsonify({
+        "sent": result.get("sent", 0),
+        "blocked": result.get("blocked", []),
+    })
+
+
+@bp.post("/availability_conflicts")
+@jwt_required()
+def availability_conflicts():
+    """
+    PAD-107: which of these players marked themselves unavailable for a
+    proposed class window?
+
+    Body: ``{date: "YYYY-MM-DD", startTime: "HH:MM", endTime: "HH:MM",
+    playerIds: [..]}``. Returns ``{"blocked": [{"playerId", "name"}]}``.
+
+    Deliberately returns names only — the student's blocker title, description
+    and exact hours are their private calendar and are never exposed to a coach.
+
+    Scoped to the caller's OWN roster: ids belonging to another coach's students
+    are dropped silently, so this cannot be used to probe whether an arbitrary
+    player is free at a given hour.
+    """
+    coach = _current_coach()
+    data = request.get_json() or {}
+    date_str = data.get("date")
+    start_time = data.get("startTime")
+    end_time = data.get("endTime")
+    raw_ids = data.get("playerIds") or []
+
+    if not date_str or not start_time or not end_time:
+        return jsonify({"error": "date, startTime and endTime are required"}), 400
+    if not raw_ids:
+        return jsonify({"blocked": []})
+
+    try:
+        player_ids = [int(pid) for pid in raw_ids]
+        window_start = datetime.strptime(f"{date_str} {start_time}", "%Y-%m-%d %H:%M")
+        window_end = datetime.strptime(f"{date_str} {end_time}", "%Y-%m-%d %H:%M")
+    except (TypeError, ValueError):
+        return jsonify({"error": "invalid date/time or playerIds"}), 400
+
+    if window_end <= window_start:
+        return jsonify({"blocked": []})
+
+    from padel_app.models import Association_CoachPlayer, Player
+
+    # Being a coach is not enough — a coach may only ask about THEIR OWN
+    # students. Foreign ids are dropped rather than rejected, so the response
+    # reveals nothing about whether such a player exists.
+    own_player_ids = {
+        cp.player_id
+        for cp in Association_CoachPlayer.query.filter_by(coach_id=coach.id).all()
+    }
+    player_ids = [pid for pid in player_ids if pid in own_player_ids]
+    if not player_ids:
+        return jsonify({"blocked": []})
+
+    blocked_ids = blocked_player_ids_for_window(player_ids, window_start, window_end)
+    blocked = []
+    for player_id in player_ids:
+        if player_id not in blocked_ids:
+            continue
+        player = Player.query.get(player_id)
+        blocked.append({
+            "playerId": player_id,
+            "name": player.user.name if player and player.user else "",
+        })
+    return jsonify({"blocked": blocked})
 
 
 @bp.get("/groups")
@@ -405,3 +514,73 @@ def debug_schedule_reminder_test():
         "studentIds": [student1_user.id, student2_user.id],
         "studentUsernames": ["e2e-student", "e2e-student-2"],
     })
+
+
+@bp.post("/debug/reset_presence")
+@jwt_required()
+def debug_reset_presence():
+    """
+    E2E test helper (PAD-73) — only active when E2E_DEBUG_ENDPOINTS is set AND
+    the caller presents a valid JWT.
+
+    Restores a seeded student to "enrolled, invited, not yet answered" on a
+    lesson instance: re-creates the enrolment row if a previous test removed it
+    and clears the presence back to ``invited=True, confirmed=False`` with no
+    status/justification/late flag.
+
+    The E2E seed DB is shared across every spec, so the proactive-decline tests
+    must hand the class back exactly as they found it. Doing that through a
+    debug endpoint keeps the assertions themselves honest — they never touch the
+    DB directly, only the same API surface the app uses.
+
+    POST body: { "lessonInstanceId": int, "username": str }
+    """
+    if not _debug_endpoints_enabled():
+        abort(404)
+
+    from padel_app.models.Association_PlayerLessonInstance import (
+        Association_PlayerLessonInstance,
+    )
+    from padel_app.models.presences import Presence
+    from padel_app.sql_db import db
+
+    data = request.get_json() or {}
+    lesson_instance_id = int(data.get("lessonInstanceId"))
+    username = data.get("username")
+
+    user = User.query.filter_by(username=username).first()
+    if not user or not user.player:
+        abort(404, "Seeded user not found")
+    player = user.player
+
+    LessonInstance.query.get_or_404(lesson_instance_id)
+
+    enrolment = Association_PlayerLessonInstance.query.filter_by(
+        player_id=player.id,
+        lesson_instance_id=lesson_instance_id,
+    ).first()
+    if enrolment is None:
+        db.session.add(Association_PlayerLessonInstance(
+            player_id=player.id,
+            lesson_instance_id=lesson_instance_id,
+        ))
+
+    presence = Presence.query.filter_by(
+        player_id=player.id,
+        lesson_instance_id=lesson_instance_id,
+    ).first()
+    if presence is None:
+        presence = Presence(
+            player_id=player.id,
+            lesson_instance_id=lesson_instance_id,
+        )
+        db.session.add(presence)
+    presence.invited = True
+    presence.confirmed = False
+    presence.validated = False
+    presence.status = None
+    presence.justification = None
+    presence.late_cancellation = False
+
+    db.session.commit()
+    return jsonify({"ok": True, "playerId": player.id})

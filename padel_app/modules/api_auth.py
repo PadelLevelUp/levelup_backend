@@ -29,6 +29,13 @@ def _serialize_me(user):
         "abbreviation": user.abbreviation_display,
         "email": user.email,
         "phone": user.phone,
+        # PAD-112: the student's standing class-invitation block preferences.
+        # Per-user, so they ride on this route rather than on a coach-scoped one
+        # (settings.role-scope rule 8 keeps /auth/me open to both roles).
+        "blockAutoInvitations": bool(user.notif_block_auto_invitations),
+        "blockManualInvitations": bool(user.notif_block_manual_invitations),
+        "blockAllNotifications": bool(user.notif_block_all),
+        "notificationBlockReason": user.notif_block_reason or "",
     }
 
 @bp.post("/login")

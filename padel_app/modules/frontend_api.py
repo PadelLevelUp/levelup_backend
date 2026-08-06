@@ -14,6 +14,7 @@ from padel_app.serializers.lesson import (
     serialize_class_instance,
 )
 from padel_app.serializers.user import serialize_user
+from padel_app.tools.username_tools import is_placeholder_username
 from padel_app.serializers.presence import serialize_presence
 from padel_app.serializers.calendar import serialize_calendar_block
 from padel_app.serializers.message import serialize_message
@@ -57,6 +58,10 @@ from padel_app.services.player_service import (
 )
 from padel_app.services.user_service import (
     activate_user_service,
+)
+from padel_app.services.attendance_history_service import (
+    build_attendance_history,
+    default_range as default_attendance_range,
 )
 from padel_app.services.club_service import (
     create_coach_invitation_service,
@@ -178,7 +183,12 @@ def current_player():
     return g.current_player
 
 def current_club():
-    coach = current_coach()
+    # PAD-103: a club is always reached *through* a coach. Resolving it with the
+    # nullable `current_coach()` turned every student caller into an
+    # `AttributeError` -> 500; `require_coach()` makes it the 403 it always
+    # should have been. `require_coach` is defined below — Python resolves it at
+    # call time, so the ordering is fine.
+    coach = require_coach()
     return coach.current_club
 
 
@@ -195,6 +205,18 @@ def current_club():
 #   * the acting coach is always derived from the JWT, never from the body;
 #   * a body-supplied owner id is only ever accepted when it matches the JWT's;
 #   * touching a row owned by somebody else is 403, not 404, and never mutates.
+#
+# PAD-103 closed the other half of the same hole. PAD-92 only applied
+# `require_coach()` to the `delete/*` routes; every other coach-only route still
+# started from the nullable `current_coach()` and dereferenced it, so a caller
+# with a *player* profile and no coach profile — a student — produced an
+# unhandled `AttributeError` (500) instead of a 403. That is the same class of
+# bug: the caller's role was never actually checked, it just happened to crash.
+# Every coach-only route now goes through `require_coach()`; the routes that
+# legitimately serve students (`/calendar`, `/dashboard`, `/class_instance`,
+# `/calendar_event`, `/lesson_instance/<id>/presences`, `/availability_blockers`)
+# keep their explicit `current_coach() is None` student branch and must NOT be
+# converted.
 
 
 def require_coach():
@@ -379,7 +401,15 @@ def lesson_instance_detail(instance_id):
 @bp.get("/register/user/<user_id>")
 def get_user_for_registration(user_id):
     user = User.query.get_or_404(user_id)
-    return jsonify(serialize_user(user))
+    payload = serialize_user(user)
+    # PAD-105: a coach-created account carries a generated `pending-…`
+    # placeholder username. This form is precisely where the user picks their
+    # own, so hand back an empty field rather than the placeholder — prefilling
+    # it leaks an internal detail and nudges the user into keeping a
+    # machine-generated login.
+    if is_placeholder_username(payload.get("username")):
+        payload["username"] = None
+    return jsonify(payload)
 
 
 @bp.post("/activate/user/<user_id>")
@@ -438,7 +468,7 @@ def mark_conversation_read(conversation_id):
 @bp.get("/coach")
 @jwt_required()
 def coach_detail():
-    coach = current_coach()
+    coach = require_coach()
     club = coach.current_club
     return jsonify({
         "id": coach.id,
@@ -556,14 +586,14 @@ def coach_players_paginated():
 @bp.get("/coach_levels")
 @jwt_required()
 def get_coach_levels():
-    coach = current_coach()
+    coach = require_coach()
     return jsonify([serialize_coach_level(l) for l in coach.levels])
 
 
 @bp.get("/seasons")
 @jwt_required()
 def get_seasons():
-    coach = current_coach()
+    coach = require_coach()
     return jsonify([serialize_season(s) for s in list_seasons(coach)])
 
 
@@ -578,7 +608,7 @@ def get_seasons():
 @bp.get("/evaluation_categories")
 @jwt_required()
 def evaluation_categories():
-    coach = current_coach()
+    coach = require_coach()
     return jsonify([ec.frontend_dict() for ec in coach.evaluation_categories])
 
 
@@ -715,6 +745,84 @@ def class_instance():
 def player_profile(player_id):
     coach = current_coach()
     return jsonify(get_player_profile(coach, player_id))
+
+
+def _resolve_attendance_subject(raw_player_id):
+    """Authorize `/attendance_history` and return the player whose data to read.
+
+    Spec `attendance.history` rule 3. The page has two entry points — a student
+    reading their own history and a coach reading a roster player's — so the
+    guard lives HERE, on the data endpoint, not on the frontend route. PAD-88 and
+    PAD-115 are the precedent: a `RoleRoute` in the SPA is UX, not authorization.
+
+    Resolution order matters. The SELF case is checked first so a user who holds
+    both a player and a coach profile is never 403'd on their own data — the
+    coach-first ordering used elsewhere in this blueprint would do exactly that.
+    """
+    player = current_player()
+
+    if raw_player_id in (None, ""):
+        if player is None:
+            abort(403, "Not authorized to view this attendance history")
+        return player
+
+    try:
+        target_id = int(raw_player_id)
+    except (TypeError, ValueError):
+        abort(400, "playerId must be an integer")
+
+    # 1. Own data.
+    if player is not None and player.id == target_id:
+        return player
+
+    # 2. A coach may read any player on their own roster, and nobody else's.
+    coach = current_coach()
+    if coach is not None:
+        require_own_roster_relation(coach, target_id)
+        return Player.query.get_or_404(target_id)
+
+    abort(403, "Not authorized to view this attendance history")
+
+
+def _parse_attendance_bound(raw, *, end_of_day):
+    """Parse a `from`/`to` query param; a bare date means the whole day."""
+    parsed = parser.isoparse(raw)
+    if len(raw.strip()) <= 10 and end_of_day:
+        parsed = parsed.replace(hour=23, minute=59, second=59)
+    return parsed
+
+
+@bp.get("/attendance_history")
+@jwt_required()
+def attendance_history():
+    """Attended-class history for one player (PAD-114).
+
+    Query params: `playerId` (defaults to the caller), `from`/`to` (ISO-8601,
+    default = current month) and an optional `granularity` pin. The response
+    always echoes the granularity actually used so the chart labels its axis from
+    the payload rather than re-deriving the rule client-side.
+    """
+    subject = _resolve_attendance_subject(request.args.get("playerId"))
+
+    raw_from = request.args.get("from")
+    raw_to = request.args.get("to")
+    if raw_from and raw_to:
+        try:
+            range_start = _parse_attendance_bound(raw_from, end_of_day=False)
+            range_end = _parse_attendance_bound(raw_to, end_of_day=True)
+        except (ValueError, OverflowError):
+            abort(400, "from/to must be ISO-8601 datetimes")
+    else:
+        range_start, range_end = default_attendance_range()
+
+    payload = build_attendance_history(
+        player_id=subject.id,
+        range_start=range_start,
+        range_end=range_end,
+        granularity=request.args.get("granularity"),
+    )
+    payload["playerName"] = subject.user.name if subject.user else None
+    return jsonify(payload)
 
 
 # -------------------------------------------------------------------
@@ -882,7 +990,7 @@ def delete_availability_blocker(block_id):
 @jwt_required()
 def add_coach_level():
     data = request.get_json() or {}
-    upsert_coach_levels(current_coach(), data)
+    upsert_coach_levels(require_coach(), data)
     return jsonify(data)
 
 
@@ -890,7 +998,7 @@ def add_coach_level():
 @jwt_required()
 def add_seasons():
     data = request.get_json() or []
-    coach = current_coach()
+    coach = require_coach()
     try:
         upsert_seasons(coach, data)
     except ValueError as e:
@@ -907,7 +1015,7 @@ def add_seasons():
 @jwt_required()
 def delete_season_route():
     data = request.get_json() or {}
-    delete_season(current_coach(), data["id"])
+    delete_season(require_coach(), data["id"])
     return jsonify({"status": "Removed season"}), 200
 
 
@@ -915,7 +1023,7 @@ def delete_season_route():
 @jwt_required()
 def add_evaluation_categories():
     data = request.get_json() or {}
-    upsert_evaluation_categories(current_coach(), data)
+    upsert_evaluation_categories(require_coach(), data)
     return jsonify(data)
 
 
@@ -923,7 +1031,7 @@ def add_evaluation_categories():
 @jwt_required()
 def add_coach_note():
     data = request.get_json() or {}
-    result, status = add_coach_note_service(current_coach(), data)
+    result, status = add_coach_note_service(require_coach(), data)
     return jsonify(result), status
 
 
@@ -931,7 +1039,7 @@ def add_coach_note():
 @jwt_required()
 def add_evaluation_entry():
     data = request.get_json() or {}
-    result = add_evaluation_entry_service(current_coach(), data)
+    result = add_evaluation_entry_service(require_coach(), data)
     return jsonify(result)
 
 
@@ -953,7 +1061,7 @@ def add_evaluation_entry():
 @jwt_required()
 def create_coach_invitation(club_id):
     data = request.get_json(silent=True) or {}
-    coach = current_coach()
+    coach = require_coach()
     invitation = create_coach_invitation_service(
         club_id, coach, email=data.get("email")
     )
@@ -967,7 +1075,7 @@ def create_coach_invitation(club_id):
 @bp.get("/club/<int:club_id>/coach-invitations")
 @jwt_required()
 def list_coach_invitations(club_id):
-    coach = current_coach()
+    coach = require_coach()
     invitations = list_coach_invitations_service(club_id, coach)
     return jsonify([
         {
@@ -1013,7 +1121,7 @@ def accept_coach_invitation(token):
 @bp.post("/coach-invitations/<token>/revoke")
 @jwt_required()
 def revoke_coach_invitation(token):
-    coach = current_coach()
+    coach = require_coach()
     revoke_coach_invitation_service(token, coach)
     return jsonify({"success": True})
 
@@ -1061,7 +1169,7 @@ def accept_player_invitation(token):
 @bp.post("/player-invitations/<token>/revoke")
 @jwt_required()
 def revoke_player_invitation(token):
-    coach = current_coach()
+    coach = require_coach()
     revoke_player_invitation_service(token, coach)
     return jsonify({"success": True})
 
@@ -1381,9 +1489,7 @@ def import_analyze():
     if not file:
         return jsonify({"error": "No file provided"}), 400
 
-    coach = current_coach()
-    if not coach:
-        return jsonify({"error": "Coach not found"}), 404
+    coach = require_coach()
 
     file_bytes = file.read()
 
@@ -1510,7 +1616,7 @@ def import_confirm():
 
     Drains the shared worker and returns the same results dict as before.
     """
-    coach = current_coach()
+    coach = require_coach()
     club = current_club()
     data = request.get_json() or {}
 
@@ -1535,9 +1641,7 @@ def import_confirm_stream():
     """
     from flask import stream_with_context
 
-    coach = current_coach()
-    if not coach:
-        return jsonify({"error": "Coach not found"}), 404
+    coach = require_coach()
     club = current_club()
     data = request.get_json() or {}
 
@@ -1558,9 +1662,7 @@ def import_confirm_stream():
 @jwt_required()
 def import_history():
     from padel_app.services.import_service import get_import_history
-    coach = current_coach()
-    if not coach:
-        return jsonify({"error": "Coach not found"}), 404
+    coach = require_coach()
     return jsonify(get_import_history(coach))
 
 
@@ -1568,9 +1670,7 @@ def import_history():
 @jwt_required()
 def import_revert(import_id):
     from padel_app.services.import_service import revert_import
-    coach = current_coach()
-    if not coach:
-        return jsonify({"error": "Coach not found"}), 404
+    coach = require_coach()
 
     result = revert_import(import_id, coach)
     if isinstance(result, tuple):

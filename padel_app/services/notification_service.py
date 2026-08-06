@@ -67,6 +67,24 @@ from padel_app.services.level_ladder import (
 from padel_app.utils.push_notifications import send_push_notification
 
 
+# PAD-107 + PAD-112: message types that ASK a student to play in a specific
+# class slot. These are the only sends a suppression rule may drop — both an
+# availability blocker (PAD-107) and a student's own block preference (PAD-112)
+# are enforced against exactly this vocabulary, via two additive guards in
+# ``_send_system_message``. Both tickets introduced this constant independently,
+# with the same name and the same three values; the batch merge kept one
+# definition and both guards.
+#
+# Plain chat, class-cancellation notices and "you got the spot" confirmations
+# are deliberately NOT in here: silencing invitations must never cut a student
+# off from their coach.
+_BLOCKABLE_MESSAGE_TYPES = frozenset({
+    "notification_invite",
+    "notification_reminder",
+    "waiting_list_offer",
+})
+
+
 # ---------------------------------------------------------------------------
 # Config helpers
 # ---------------------------------------------------------------------------
@@ -548,6 +566,17 @@ def _get_eligible_students_for_group(
     from padel_app.services.student_availability_service import filter_blocked_coach_players
     coach_players = filter_blocked_coach_players(coach_players, instance)
 
+    # PAD-112: drop students who switched off AUTOMATIC invitations outright.
+    # Additive with the line above and deliberately separate: that one asks "are
+    # they free at THIS hour?", this one asks "do they want to be asked at all?".
+    # Filtering here — rather than at delivery — is what keeps the engine from
+    # creating a NotificationEvent for someone it will never message, which
+    # would leave the vacancy waiting on a reply that can never arrive.
+    from padel_app.services.student_notification_preferences import (
+        filter_preference_blocked_coach_players,
+    )
+    coach_players = filter_preference_blocked_coach_players(coach_players)
+
     player_stats = {}
     for cp in coach_players:
         att_rate, just_rate = _attendance_stats(cp.player_id)
@@ -611,6 +640,17 @@ def get_eligible_students(
     # this class window (AUTO invitations only — manual add is unaffected).
     from padel_app.services.student_availability_service import filter_blocked_coach_players
     coach_players = filter_blocked_coach_players(coach_players, instance)
+
+    # PAD-112: drop students who switched off AUTOMATIC invitations outright.
+    # Additive with the line above and deliberately separate: that one asks "are
+    # they free at THIS hour?", this one asks "do they want to be asked at all?".
+    # Filtering here — rather than at delivery — is what keeps the engine from
+    # creating a NotificationEvent for someone it will never message, which
+    # would leave the vacancy waiting on a reply that can never arrive.
+    from padel_app.services.student_notification_preferences import (
+        filter_preference_blocked_coach_players,
+    )
+    coach_players = filter_preference_blocked_coach_players(coach_players)
 
     criteria = round_cfg.get("criteria", [])
     criteria_values = round_cfg.get("criteria_values", {})
@@ -816,6 +856,67 @@ def _send_system_message(
             )
         return None
 
+    # PAD-107 hard backstop — "em nenhuma circunstância". A student who marked
+    # themselves unavailable must never be solicited about a class that falls in
+    # that window, whatever fired the send: the coach's "Lembrar"/notify buttons,
+    # the APScheduler reminder job, an auto-invitation round, or the waiting-list
+    # cascade. Enforcing it at the single delivery choke point means no future
+    # caller can bypass it by accident.
+    #
+    # Scope is deliberately narrow: only the three CLASS-SLOT SOLICITATION types.
+    # Plain chat, cancellation notices and "you got the spot" confirmations still
+    # go through — being unavailable means "don't ask me to play at that hour",
+    # not "cut me off from my coach".
+    resolved_instance_id = class_instance_id
+    if resolved_instance_id is None and msg_metadata:
+        resolved_instance_id = msg_metadata.get("lessonInstanceId") or msg_metadata.get("instanceId")
+
+    if message_type in _BLOCKABLE_MESSAGE_TYPES and resolved_instance_id is not None:
+        from padel_app.services.student_availability_service import (
+            instance_window_is_blocked_for_user,
+        )
+
+        _blocked_instance = LessonInstance.query.get(resolved_instance_id)
+        if instance_window_is_blocked_for_user(player_user_id, _blocked_instance):
+            from flask import current_app, has_app_context
+            if has_app_context():
+                current_app.logger.info(
+                    "_send_system_message: suppressing %s for user %s — availability "
+                    "blocker overlaps lesson instance %s (PAD-107)",
+                    message_type, player_user_id, resolved_instance_id,
+                )
+            return None
+
+    # PAD-112 backstop — a student who blocked ALL notifications is never
+    # solicited about a class slot, whatever fired the send: the coach's
+    # notify/remind buttons, the APScheduler reminder job, an auto-invitation
+    # round, or the waiting-list cascade. Enforcing it at the single delivery
+    # choke point means no future caller can bypass it by accident.
+    #
+    # This is a SAFETY NET, not the primary enforcement. The auto path filters
+    # in `get_eligible_students`, the manual path filters before it creates the
+    # NotificationEvent, and `send_class_reminders` filters before it sends —
+    # because blocking only here would leave events marked "sent" with no
+    # message behind them.
+    #
+    # Purely a per-recipient lookup: unlike the PAD-107 availability backstop it
+    # needs no lesson instance, so the two guards simply sit in sequence — a
+    # send is suppressed if EITHER says so.
+    if message_type in _BLOCKABLE_MESSAGE_TYPES:
+        from padel_app.services.student_notification_preferences import (
+            user_blocks_all_notifications,
+        )
+
+        if user_blocks_all_notifications(player_user_id):
+            from flask import current_app, has_app_context
+            if has_app_context():
+                current_app.logger.info(
+                    "_send_system_message: suppressing %s for user %s — they "
+                    "blocked all notifications (PAD-112)",
+                    message_type, player_user_id,
+                )
+            return None
+
     conv = _get_or_create_direct_conversation(coach_user_id, player_user_id)
     msg = Message(
         text=text,
@@ -842,10 +943,8 @@ def _send_system_message(
     # in this module is a class/notification-engine event (reminder, invite,
     # spot-filled, waiting list, etc.), so it always carries a lesson instance id
     # for mobile tap-routing to class/[id]. Falls back to msg_metadata's
-    # lessonInstanceId/instanceId when the caller didn't pass it explicitly.
-    resolved_instance_id = class_instance_id
-    if resolved_instance_id is None and msg_metadata:
-        resolved_instance_id = msg_metadata.get("lessonInstanceId") or msg_metadata.get("instanceId")
+    # lessonInstanceId/instanceId when the caller didn't pass it explicitly
+    # (``resolved_instance_id`` was computed above for the PAD-107 backstop).
     if resolved_instance_id is not None:
         send_expo_push_to_user(
             player_user_id,
@@ -864,6 +963,7 @@ def _notify_coach_of_cancellation(
     player,
     *,
     is_late: bool,
+    is_proactive: bool = False,
     locale: str = "en",
 ) -> "object | None":
     """Create a single COACH-facing notification when a student cancels.
@@ -895,7 +995,22 @@ def _notify_coach_of_cancellation(
     # language. Previously only the interpolated fields (name, class, weekday)
     # were localized while the template words stayed English, producing a mixed
     # "cancelled (LATE) for ... on <weekday-in-pt>" message for PT coaches.
-    if is_pt:
+    # PAD-73: a proactive decline gets its own wording. The coach should be able
+    # to tell at a glance that this student spoke up EARLY — before they were
+    # even asked to confirm — because that is exactly the behaviour the feature
+    # is meant to encourage, and it reads very differently from a late drop-out.
+    if is_proactive:
+        if is_pt:
+            text = (
+                f"{player_name} avisou com antecedência que não vai comparecer "
+                f"a {class_title}{when}. A vaga foi libertada."
+            )
+        else:
+            text = (
+                f"{player_name} let you know in advance that they will not attend "
+                f"{class_title}{when}. The spot has been freed."
+            )
+    elif is_pt:
         marker = " (ATRASADO)" if is_late else ""
         text = f"{player_name} cancelou{marker} para {class_title}{when}."
     elif is_late:
@@ -912,6 +1027,9 @@ def _notify_coach_of_cancellation(
         msg_metadata={
             "cancellation": True,
             "lateCancellation": bool(is_late),
+            # PAD-73: machine-readable marker so clients can style an early
+            # heads-up differently from a plain or late cancellation.
+            "proactiveDecline": bool(is_proactive),
             "lessonInstanceId": instance.id,
         },
     )
@@ -922,7 +1040,9 @@ def _notify_coach_of_cancellation(
         "payload": serialize_message(msg, None),
     })
 
-    if is_pt:
+    if is_proactive:
+        push_title = "Aviso antecipado" if is_pt else "Advance notice"
+    elif is_pt:
         push_title = "Cancelamento tardio" if is_late else "Cancelamento"
     else:
         push_title = "Late cancellation" if is_late else "Cancellation"
@@ -1271,7 +1391,7 @@ def send_class_reminders(instance_id: int, *, now: datetime | None = None) -> di
     _log = current_app.logger if has_app_context() else None
 
     _now = now or utcnow_naive()
-    _no_send = {"sent": 0, "more_due": False}
+    _no_send = {"sent": 0, "more_due": False, "blocked": []}
 
     instance = LessonInstance.query.get(instance_id)
     if not instance:
@@ -1327,8 +1447,48 @@ def send_class_reminders(instance_id: int, *, now: datetime | None = None) -> di
     sent_this_round = 0
     more_due = False
 
+    # PAD-107 + PAD-112: two independent reasons a student is skipped for this
+    # class's reminders — they marked themselves unavailable for the slot
+    # (PAD-107), or they blocked ALL notifications (PAD-112). Both apply. A
+    # student hit by both appears once, carrying the PAD-112 entry, because that
+    # reason is the student's own coach-visible words; an availability blocker's
+    # details stay private.
+    #
+    # Only the "all" preference level reaches this far — blocking just the
+    # automatic or manual INVITATIONS leaves reminders alone, because a reminder
+    # is about a class they are already enrolled in, not an invitation to a new
+    # one.
+    #
+    # Everyone else in the class is still reminded: one silenced student must
+    # not silence the whole class. Skipped students are reported so the coach
+    # knows the count is deliberately short.
+    from padel_app.services.student_availability_service import (
+        blocked_players_for_instance,
+    )
+    from padel_app.services.student_notification_preferences import (
+        preference_blocked_players,
+    )
+    _blocked_by_id = {
+        entry["playerId"]: entry
+        for entry in blocked_players_for_instance(instance)
+    }
+    for entry in preference_blocked_players(
+        [rel.player_id for rel in instance.players_relations], kind="all",
+    ):
+        _blocked_by_id[entry["playerId"]] = entry
+    blocked = list(_blocked_by_id.values())
+    blocked_ids = set(_blocked_by_id)
+    if blocked and _log:
+        _log.info(
+            "send_class_reminders: instance %s — skipping %d student(s) who are "
+            "unavailable for this slot or blocked notifications (PAD-107/PAD-112)",
+            instance_id, len(blocked),
+        )
+
     for rel in instance.players_relations:
         player_id = rel.player_id
+        if int(player_id) in blocked_ids:
+            continue
         player_user_id = _user_id_for_player(player_id)
         if not player_user_id or not coach_user_id:
             continue
@@ -1423,7 +1583,7 @@ def send_class_reminders(instance_id: int, *, now: datetime | None = None) -> di
         if (sent_count + 1) < reminder_count:
             more_due = True
 
-    return {"sent": sent_this_round, "more_due": more_due}
+    return {"sent": sent_this_round, "more_due": more_due, "blocked": blocked}
 
 
 def _expire_stale_reminders(instance: LessonInstance, player_user_id: int) -> None:
@@ -1816,6 +1976,91 @@ def _free_spot_for_declining_player(
             _now = now or utcnow_naive()
             if invite_start_dt is None or _now >= invite_start_dt:
                 trigger_invitations(instance, coach.id)
+            elif vacancy is not None:
+                # PAD-73: the vacancy opens IMMEDIATELY, but inviting other
+                # students must still wait for the coach's configured
+                # "iniciar convites" instant — even when the decline lands days
+                # earlier than that.
+                #
+                # Skipping `trigger_invitations` above is not enough on its own:
+                # `process_invitation_batches` runs every two minutes over every
+                # open vacancy and fires a batch as soon as it sees one with
+                # `last_activity_at is None`. It only holds off for a vacancy
+                # that carries `invite_not_before`. Without stamping it here, a
+                # decline 10 days out would have the engine inviting replacements
+                # within two minutes — exactly the behaviour this ticket rules
+                # out. `invite_not_before` is the field the batch processor and
+                # `_send_invitation_batch` already honour (the semi-automatic
+                # approval path stamps it for the same reason), so this makes the
+                # timing guarantee hold on every path rather than just this one.
+                vacancy.invite_not_before = invite_start_dt
+                vacancy.save()
+
+
+def proactive_decline_deadline(
+    instance: LessonInstance,
+    config=None,
+) -> "datetime | None":
+    """PAD-73 — the instant the proactive-decline window closes.
+
+    A decline is "proactive" when the student volunteers it *before they would
+    normally have been asked to confirm*. That moment is precisely when the
+    attendance reminder for this instance would fire, so the cutoff is DERIVED
+    from the very same input the scheduler uses to arm the reminder job —
+    ``config.get_reminder_timing()`` fed through ``_compute_reminder_dt`` — and
+    is never a hardcoded interval. Change the coach's reminder timing and this
+    cutoff moves with it, automatically and in lockstep with the real reminder.
+
+    Returns ``None`` when no instant is computable (no start time, or a timing
+    shape ``_compute_timing_dt`` doesn't understand). Callers treat ``None`` as
+    "there is no proactive window", which keeps the pre-PAD-73 behaviour intact.
+    """
+    if instance is None or instance.start_datetime is None:
+        return None
+
+    from padel_app.models.notification_config import (
+        DEFAULT_REMINDER_TIMING,
+        NotificationConfig,
+    )
+    from padel_app.scheduler import _compute_reminder_dt
+
+    _config = config
+    if _config is None:
+        # Deliberately a plain query, NOT ``get_or_create_config``: this helper
+        # is called from the class-instance serializer on a read path, and a GET
+        # must not write a NotificationConfig row as a side effect.
+        coach_rel = Association_CoachLessonInstance.query.filter_by(
+            lesson_instance_id=instance.id
+        ).first()
+        if coach_rel is not None:
+            _config = NotificationConfig.query.filter_by(
+                coach_id=coach_rel.coach_id
+            ).first()
+
+    timing = (
+        _config.get_reminder_timing() if _config is not None
+        else DEFAULT_REMINDER_TIMING
+    )
+    return _compute_reminder_dt(instance, timing)
+
+
+def proactive_decline_window_is_open(
+    instance: LessonInstance,
+    config=None,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    """True while a decline for ``instance`` would still count as proactive.
+
+    Single source of truth for BOTH the ``cancel_attendance`` classification and
+    the ``canDeclineProactively`` flag in the class-instance payload, so the UI
+    can never offer the proactive action at a moment the server would classify
+    differently.
+    """
+    deadline = proactive_decline_deadline(instance, config)
+    if deadline is None:
+        return False
+    return (now or utcnow_naive()) < deadline
 
 
 def cancel_attendance(
@@ -1833,9 +2078,18 @@ def cancel_attendance(
     Cancellations at or after the coach's configured cancellation deadline
     (``cancellationDeadlineHours`` before start, default 24) are still allowed
     and still free the spot, but flag the Presence with ``late_cancellation``.
+
+    PAD-73 — this is ALSO the proactive-decline path. There is deliberately no
+    second endpoint: the server classifies the decline itself from its own clock
+    (``proactive_decline_window_is_open``) and reports which kind it was in the
+    ``proactive`` key of the response. A stale client therefore cannot mislabel
+    a decline, and there is exactly one place where enrolment is authorized.
     """
     from flask import abort
     from padel_app.models import Coach, Player
+    from padel_app.models.Association_PlayerLessonInstance import (
+        Association_PlayerLessonInstance,
+    )
 
     instance = LessonInstance.query.get_or_404(lesson_instance_id)
 
@@ -1847,10 +2101,41 @@ def cancel_attendance(
     if not player:
         abort(403)
 
+    # PAD-73 / PAD-88 / PAD-115: authorize on ENROLMENT, not on the presence row.
+    # Being a player is not enough — a student may only decline their OWN place
+    # in a class they are actually in. Previously this function proceeded even
+    # when no Presence existed, which let any signed-in student drive
+    # `_ensure_vacancy_for_player` (and, inside the invitation window, a real
+    # fan-out) against an arbitrary lesson instance.
+    is_enrolled = Association_PlayerLessonInstance.query.filter_by(
+        player_id=player.id,
+        lesson_instance_id=lesson_instance_id,
+    ).first() is not None
+    if not is_enrolled:
+        abort(403, description="You are not enrolled in this class.")
+
     presence = Presence.query.filter_by(
         player_id=player.id,
         lesson_instance_id=lesson_instance_id,
     ).first()
+    if presence is None:
+        # PAD-73, mirroring the PAD-69 fix in ``respond_to_reminder``: an
+        # enrolment does not guarantee a Presence row. ``create_lesson_instance_helper``
+        # writes ``Association_PlayerLessonInstance`` from the lesson's
+        # ``player_ids`` but no Presence — only ``get_or_materialize_instance``
+        # does that, on a different path. Without this, a student enrolled in a
+        # coach-created one-off instance would have their decline accepted and
+        # their coach notified while ``status``/``justification`` were never
+        # written: the absence would not be justified and, because
+        # ``effective_filled_spots`` counts declines via ``status == "absent"``,
+        # the spot would never actually free up even though a vacancy was opened.
+        presence = Presence(
+            lesson_instance_id=lesson_instance_id,
+            player_id=player.id,
+            invited=True,
+            confirmed=False,
+        )
+        presence.create()
 
     coach_rel = Association_CoachLessonInstance.query.filter_by(
         lesson_instance_id=lesson_instance_id
@@ -1865,6 +2150,10 @@ def cancel_attendance(
         if config
         else dict(default_templates_for_locale(locale))
     )
+
+    # PAD-73: is this a PROACTIVE decline? The window closes at the instant the
+    # attendance reminder would fire, derived from the coach's reminder timing.
+    is_proactive = proactive_decline_window_is_open(instance, config, now=_now)
 
     # Flag late cancellations: at/after the deadline (start - cancellationDeadlineHours)
     # but still before start. The spot is freed either way.
@@ -1881,6 +2170,13 @@ def cancel_attendance(
         if instance.start_datetime is not None:
             deadline = instance.start_datetime - timedelta(hours=deadline_hours)
             is_late = _now >= deadline
+        # PAD-73: a proactive decline is never late. This only bites when a coach
+        # configures a first reminder that fires AFTER their own cancellation
+        # deadline (e.g. remind 12h before, deadline 24h before) — telling the
+        # coach at the earliest moment the system ever expected an answer cannot
+        # sensibly be penalised as a late cancellation.
+        if is_proactive:
+            is_late = False
         presence.late_cancellation = is_late
 
     # PAD-44: notify the COACH of the cancellation exactly once, flagging late
@@ -1895,6 +2191,7 @@ def cancel_attendance(
             instance,
             player,
             is_late=is_late,
+            is_proactive=is_proactive,
             locale=locale,
         )
 
@@ -1935,7 +2232,9 @@ def cancel_attendance(
         locale=locale,
         now=now,
     )
-    return {"action": "declined"}
+    # PAD-73: the caller is told which kind of decline this was so the UI can
+    # confirm it accurately without re-deriving the cutoff client-side.
+    return {"action": "declined", "proactive": is_proactive}
 
 
 def _trigger_vacancy_for_player(
@@ -2572,8 +2871,35 @@ def send_manual_notifications(
     locale = _resolve_locale(coach)
     templates = config.get_message_templates(locale)
 
+    # PAD-107 + PAD-112: a manually picked student is skipped when they marked
+    # themselves unavailable for this class slot (PAD-107) or switched off
+    # MANUAL invitations / blocked everything (PAD-112) — no NotificationEvent,
+    # no message, no push.
+    #
+    # Both are applied BEFORE `event.create()` below, not at delivery. Creating
+    # the NotificationEvent first and then failing to send would leave an orphan
+    # row marked "sent" with no message behind it: the coach's UI would show a
+    # pending invite that never existed.
+    #
+    # The rest of the coach's selection is still notified; the caller surfaces
+    # who was skipped.
+    from padel_app.services.student_availability_service import (
+        blocked_player_ids_for_window,
+    )
+    from padel_app.services.student_notification_preferences import (
+        player_blocks_manual_invitations,
+    )
+    blocked_ids = blocked_player_ids_for_window(
+        player_ids, instance.start_datetime, instance.end_datetime
+    )
+
     events = []
     for player_id in player_ids:
+        if int(player_id) in blocked_ids:
+            continue
+        if player_blocks_manual_invitations(player_id):
+            continue
+
         player_user_id = _user_id_for_player(player_id)
 
         event = NotificationEvent(
@@ -3044,12 +3370,26 @@ def _fan_out_standing_entry(entry: StandingWaitingListEntry) -> None:
             continue
         if instance.status in ("canceled", "completed"):
             continue
+        # PAD-109: match on the (lesson_instance_id, player_id) pair the
+        # uq_waiting_session_player constraint covers — NOT on is_active, which
+        # is not part of it. Removing a standing entry only flips its per-class
+        # rows to is_active=False, so re-adding the same player to the same
+        # upcoming class used to fall through to an INSERT and blow up with a
+        # UniqueViolation (500). Reactivate the row we already have instead.
         existing = WaitingListEntry.query.filter_by(
             lesson_instance_id=instance_id,
             player_id=entry.player_id,
-            is_active=True,
         ).first()
         if existing:
+            if existing.is_active:
+                # Already queued for this class — either by this coach's earlier
+                # standing entry or because the player joined the list themselves.
+                # Leave the existing row (and its origin) untouched.
+                continue
+            existing.is_active = True
+            existing.coach_id = entry.coach_id
+            existing.standing_entry_id = entry.id
+            existing.save()
             continue
         WaitingListEntry(
             lesson_instance_id=instance_id,

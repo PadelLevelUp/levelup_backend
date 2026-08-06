@@ -1,5 +1,6 @@
 """
 PAD-28: Student availability blockers suppress AUTOMATIC class invitations.
+PAD-107: ...and MANUAL ones too — a blocked student must never be solicited.
 
 Verifies:
   - A student with an availability blocker overlapping a class window is
@@ -7,6 +8,9 @@ Verifies:
   - A student whose blocker does NOT overlap is still eligible.
   - A blocker that is not marked blocks_auto_invitations does not suppress.
   - Recurring weekly blockers suppress the matching weekday occurrence.
+  - (PAD-107) Neither the manual-notify path nor the reminder path creates a
+    Message / NotificationEvent for a blocked student, while unblocked
+    classmates still get theirs.
 
 Run:
     pytest padel_app/tests/test_student_availability_blockers.py -v
@@ -229,3 +233,198 @@ def test_recurring_weekly_blocker_suppresses_matching_weekday(app):
 
         eligible = get_eligible(vacancy, instance, coach_id, cfg, 1)
         assert player_id not in {cp.player_id for cp in eligible}
+
+
+# ---------------------------------------------------------------------------
+# PAD-107 — manual paths must respect the blocker too
+# ---------------------------------------------------------------------------
+
+def _enrol(instance, player):
+    from padel_app.models.Association_PlayerLessonInstance import (
+        Association_PlayerLessonInstance,
+    )
+    db.session.add(Association_PlayerLessonInstance(
+        player_id=player.id, lesson_instance_id=instance.id))
+    db.session.commit()
+
+
+def _messages_for_user(user_id):
+    """Every Message in any conversation the user takes part in."""
+    from padel_app.models import Message
+    from padel_app.models.conversation_participants import ConversationParticipant
+
+    conv_ids = [
+        cp.conversation_id
+        for cp in ConversationParticipant.query.filter_by(user_id=user_id).all()
+    ]
+    if not conv_ids:
+        return []
+    return Message.query.filter(Message.conversation_id.in_(conv_ids)).all()
+
+
+def _setup_two_students(suffix):
+    """Coach + a BLOCKED student and an AVAILABLE one, both enrolled."""
+    cu = _create_user("Coach", f"coach-{suffix}")
+    coach = _create_coach(cu)
+    level = _create_level(coach)
+
+    blocked_user = _create_user("Blocked Student", f"blocked-{suffix}")
+    blocked = _create_player(blocked_user)
+    _create_coach_player(coach, blocked, level=level, side="right")
+
+    free_user = _create_user("Free Student", f"free-{suffix}")
+    free = _create_player(free_user)
+    _create_coach_player(coach, free, level=level, side="left")
+
+    start = (datetime.utcnow() + timedelta(days=3)).replace(
+        hour=10, minute=0, second=0, microsecond=0)
+    instance = _create_instance(coach, level, start)
+    _config(coach.id)
+
+    _enrol(instance, blocked)
+    _enrol(instance, free)
+
+    # The blocker covers exactly the class slot.
+    _add_blocker(blocked_user.id, instance.start_datetime, instance.end_datetime)
+
+    return coach, instance, (blocked, blocked_user), (free, free_user)
+
+
+def test_pad107_manual_notify_skips_blocked_student(app):
+    """No NotificationEvent, no Message and no push for a blocked student."""
+    with app.app_context():
+        from padel_app.models import NotificationEvent
+        from padel_app.services.notification_service import send_manual_notifications
+
+        coach, instance, (blocked, blocked_user), (free, free_user) = (
+            _setup_two_students("manual"))
+
+        events = send_manual_notifications(
+            instance.id, [blocked.id, free.id], coach.id)
+
+        assert {e.player_id for e in events} == {free.id}
+        assert NotificationEvent.query.filter_by(player_id=blocked.id).count() == 0
+        assert _messages_for_user(blocked_user.id) == []
+        # The available classmate is unaffected.
+        assert len(_messages_for_user(free_user.id)) == 1
+
+
+def test_pad107_reminders_skip_blocked_student_but_reach_the_rest(app):
+    """"Lembrar" reminds everyone except the unavailable student."""
+    with app.app_context():
+        from padel_app.services.notification_service import send_class_reminders
+
+        coach, instance, (blocked, blocked_user), (free, free_user) = (
+            _setup_two_students("remind"))
+
+        result = send_class_reminders(instance.id)
+
+        assert result["sent"] == 1
+        assert [b["playerId"] for b in result["blocked"]] == [blocked.id]
+        assert result["blocked"][0]["name"] == "Blocked Student"
+        assert _messages_for_user(blocked_user.id) == []
+        assert len(_messages_for_user(free_user.id)) == 1
+
+
+def test_pad107_send_system_message_backstop_refuses_invite(app):
+    """Even a direct call to the delivery choke point is refused."""
+    with app.app_context():
+        from padel_app.services.notification_service import _send_system_message
+
+        coach, instance, (blocked, blocked_user), (free, free_user) = (
+            _setup_two_students("backstop"))
+
+        msg = _send_system_message(
+            coach_user_id=coach.user_id,
+            player_user_id=blocked_user.id,
+            text="Want to play?",
+            message_type="notification_invite",
+            msg_metadata={"lessonInstanceId": instance.id},
+        )
+
+        assert msg is None
+        assert _messages_for_user(blocked_user.id) == []
+
+
+def test_pad107_backstop_does_not_block_plain_chat(app):
+    """Unavailability silences class solicitations, not the coach's chat."""
+    with app.app_context():
+        from padel_app.services.notification_service import _send_system_message
+
+        coach, instance, (blocked, blocked_user), (free, free_user) = (
+            _setup_two_students("chat"))
+
+        msg = _send_system_message(
+            coach_user_id=coach.user_id,
+            player_user_id=blocked_user.id,
+            text="See you next week!",
+            message_type="text",
+            msg_metadata={"lessonInstanceId": instance.id},
+        )
+
+        assert msg is not None
+        assert len(_messages_for_user(blocked_user.id)) == 1
+
+
+def test_pad107_blocked_players_for_instance_reports_names_only(app):
+    """The coach-facing payload leaks no blocker detail."""
+    with app.app_context():
+        from padel_app.services.student_availability_service import (
+            blocked_players_for_instance,
+        )
+
+        coach, instance, (blocked, blocked_user), (free, free_user) = (
+            _setup_two_students("payload"))
+
+        blocked_list = blocked_players_for_instance(instance)
+
+        # ``cause`` was added during the PAD-107/PAD-112 batch merge: both
+        # tickets now feed one shared ``blocked`` array on the notify routes and
+        # the coach is shown different wording for each, so an entry has to say
+        # which kind of block it is. It is a category, not blocker detail.
+        assert blocked_list == [
+            {"playerId": blocked.id, "name": "Blocked Student", "cause": "unavailable"}
+        ]
+        # The point of this test: still no title, description or hours.
+        assert set(blocked_list[0]) == {"playerId", "name", "cause"}
+
+
+def test_pad107_availability_conflicts_only_sees_own_roster(app, client):
+    """A coach cannot probe another coach's student's private calendar."""
+    from flask_jwt_extended import create_access_token
+
+    with app.app_context():
+        app.config["JWT_SECRET_KEY"] = "test-jwt-secret"
+
+        owner, instance, (blocked, blocked_user), _free = _setup_two_students("authz")
+
+        # A second, unrelated coach with no link to `blocked`.
+        stranger_user = _create_user("Stranger Coach", "stranger-authz")
+        stranger = _create_coach(stranger_user)
+        db.session.commit()
+
+        date_str = instance.start_datetime.strftime("%Y-%m-%d")
+        payload = {
+            "date": date_str,
+            "startTime": instance.start_datetime.strftime("%H:%M"),
+            "endTime": instance.end_datetime.strftime("%H:%M"),
+            "playerIds": [blocked.id],
+        }
+
+        def _post(user_id):
+            token = create_access_token(identity=str(user_id))
+            return client.post(
+                "/api/app/notify/availability_conflicts",
+                json=payload,
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        # The owning coach legitimately sees the conflict...
+        own = _post(owner.user_id)
+        assert own.status_code == 200
+        assert [b["playerId"] for b in own.get_json()["blocked"]] == [blocked.id]
+
+        # ...the stranger learns nothing, not even that the player exists.
+        other = _post(stranger.user_id)
+        assert other.status_code == 200
+        assert other.get_json()["blocked"] == []
