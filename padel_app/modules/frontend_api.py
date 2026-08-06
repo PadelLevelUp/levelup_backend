@@ -303,6 +303,72 @@ def require_own_roster_relation(coach, player_id):
     return rel
 
 
+def require_accessible_exercises(coach, exercise_ids):
+    """Assert every id in ``exercise_ids`` is in the caller's exercise library.
+
+    "Accessible" is the same set `get_exercises_for_coach` returns — an
+    `Association_CoachExercise` row for this coach in *either* role. `follower`
+    is read access (training.exercises rule 7), and planning a shared drill into
+    your own lesson is a read of that drill, so followers are allowed. Requiring
+    `owner` here would break sharing, which is the whole point of the role.
+
+    All-or-nothing: one unreachable id rejects the request, so a caller can
+    never write a partial plan out of a mixed batch.
+    """
+    ids = set()
+    for raw in exercise_ids or []:
+        try:
+            ids.add(int(raw))
+        except (TypeError, ValueError):
+            abort(400, "exerciseIds must be integers")
+
+    if not ids:
+        # Clearing a plan is a legitimate save, not an authorization failure.
+        return []
+
+    reachable = {
+        rel.exercise_id
+        for rel in Association_CoachExercise.query.filter(
+            Association_CoachExercise.coach_id == coach.id,
+            Association_CoachExercise.exercise_id.in_(ids),
+        ).all()
+    }
+    # Fall back to direct ownership as well. `create_exercise_service` always
+    # writes the owner association, so via the app the two agree — but an
+    # exercise created through the generic admin CRUD has `owner_coach_id` and
+    # no association row, and 403-ing a coach on their own drill would be a
+    # regression this ticket has no business causing. Still closes the IDOR:
+    # a foreign coach matches neither condition.
+    if ids - reachable:
+        reachable |= {
+            ex.id
+            for ex in Exercise.query.filter(
+                Exercise.owner_coach_id == coach.id,
+                Exercise.id.in_(ids - reachable),
+            ).all()
+        }
+    # An id that does not exist at all lands here too — same 403, so the
+    # response never reveals which foreign ids are real.
+    if ids - reachable:
+        abort(403, "Not authorized to plan one or more of these exercises")
+    return sorted(ids)
+
+
+def require_owned_training_target(coach, class_instance_data):
+    """Resolve the class a training plan targets and assert the caller owns it.
+
+    Mirrors the body shape `confirm_training_service` branches on: a
+    materialized occurrence carries `parentClassId` and `originalId` is a
+    LessonInstance; otherwise `originalId` is a Lesson that the service would
+    materialize on demand for `date`.
+    """
+    data = class_instance_data or {}
+    model_name = "LessonInstance" if "parentClassId" in data else "Lesson"
+    return require_owned_class(
+        coach, model_name, _required_int_id(data, "originalId")
+    )
+
+
 # -------------------------------------------------------------------
 # SSE
 # -------------------------------------------------------------------
@@ -1781,8 +1847,23 @@ def delete_exercise_group(group_id):
 @bp.post("/class_instance/training/confirm")
 @jwt_required()
 def confirm_training():
-    data = request.get_json()
-    training = confirm_training_service(data['classInstance'], data['exerciseIds'])
+    # PAD-115: this route used to pass the body straight to the service without
+    # ever resolving the caller, so any authenticated user could write a
+    # training plan onto any coach's class by enumerating ids. All three checks
+    # must run BEFORE the service: the Lesson-shaped body materializes an
+    # instance on demand (RULES.md #1), and the service deletes the existing
+    # plan before inserting — so a late guard would still leave a materialized
+    # row behind and could wipe the owner's plan.
+    data = request.get_json() or {}
+    coach = require_coach()
+    class_instance = data.get('classInstance') or {}
+    require_owned_training_target(coach, class_instance)
+    # Pass the validated ids on rather than the raw body: they come back as
+    # deduped ints, and a repeated id used to reach the composite PK as a
+    # duplicate insert (a 500) instead of being collapsed.
+    exercise_ids = require_accessible_exercises(coach, data.get('exerciseIds'))
+
+    training = confirm_training_service(class_instance, exercise_ids)
     return jsonify({
         "plannedExerciseIds": [str(t.exercise_id) for t in training],
     })
