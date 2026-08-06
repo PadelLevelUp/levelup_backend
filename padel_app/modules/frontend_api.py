@@ -220,7 +220,23 @@ def current_club():
 
 
 def require_coach():
-    """Return the calling ``Coach``, or 403 when the caller has no coach profile."""
+    """Return the calling ``Coach``, or 403 when the caller has no coach profile.
+
+    Use this on every coach-only route. ``current_coach()`` returns ``None`` for
+    a user with only a player profile, and dereferencing that (``coach.id``, or
+    ``current_club()``) raises an unhandled AttributeError — the caller then gets
+    a 500 where the API means "not allowed" (PAD-103, PAD-116).
+
+    DO NOT convert these routes: they branch on ``current_coach() is None`` on
+    purpose, to serve students their own data. Hardening them would lock a
+    student out of their own calendar::
+
+        /calendar   /dashboard   /class_instance   /calendar_event
+        /lesson_instance/<id>/presences            /availability_blockers
+
+    ``test_training_players_role_authz.py`` asserts both halves of this comment,
+    so the list is executable rather than advisory.
+    """
     coach = current_coach()
     if coach is None:
         abort(403, "User is not a coach")
@@ -301,6 +317,72 @@ def require_own_roster_relation(coach, player_id):
     if rel is None:
         abort(403, "Not authorized to modify this player")
     return rel
+
+
+def require_accessible_exercises(coach, exercise_ids):
+    """Assert every id in ``exercise_ids`` is in the caller's exercise library.
+
+    "Accessible" is the same set `get_exercises_for_coach` returns — an
+    `Association_CoachExercise` row for this coach in *either* role. `follower`
+    is read access (training.exercises rule 7), and planning a shared drill into
+    your own lesson is a read of that drill, so followers are allowed. Requiring
+    `owner` here would break sharing, which is the whole point of the role.
+
+    All-or-nothing: one unreachable id rejects the request, so a caller can
+    never write a partial plan out of a mixed batch.
+    """
+    ids = set()
+    for raw in exercise_ids or []:
+        try:
+            ids.add(int(raw))
+        except (TypeError, ValueError):
+            abort(400, "exerciseIds must be integers")
+
+    if not ids:
+        # Clearing a plan is a legitimate save, not an authorization failure.
+        return []
+
+    reachable = {
+        rel.exercise_id
+        for rel in Association_CoachExercise.query.filter(
+            Association_CoachExercise.coach_id == coach.id,
+            Association_CoachExercise.exercise_id.in_(ids),
+        ).all()
+    }
+    # Fall back to direct ownership as well. `create_exercise_service` always
+    # writes the owner association, so via the app the two agree — but an
+    # exercise created through the generic admin CRUD has `owner_coach_id` and
+    # no association row, and 403-ing a coach on their own drill would be a
+    # regression this ticket has no business causing. Still closes the IDOR:
+    # a foreign coach matches neither condition.
+    if ids - reachable:
+        reachable |= {
+            ex.id
+            for ex in Exercise.query.filter(
+                Exercise.owner_coach_id == coach.id,
+                Exercise.id.in_(ids - reachable),
+            ).all()
+        }
+    # An id that does not exist at all lands here too — same 403, so the
+    # response never reveals which foreign ids are real.
+    if ids - reachable:
+        abort(403, "Not authorized to plan one or more of these exercises")
+    return sorted(ids)
+
+
+def require_owned_training_target(coach, class_instance_data):
+    """Resolve the class a training plan targets and assert the caller owns it.
+
+    Mirrors the body shape `confirm_training_service` branches on: a
+    materialized occurrence carries `parentClassId` and `originalId` is a
+    LessonInstance; otherwise `originalId` is a Lesson that the service would
+    materialize on demand for `date`.
+    """
+    data = class_instance_data or {}
+    model_name = "LessonInstance" if "parentClassId" in data else "Lesson"
+    return require_owned_class(
+        coach, model_name, _required_int_id(data, "originalId")
+    )
 
 
 # -------------------------------------------------------------------
@@ -480,7 +562,7 @@ def coach_detail():
 @bp.get("/players")
 @jwt_required()
 def get_players():
-    coach = current_coach()
+    coach = require_coach()
     club = current_club()
     player_list = get_players_list(coach, club)
 
@@ -547,7 +629,7 @@ def report_message(message_id):
 @bp.get("/coach_players")
 @jwt_required()
 def coach_players():
-    coach = current_coach()
+    coach = require_coach()
     coach = Coach.query.get_or_404(coach.id)
     return jsonify(get_coach_players_list(coach))
 
@@ -555,7 +637,7 @@ def coach_players():
 @bp.get("/coach_players_paginated")
 @jwt_required()
 def coach_players_paginated():
-    coach = current_coach()
+    coach = require_coach()
     coach = Coach.query.get_or_404(coach.id)
 
     page = request.args.get("page", default=1, type=int)
@@ -743,7 +825,7 @@ def class_instance():
 @bp.get("/player_profile/<int:player_id>")
 @jwt_required()
 def player_profile(player_id):
-    coach = current_coach()
+    coach = require_coach()
     return jsonify(get_player_profile(coach, player_id))
 
 
@@ -1700,21 +1782,21 @@ from padel_app.services.training_service import (
 @bp.get("/exercises")
 @jwt_required()
 def exercises():
-    coach = current_coach()
+    coach = require_coach()
     return jsonify([serialize_exercise(ex) for ex in get_exercises_for_coach(coach)])
 
 
 @bp.get("/exercises/<int:exercise_id>")
 @jwt_required()
 def exercise_detail(exercise_id):
-    coach = current_coach()
+    coach = require_coach()
     return jsonify(serialize_exercise(get_exercise_for_coach(coach, exercise_id)))
 
 
 @bp.post("/exercises")
 @jwt_required()
 def create_exercise():
-    coach = current_coach()
+    coach = require_coach()
     data = request.get_json() or {}
     exercise = create_exercise_service(coach, data)
     return jsonify(serialize_exercise(exercise)), 201
@@ -1723,7 +1805,7 @@ def create_exercise():
 @bp.put("/exercises/<int:exercise_id>")
 @jwt_required()
 def update_exercise(exercise_id):
-    coach = current_coach()
+    coach = require_coach()
     data = request.get_json() or {}
     exercise = update_exercise_service(exercise_id, coach, data)
     return jsonify(serialize_exercise(exercise))
@@ -1732,7 +1814,7 @@ def update_exercise(exercise_id):
 @bp.delete("/exercises/<int:exercise_id>")
 @jwt_required()
 def delete_exercise(exercise_id):
-    coach = current_coach()
+    coach = require_coach()
     delete_exercise_service(exercise_id, coach)
     return "", 204
 
@@ -1744,14 +1826,14 @@ def delete_exercise(exercise_id):
 @bp.get("/exercise-groups")
 @jwt_required()
 def exercise_groups():
-    coach = current_coach()
+    coach = require_coach()
     return jsonify([serialize_exercise_group(g) for g in get_exercise_groups_for_coach(coach)])
 
 
 @bp.post("/exercise-groups")
 @jwt_required()
 def create_exercise_group():
-    coach = current_coach()
+    coach = require_coach()
     data = request.get_json() or {}
     group = create_exercise_group_service(coach, data)
     return jsonify(serialize_exercise_group(group)), 201
@@ -1760,7 +1842,7 @@ def create_exercise_group():
 @bp.put("/exercise-groups/<int:group_id>")
 @jwt_required()
 def update_exercise_group(group_id):
-    coach = current_coach()
+    coach = require_coach()
     data = request.get_json() or {}
     group = update_exercise_group_service(group_id, coach, data)
     return jsonify(serialize_exercise_group(group))
@@ -1769,7 +1851,7 @@ def update_exercise_group(group_id):
 @bp.delete("/exercise-groups/<int:group_id>")
 @jwt_required()
 def delete_exercise_group(group_id):
-    coach = current_coach()
+    coach = require_coach()
     delete_exercise_group_service(group_id, coach)
     return "", 204
 
@@ -1781,8 +1863,23 @@ def delete_exercise_group(group_id):
 @bp.post("/class_instance/training/confirm")
 @jwt_required()
 def confirm_training():
-    data = request.get_json()
-    training = confirm_training_service(data['classInstance'], data['exerciseIds'])
+    # PAD-115: this route used to pass the body straight to the service without
+    # ever resolving the caller, so any authenticated user could write a
+    # training plan onto any coach's class by enumerating ids. All three checks
+    # must run BEFORE the service: the Lesson-shaped body materializes an
+    # instance on demand (RULES.md #1), and the service deletes the existing
+    # plan before inserting — so a late guard would still leave a materialized
+    # row behind and could wipe the owner's plan.
+    data = request.get_json() or {}
+    coach = require_coach()
+    class_instance = data.get('classInstance') or {}
+    require_owned_training_target(coach, class_instance)
+    # Pass the validated ids on rather than the raw body: they come back as
+    # deduped ints, and a repeated id used to reach the composite PK as a
+    # duplicate insert (a 500) instead of being collapsed.
+    exercise_ids = require_accessible_exercises(coach, data.get('exerciseIds'))
+
+    training = confirm_training_service(class_instance, exercise_ids)
     return jsonify({
         "plannedExerciseIds": [str(t.exercise_id) for t in training],
     })

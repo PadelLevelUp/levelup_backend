@@ -1,6 +1,8 @@
 from datetime import datetime, timedelta, time
 import json
 
+from flask import current_app
+
 from padel_app.sql_db import db
 from padel_app.models import (
     Lesson,
@@ -82,6 +84,21 @@ def transform_to_datetime(obj, data):
 # Lesson instance helpers
 # ---------------------------------------------------------------------------
 
+def _log_exception(msg, *args):
+    """Log at ERROR with a traceback, tolerating a missing app context.
+
+    Materialization also runs from scheduler jobs, so this must never be the
+    thing that raises inside an exception handler.
+    """
+    from flask import current_app, has_app_context
+
+    if has_app_context():
+        current_app.logger.exception(msg, *args)
+    else:
+        import logging
+        logging.getLogger(__name__).exception(msg, *args)
+
+
 def get_or_materialize_instance(lesson: Lesson, date):
     # An occurrence's identity is (lesson_id, occurrence date), NOT the parent
     # lesson's time-of-day. A "this occurrence only" edit can move an instance's
@@ -137,18 +154,51 @@ def get_or_materialize_instance(lesson: Lesson, date):
     from padel_app.scheduler import _maybe_schedule_instance
     _maybe_schedule_instance(instance)
 
-    # Fan out standing waiting list entries to this new instance
-    # Use a SAVEPOINT so any DB failure (e.g. migration not yet run) doesn't
-    # poison the outer transaction and break unrelated operations like presence confirmation.
+    # Fan out standing waiting list entries to this new instance.
+    #
+    # Best-effort step (spec classes.instances rule 5): `instance` is already
+    # committed above, so a failure here must never fail the caller's request.
+    # A SAVEPOINT keeps a DB failure (e.g. migration not yet run) from poisoning
+    # the outer transaction and breaking unrelated operations like presence
+    # confirmation.
+    #
+    # PAD-117: `begin_nested()` is opened OUTSIDE the try on purpose. Inside it,
+    # a failure to open the savepoint left `sp` unassigned and the handler's
+    # `sp.rollback()` raised `UnboundLocalError`, masking the real cause.
+    sp = db.session.begin_nested()
     try:
-        sp = db.session.begin_nested()
         from padel_app.services.notification_service import _sync_standing_entries_for_new_instance
         if lesson.coaches_relations:
             coach_id = lesson.coaches_relations[0].coach_id
             _sync_standing_entries_for_new_instance(instance, coach_id)
         sp.commit()
     except Exception:
-        sp.rollback()
+        # Containment is not silent: reaching here means a callee misbehaved, and
+        # PAD-108 showed how hard that is to diagnose after the fact.
+        _log_exception(
+            "get_or_materialize_instance: standing waiting list sync failed for "
+            "instance %s — contained, instance stands",
+            instance.id,
+        )
+        try:
+            sp.rollback()
+        except Exception:
+            # PAD-117: the guarded block committed before failing, which ended
+            # this savepoint (and the outer transaction) out from under us. The
+            # handle is dead, so rolling it back raises the SAME error — which
+            # used to escape as an HTTP 500, the very failure this guard exists
+            # to prevent. Recover at the session level instead, so the rest of
+            # the request runs on a usable session. `instance` was committed
+            # before the guarded block ran, so it survives (rule 7); any waiting
+            # list rows staged inside the savepoint are reconciled by the next
+            # materialization call, which is idempotent (rule 3).
+            _log_exception(
+                "get_or_materialize_instance: savepoint rollback failed for "
+                "instance %s — transaction was closed by the guarded block; "
+                "recovering the session",
+                instance.id,
+            )
+            db.session.rollback()
 
     return instance
 
@@ -742,6 +792,21 @@ def edit_class_service(data):
         if scope == "future":
             parent_lesson = instance.lesson
             _ensure_date(payload, event_date)
+            # Cancel the parent's occurrence jobs from the split boundary before
+            # the split: _apply_future_edit_to_lesson truncates the parent's
+            # recurrence to `boundary - 1 day`, so any job at/after the boundary
+            # would fire for an occurrence the parent no longer produces.
+            # The boundary is `new_date or event_date` — mirroring the `from_date`
+            # that _apply_future_edit_to_lesson computes. Using event_date here
+            # would wrongly cancel jobs in [event_date, new_date) whenever the
+            # edit moves the date, and those occurrences DO survive on the parent.
+            from padel_app.scheduler import (
+                cancel_lesson_reminder_jobs,
+                schedule_lesson_reminder_jobs,
+            )
+            cancel_lesson_reminder_jobs(
+                parent_lesson.id, from_date=new_date or event_date
+            )
             lesson_to_edit, from_date = _apply_future_edit_to_lesson(
                 lesson=parent_lesson,
                 event_date=event_date,
@@ -756,6 +821,25 @@ def edit_class_service(data):
             if notifications_enabled is not None:
                 lesson_to_edit.notifications_enabled = notifications_enabled
                 lesson_to_edit.save()
+            # A "this and future" edit off a materialized occurrence splits the
+            # series into a *new* Lesson (duplicate_lesson_helper). Without this
+            # the new lesson carries no reminder jobs at all, so its classes
+            # silently send no reminders until the weekly extend_schedule_window
+            # pass happens to pick it up — up to 7 days later, and never
+            # retroactively for the occurrences missed in between.
+            # Best-effort (PAD-10): the edit is already committed, so a scheduler
+            # failure must not turn a successful edit into a false error response.
+            try:
+                if lesson_to_edit.coaches_relations:
+                    schedule_lesson_reminder_jobs(
+                        lesson_to_edit.id,
+                        lesson_to_edit.coaches_relations[0].coach_id,
+                    )
+            except Exception:
+                current_app.logger.exception(
+                    "edit_class_service: failed to schedule reminder jobs for lesson %s",
+                    lesson_to_edit.id,
+                )
             return {"id": lesson_to_edit.id}, 201
 
         return {"error": "Invalid scope"}, 400
@@ -776,9 +860,11 @@ def edit_class_service(data):
 
     if scope == "future":
         _ensure_date(payload, event_date)
-        # Cancel old lesson occurrence jobs from event_date before the split
+        # Cancel old lesson occurrence jobs from the split boundary. The boundary
+        # is `new_date or event_date` — the same `from_date` that
+        # _apply_future_edit_to_lesson truncates the parent's recurrence at.
         from padel_app.scheduler import cancel_lesson_reminder_jobs, schedule_lesson_reminder_jobs
-        cancel_lesson_reminder_jobs(lesson.id, from_date=event_date)
+        cancel_lesson_reminder_jobs(lesson.id, from_date=new_date or event_date)
         lesson_to_edit, _ = _apply_future_edit_to_lesson(
             lesson=lesson,
             event_date=event_date,
