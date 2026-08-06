@@ -305,6 +305,26 @@ def test_moved_date_edit_via_lesson_model_keeps_jobs_before_the_boundary(
     )
 
 
+def test_extend_schedule_window_re_derives_missing_reminder_jobs(
+    app, memory_scheduler, recurring_series
+):
+    """The safety net: whatever the cause, a lesson left with no reminder jobs
+    gets them back on the next sweep. This is what bounds the blast radius of
+    any future scheduling gap — the sweep runs daily (see init_scheduler)."""
+    _coach_id, lesson_id, _first_start = recurring_series
+    from padel_app.scheduler import _run_extend_schedule_window
+
+    assert not _reminder_job_ids(memory_scheduler, lesson_id), (
+        "precondition: the lesson starts with no reminder jobs"
+    )
+
+    _run_extend_schedule_window()
+
+    assert _reminder_job_ids(memory_scheduler, lesson_id), (
+        "extend_schedule_window did not re-derive jobs for a lesson that had none"
+    )
+
+
 def test_future_edit_survives_a_scheduler_failure(
     app, memory_scheduler, recurring_series
 ):

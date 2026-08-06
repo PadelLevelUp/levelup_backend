@@ -14,7 +14,8 @@ Jobs
 - ``reminder_{instance_id}``                   — DateTrigger — fires send_class_reminders() (legacy, for already-materialized instances)
 - ``invite_start_{instance_id}``               — DateTrigger — fires trigger_invitations()
 - ``process_batches``                          — IntervalTrigger (2 min) — fires process_invitation_batches()
-- ``extend_schedule_window``                   — IntervalTrigger (7 days) — extends 60-day reminder horizon
+- ``extend_schedule_window``                   — IntervalTrigger (1 day) — extends 60-day reminder horizon
+                                                 and re-derives any missing lesson reminder jobs
 
 Public API (no ``app`` argument needed)
 ---------------------------------------
@@ -279,8 +280,17 @@ def _run_process_batches() -> None:
 def _run_extend_schedule_window() -> None:
     """Extend the rolling 60-day reminder horizon for all coaches.
 
-    Runs weekly so that lesson occurrences entering the 60-day window
-    are always covered, even for long-running recurring series.
+    Runs daily so that lesson occurrences entering the 60-day window are always
+    covered, even for long-running recurring series.
+
+    This doubles as the safety net for scheduling gaps: it re-derives jobs for
+    every active lesson of every coach, so a lesson that somehow ends up with no
+    reminder jobs (PAD-121: a "this and all future" edit split a series into a
+    new Lesson without scheduling it) recovers on the next pass. It ran weekly
+    until PAD-121, which meant such a gap could silence a class for up to 7 days
+    before self-healing. Re-scheduling is idempotent — job ids are deterministic
+    and added with ``replace_existing=True``, and reminders already in the past
+    are skipped rather than re-fired.
     """
     app = _app
     if app is None:
@@ -376,7 +386,7 @@ def init_scheduler(app, test_config=None) -> None:
 
     sched.add_job(
         func=_run_extend_schedule_window,
-        trigger=IntervalTrigger(days=7),
+        trigger=IntervalTrigger(days=1),
         id="extend_schedule_window",
         replace_existing=True,
         coalesce=True,
