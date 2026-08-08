@@ -33,7 +33,7 @@ def build_dashboard_payload(*, user, coach: Optional[object], player: Optional[o
     ]
 
     if coach is not None:
-        role_blocks = build_coach_dashboard_blocks(coach=coach)
+        role_blocks = build_coach_dashboard_blocks(coach=coach, user_id=user.id)
         dashboard_id = "coach_default_v1"
         title = "Dashboard"
     else:
