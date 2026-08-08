@@ -52,7 +52,10 @@ HERO_SOON_MINUTES = 120
 SCHEDULE_DAYS = 7
 SCHEDULE_ROWS = 5
 QUEUE_REPLY_LIMIT = 3
-HERO_AVATAR_LIMIT = 3
+# Two, not three: at 28px with the overlap the design uses, a third circle
+# covers the second one's initials. Two avatars plus a "+n" chip reads cleanly
+# and still says how many are signed up.
+HERO_AVATAR_LIMIT = 2
 ACTIVE_PLAYER_DAYS = 30
 VALIDATION_WINDOW_DAYS = 7
 
