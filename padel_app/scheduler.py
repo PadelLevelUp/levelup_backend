@@ -39,9 +39,16 @@ import atexit
 import os
 import sys
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from padel_app.utils.dates import utcnow_naive
+
+# PAD-134: wall-clock times a coach types into Settings ("send at 18:00") are
+# CLUB-LOCAL, not UTC. Same constant and rationale as
+# student_availability_service.CLUB_TZ, which already evaluates recurring
+# "every Monday 18:00" occurrences against the Lisbon wall clock.
+CLUB_TZ = ZoneInfo("Europe/Lisbon")
 
 # ---------------------------------------------------------------------------
 # Module-level singletons
@@ -86,7 +93,12 @@ def _compute_timing_dt(instance_start: datetime, timing_config: dict) -> datetim
       {"type": "days_before",        "days": N, "time": "HH:MM"}
       {"type": "days_before_at_time","days": N, "time": "HH:MM"}
 
-    ``instance_start`` must be a naive UTC datetime.
+    ``instance_start`` must be a naive UTC datetime, and the return value is
+    naive UTC too (the scheduler arms every job with ``timezone="UTC"``).
+
+    The ``"time"`` field is a CLUB_TZ wall clock, so the day/time variants
+    convert local → UTC; ``hours_before`` is pure delta arithmetic and needs
+    no conversion.
     """
     if not timing_config:
         return None
@@ -104,8 +116,22 @@ def _compute_timing_dt(instance_start: datetime, timing_config: dict) -> datetim
             hour, minute = (int(p) for p in time_str.split(":"))
         except (ValueError, AttributeError):
             hour, minute = 9, 0
-        target_date = instance_start.date() - timedelta(days=days)
-        return datetime(target_date.year, target_date.month, target_date.day, hour, minute)
+
+        # PAD-134: `hour`/`minute` are the coach's CLUB_TZ wall clock. Stamping
+        # them straight into a naive-UTC datetime made every reminder fire an
+        # hour late through Portuguese summer time (WEST = UTC+1) and on time
+        # in winter (WET = UTC+0) — the reported "sempre 1h depois".
+        #
+        # The day count is taken from the LOCAL calendar day too: a 00:30
+        # Lisbon class is 23:30 UTC the previous day, so a UTC-derived date
+        # would land the reminder a day early.
+        local_start = instance_start.replace(tzinfo=timezone.utc).astimezone(CLUB_TZ)
+        target_date = local_start.date() - timedelta(days=days)
+        local_target = datetime(
+            target_date.year, target_date.month, target_date.day,
+            hour, minute, tzinfo=CLUB_TZ,
+        )
+        return local_target.astimezone(timezone.utc).replace(tzinfo=None)
 
     return None
 
