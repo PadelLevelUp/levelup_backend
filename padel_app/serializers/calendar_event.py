@@ -80,6 +80,10 @@ def serialize_calendar_event(obj, *, override_id: str | None = None, override_da
                 # same value the class-detail "capacity" field shows. Declined
                 # students free their spot and must not be counted here.
                 "participantCount": obj.effective_filled_spots,
+                # Of those filled spots, how many actively confirmed. Lets the
+                # calendar block show confirmed / awaiting / free in one bar
+                # without a per-class request.
+                "confirmedCount": obj.confirmed_spots,
                 "maxPlayers": obj.max_players,
                 "color": lesson.color,
                 "levelId": obj.level_id or lesson.default_level_id,
@@ -100,6 +104,8 @@ def serialize_calendar_event(obj, *, override_id: str | None = None, override_da
                 # class that was never materialized), so enrolment IS the
                 # effective filled count here. See LessonInstance.effective_filled_spots.
                 "participantCount": len(obj.players_relations),
+                # Nobody can have confirmed a class that does not exist yet.
+                "confirmedCount": 0,
                 "color": obj.color,
                 "levelId": obj.default_level_id,
                 "isRecurring": True if obj.recurrence_rule else False
