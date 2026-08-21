@@ -70,16 +70,72 @@ class TestComputeTimingDt:
         assert result == datetime(2025, 6, 10, 7, 0)
 
     def test_days_before_at_time(self):
+        # PAD-134: "09:00" is the coach's CLUB_TZ wall clock. June is WEST
+        # (UTC+1), so the UTC fire time is 08:00.
         start = datetime(2025, 6, 10, 14, 0)   # Tuesday
         cfg = {"type": "days_before", "days": 1, "time": "09:00"}
         result = _compute_timing_dt(start, cfg)
-        assert result == datetime(2025, 6, 9, 9, 0)
+        assert result == datetime(2025, 6, 9, 8, 0)
 
     def test_days_before_crosses_month_boundary(self):
         start = datetime(2025, 7, 1, 10, 0)
         cfg = {"type": "days_before", "days": 2, "time": "08:30"}
         result = _compute_timing_dt(start, cfg)
-        assert result == datetime(2025, 6, 29, 8, 30)
+        assert result == datetime(2025, 6, 29, 7, 30)  # 08:30 WEST → 07:30 UTC
+
+    # -- PAD-134: wall-clock times are CLUB_TZ, not UTC ---------------------
+    #
+    # The reported bug: a coach configures "1 day before at 18:00" and the
+    # reminder goes out at 19:00. The configured time was being stamped
+    # straight into a naive-UTC datetime, so in Portuguese summer time
+    # (WEST = UTC+1) every reminder fired one hour late.
+    #
+    # The discriminating evidence that this is a timezone conversion bug and
+    # not a constant offset: the SAME config must produce a DIFFERENT UTC
+    # instant in summer than in winter.
+
+    def test_reported_case_summer_18h_fires_at_18h_local(self):
+        """August class, "1 day before at 18:00" → 17:00 UTC == 18:00 WEST."""
+        start = datetime(2025, 8, 14, 19, 0)  # 20:00 Lisbon
+        cfg = {"type": "days_before_at_time", "days": 1, "time": "18:00"}
+        assert _compute_timing_dt(start, cfg) == datetime(2025, 8, 13, 17, 0)
+
+    def test_same_config_in_winter_has_no_offset(self):
+        """January class, same config → 18:00 UTC, because WET == UTC+0."""
+        start = datetime(2025, 1, 14, 19, 0)
+        cfg = {"type": "days_before_at_time", "days": 1, "time": "18:00"}
+        assert _compute_timing_dt(start, cfg) == datetime(2025, 1, 13, 18, 0)
+
+    def test_target_date_uses_local_day_not_utc_day(self):
+        """A 00:30 Lisbon class is 23:30 UTC the PREVIOUS day.
+
+        The "days before" count must be taken from the local calendar day the
+        coach sees, otherwise a just-past-midnight class computes its reminder
+        a day early. Uses an August date because the local day only diverges
+        from the UTC day under WEST (in winter Lisbon *is* UTC).
+        """
+        start = datetime(2025, 8, 14, 23, 30)  # 00:30 Lisbon on the 15th
+        cfg = {"type": "days_before_at_time", "days": 1, "time": "18:00"}
+        # Local day is the 15th → 1 day before is the 14th at 18:00 WEST.
+        assert _compute_timing_dt(start, cfg) == datetime(2025, 8, 14, 17, 0)
+
+    def test_dst_spring_forward_boundary(self):
+        """2025-03-30 is the WET→WEST transition; 02:00 local does not exist.
+
+        Only assert we return a real UTC instant rather than raising — the
+        exact folded value is not something a coach can meaningfully observe.
+        """
+        start = datetime(2025, 3, 31, 10, 0)
+        cfg = {"type": "days_before_at_time", "days": 1, "time": "02:30"}
+        result = _compute_timing_dt(start, cfg)
+        assert isinstance(result, datetime)
+        assert result.tzinfo is None  # still naive UTC for the scheduler
+
+    def test_hours_before_is_unaffected_by_timezone(self):
+        """`hours_before` is pure delta arithmetic — no wall clock involved."""
+        start = datetime(2025, 8, 10, 14, 0)
+        cfg = {"type": "hours_before", "value": 24}
+        assert _compute_timing_dt(start, cfg) == datetime(2025, 8, 9, 14, 0)
 
     def test_missing_config_returns_none(self):
         assert _compute_timing_dt(datetime(2025, 6, 10, 14, 0), {}) is None

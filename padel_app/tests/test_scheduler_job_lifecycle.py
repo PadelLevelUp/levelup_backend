@@ -321,10 +321,12 @@ class TestComputeTimingDt:
         assert result == datetime(2026, 5, 30, 10, 0)
 
     def test_days_before_at_time(self):
+        # PAD-134: "09:00" is a CLUB_TZ wall clock; June is WEST (UTC+1), so
+        # the naive-UTC fire time the scheduler arms is 08:00.
         from padel_app.scheduler import _compute_timing_dt
         start = datetime(2026, 6, 5, 15, 0)
         result = _compute_timing_dt(start, {"type": "days_before", "days": 2, "time": "09:00"})
-        assert result == datetime(2026, 6, 3, 9, 0)
+        assert result == datetime(2026, 6, 3, 8, 0)
 
     def test_empty_config_returns_none(self):
         from padel_app.scheduler import _compute_timing_dt
