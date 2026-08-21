@@ -40,8 +40,13 @@ class Conversation(db.Model, model.Model):
         return f"Conversation {self.id}"
     
     def last_read_by(self, user_id):
+        # PAD-125: match on `user_id`, not `p.id`. `p` is a
+        # ConversationParticipant, so `p.id` is the join row's primary key —
+        # a different sequence from `users.id`. Comparing it against a user id
+        # matched no row (every message then serialized as unread) or, worse,
+        # matched another participant's row and leaked their read state.
         participant = next(
-            (p for p in self.participants if p.id == user_id),
+            (p for p in self.participants if p.user_id == user_id),
             None
         )
         return participant.last_read_at if participant else None
