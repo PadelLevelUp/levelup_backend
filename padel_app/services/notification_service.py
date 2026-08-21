@@ -117,6 +117,10 @@ def get_config_dict(coach_id: int) -> dict:
         "invitationStartTiming": config.get_invitation_start_timing(),
         "invitationGroups": config.get_invitation_groups(),
         "tiebreakers": config.get_tiebreakers(),
+        # PAD-128 — null when unset, and deliberately NOT defaulted to a rule
+        # set. The client must be able to tell "no bar" from "a bar that
+        # happens to be empty"; see NotificationConfig.eligibility_rules.
+        "eligibilityRules": config.get_eligibility_rules(),
     }
 
 
@@ -153,6 +157,15 @@ def update_config(coach_id: int, data: dict) -> NotificationConfig:
         config.invitation_groups = data["invitationGroups"]
     if "tiebreakers" in data:
         config.tiebreakers = data["tiebreakers"]
+    if "eligibilityRules" in data:
+        # PAD-128: `null` clears the bar back to unset, a list sets it. Both
+        # must round-trip — see NotificationConfig.eligibility_rules for why
+        # this column must never acquire a non-empty default.
+        rules = data["eligibilityRules"]
+        if rules is not None and not isinstance(rules, list):
+            from flask import abort
+            abort(400, "eligibilityRules must be a list or null")
+        config.eligibility_rules = rules
 
     config.save()
 
@@ -229,6 +242,49 @@ def _vacancy_level(vacancy, instance=None):
             level = CoachLevel.query.get(level_id)
         return level_id, level
     return effective_level_id(instance), effective_level(instance)
+
+
+def effective_eligibility(class_obj, coach_id: int, config: NotificationConfig | None = None):
+    """The eligibility bar in force for ``class_obj`` — PAD-128.
+
+    THE single resolver every consumer calls (eligibility.cascade rule 3),
+    deliberately shaped like :func:`effective_level_id`. Re-implementing the
+    fallback at a call site is how PAD-86 happened, so invitations, the waiting
+    list, manual add and (later) the student calendar all come through here.
+
+    Phase 1 reads only the coach tier. Phase 2 (PAD-129) adds the instance and
+    lesson tiers *inside this function*, so no caller has to change.
+
+    Returns ``None`` when no bar is defined, and a (possibly empty) list of rule
+    dicts otherwise. ``None`` and ``[]`` both mean "everyone is eligible" — see
+    :meth:`NotificationConfig.get_eligibility_rules`. Callers must not read a
+    missing bar as "exclude everybody"; that state is reserved for a bar that is
+    *defined* but unsatisfiable (eligibility.rules rule 2).
+    """
+    if config is None:
+        config = NotificationConfig.query.filter_by(coach_id=coach_id).first()
+    if config is None:
+        return None
+    return config.get_eligibility_rules()
+
+
+def passes_eligibility(
+    cp: Association_CoachPlayer,
+    instance,
+    coach_id: int,
+    rules,
+) -> bool:
+    """Does ``cp`` clear the eligibility bar for this class? — PAD-128.
+
+    ``rules`` is whatever :func:`effective_eligibility` returned. An unset or
+    empty bar admits everyone (eligibility.rules rule 1); a defined bar is
+    evaluated by the SAME code path as invitation-group rules
+    (eligibility.rules rule 7), with no vacancy, because eligibility must be
+    answerable for a class that has no spot open.
+    """
+    if not rules:
+        return True
+    return _passes_group_rules(rules, cp, None, coach_id, instance)
 
 
 def effective_level_code(obj) -> str:
@@ -432,18 +488,45 @@ def _compare(value, op: str, threshold) -> bool:
     return True
 
 
+def _ladder_distance(coach_id: int, level_id_a, level_id_b) -> int | None:
+    """Steps between two levels in the coach's ladder, or ``None`` — PAD-128.
+
+    Positional, never the raw ``display_order`` values, for all the reasons in
+    ``level_ladder.py`` (PAD-70). ``None`` when either level is absent from this
+    coach's ladder, which callers must read as "does not pass a level rule"
+    (eligibility.rules rule 6).
+    """
+    ladder = get_level_ladder(coach_id)
+    index_a = ladder_index(ladder, level_id_a)
+    index_b = ladder_index(ladder, level_id_b)
+    if index_a is None or index_b is None:
+        return None
+    return abs(index_a - index_b)
+
+
 def _passes_group_rules(
     rules: list,
     cp: Association_CoachPlayer,
-    vacancy: Vacancy,
+    vacancy: Vacancy | None,
     coach_id: int,
     instance: LessonInstance | None = None,
 ) -> bool:
-    """Apply all rules in an invitation group with AND logic.
+    """Apply all rules in a rule set with AND logic.
+
+    Shared by two callers with two different rule vocabularies
+    (eligibility.rules rule 7 — two evaluators would drift):
+
+    * **invitation groups** anchor on a vacancy (``*_vacancy`` operations);
+    * **eligibility** anchors on a class and passes ``vacancy=None``
+      (``*_class`` operations), because the bar must be answerable for a class
+      with no spot open.
 
     ``instance`` (PAD-86) lets the level rules fall back to the class's
-    effective level when the vacancy carries no snapshot of its own.
+    effective level when the vacancy carries no snapshot of its own — which is
+    also what makes the ``vacancy=None`` path resolve a level at all.
     """
+    # PAD-128: `_vacancy_level(None, instance)` degrades cleanly to the class's
+    # effective level, so this one call serves both anchors.
     vacancy_level_id, vacancy_level = _vacancy_level(vacancy, instance)
 
     for rule in rules:
@@ -483,8 +566,46 @@ def _passes_group_rules(
                 if op == "all_below_vacancy" and cd <= vd:
                     return False
 
+            # PAD-128 — eligibility's class-anchored vocabulary. Same ladder
+            # positions as above; "above" means STRONGER, i.e. a LOWER index.
+            elif op == "same_as_class":
+                if cp.level_id != vacancy_level_id:
+                    return False
+            elif op in (
+                "equal_or_above_class",
+                "equal_or_below_class",
+                "one_below_or_above_class",
+                "within_n_of_class",
+            ):
+                ladder = get_level_ladder(coach_id)
+                vd = ladder_index(ladder, vacancy_level_id)
+                cd = ladder_index(ladder, cp.level_id)
+                if vd is None or cd is None:
+                    # A student whose level is not in the coach's ladder never
+                    # passes a level rule (eligibility.rules rule 6).
+                    return False
+                if op == "equal_or_above_class" and cd > vd:
+                    return False
+                if op == "equal_or_below_class" and cd < vd:
+                    return False
+                if op == "one_below_or_above_class" and abs(cd - vd) > 1:
+                    return False
+                if op == "within_n_of_class":
+                    try:
+                        allowed = int(val)
+                    except (TypeError, ValueError):
+                        # A malformed `value` must not silently widen the bar
+                        # into "any level"; treat it as the strictest reading.
+                        allowed = 0
+                    if abs(cd - vd) > max(0, allowed):
+                        return False
+
         elif attr == "side":
-            if vacancy.side is None:
+            # PAD-128: side is a WAVE criterion only, never an eligibility one
+            # (eligibility.rules rule 4), so this branch is unreachable on the
+            # eligibility path. Guarded anyway because `vacancy` is now
+            # optional and a bare `vacancy.side` would raise on that path.
+            if vacancy is None or vacancy.side is None:
                 continue
             # Inclusive of "both": a "both" player (or a "both" vacancy) is eligible
             # for any side. Exact-side is preferred via the sort key, not required.
@@ -545,9 +666,16 @@ def _get_eligible_students_for_group(
     }
     excluded_ids = enrolled_ids | active_invite_ids
 
+    # PAD-128: eligibility FIRST, wave criteria second
+    # (eligibility.enforcement rule 1). The widening rounds are unchanged; the
+    # widest one now means "everyone ELIGIBLE" instead of "everyone". With no
+    # bar defined this is a no-op and the engine behaves exactly as before.
+    eligibility_rules = effective_eligibility(instance, coach_id, config)
+
     coach_players = [
         cp for cp in Association_CoachPlayer.query.filter_by(coach_id=coach_id).all()
         if cp.player_id not in excluded_ids
+        and passes_eligibility(cp, instance, coach_id, eligibility_rules)
         and _passes_group_rules(rules, cp, vacancy, coach_id, instance)
     ]
 
@@ -615,9 +743,14 @@ def get_eligible_students(
 
     excluded_ids = enrolled_ids | active_invite_ids
 
+    # PAD-128: eligibility FIRST, round criteria second
+    # (eligibility.enforcement rule 1). No-op when no bar is defined.
+    eligibility_rules = effective_eligibility(instance, coach_id, config)
+
     coach_players = [
         cp for cp in Association_CoachPlayer.query.filter_by(coach_id=coach_id).all()
         if cp.player_id not in excluded_ids
+        and passes_eligibility(cp, instance, coach_id, eligibility_rules)
     ]
 
     restrictions = config.get_restrictions()
@@ -3098,6 +3231,36 @@ def _check_waiting_list(
 
     invitation_groups = config.get_invitation_groups()
 
+    # PAD-128 / PAD-122: placement is hard-gated on the bar
+    # (eligibility.enforcement rule 2). Waiting-list candidates are NOT subject
+    # to wave criteria — they are being placed, not invited in rounds — so they
+    # are filtered by eligibility and ranked by the priority criteria below.
+    eligibility_rules = effective_eligibility(instance, coach_id, config)
+
+    # PAD-123: a student is never placed into a class they are already in
+    # (eligibility.enforcement rule 4). `absent` is the load-bearing half: the
+    # student whose cancellation CREATED this vacancy still holds an enrolment
+    # association plus an `absent` presence, so without both exclusions they are
+    # placed straight back into their own vacancy — a credit is spent, a
+    # `waiting_list_placed` message is sent, and the real spot is never offered
+    # to anybody. Unconditional: applies whether or not a bar is defined
+    # (eligibility.enforcement rule 10).
+    already_in_class_ids = {rel.player_id for rel in instance.players_relations}
+    already_in_class_ids |= {
+        p.player_id
+        for p in Presence.query.filter_by(
+            lesson_instance_id=instance.id, status="absent"
+        ).all()
+    }
+
+    # PAD-122: the restrictions the invitation path has always honoured but the
+    # fill path skipped entirely (eligibility.enforcement rule 5). Also
+    # unconditional.
+    restrictions = config.get_restrictions()
+    restricted_player_ids = set()
+    if restrictions["excludedPlayers"]["enabled"]:
+        restricted_player_ids = set(restrictions["excludedPlayers"]["playerIds"])
+
     # Filter entries — when invitation groups are configured, skip round-criteria filtering
     eligible_entries = []
     for entry in entries:
@@ -3112,6 +3275,20 @@ def _check_waiting_list(
             coach_id=coach_id, player_id=entry.player_id
         ).first()
         if not cp:
+            continue
+
+        if entry.player_id in already_in_class_ids:
+            continue
+
+        if str(entry.player_id) in restricted_player_ids:
+            continue
+
+        if restrictions["excludeUnpaidSubscription"]["enabled"]:
+            user = cp.player.user if cp.player else None
+            if not user or user.status != "active":
+                continue
+
+        if not passes_eligibility(cp, instance, coach_id, eligibility_rules):
             continue
 
         if invitation_groups:
@@ -3145,6 +3322,23 @@ def _check_waiting_list(
             if passes:
                 eligible_entries.append((entry, cp))
 
+    if not eligible_entries:
+        return None
+
+    # PAD-122: the availability-blocker filter, the last guard the fill path
+    # skipped (eligibility.enforcement rule 5). Placement is silent enrolment,
+    # so dropping a student into a window they marked unavailable is worse here
+    # than on the invitation path, where they could at least decline.
+    from padel_app.services.student_availability_service import filter_blocked_coach_players
+    unblocked_player_ids = {
+        cp.player_id
+        for cp in filter_blocked_coach_players(
+            [cp for _, cp in eligible_entries], instance
+        )
+    }
+    eligible_entries = [
+        pair for pair in eligible_entries if pair[1].player_id in unblocked_player_ids
+    ]
     if not eligible_entries:
         return None
 

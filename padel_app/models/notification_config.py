@@ -183,6 +183,20 @@ class NotificationConfig(db.Model, model.Model):
     invitation_start_timing = Column(JSON, nullable=True)
     invitation_groups = Column(JSON, nullable=True)
     tiebreakers = Column(JSON, nullable=True)
+    # PAD-128 — the coach's standard eligibility bar (eligibility.rules).
+    #
+    # DELIBERATELY has no DEFAULT_* constant and no defaulting getter. Every
+    # other JSON column here follows `return self.X if self.X is not None else
+    # DEFAULT_X`, and for this column that idiom IS the bug: NULL means "no bar
+    # defined, everyone is eligible", and substituting a non-empty default
+    # would turn an unset bar into a real filter. That is exactly how
+    # `get_invitation_groups()` falling back to a non-empty
+    # DEFAULT_INVITATION_GROUPS produced PAD-122 one layer down.
+    #
+    # NULL and [] both mean "no bar". They are stored distinctly only because
+    # eligibility.cascade (PAD-129) needs [] to be a deliberate override at the
+    # lesson/instance tiers; at the coach tier they are equivalent.
+    eligibility_rules = Column(JSON, nullable=True)
 
     coach = relationship("Coach")
 
@@ -298,6 +312,22 @@ class NotificationConfig(db.Model, model.Model):
 
     def get_tiebreakers(self):
         return self.tiebreakers if self.tiebreakers is not None else DEFAULT_TIEBREAKERS
+
+    def get_eligibility_rules(self):
+        """The coach's standard eligibility bar, or ``None`` when unset (PAD-128).
+
+        Returns the stored value verbatim — there is **no** default to fall back
+        to. ``None`` (never configured) and ``[]`` (explicitly cleared) are both
+        "no bar", and callers must read either as "everyone is eligible" rather
+        than as a filter that excludes everybody.
+
+        Anything that is not a list is treated as unset: a malformed column
+        must not be able to lock a coach's whole roster out of their classes.
+        """
+        rules = self.eligibility_rules
+        if not isinstance(rules, list):
+            return None
+        return rules
 
     @classmethod
     def get_create_form(cls):
