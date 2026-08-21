@@ -2,107 +2,38 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
-from padel_app.tools.tools import _parse_range_or_default
+from padel_app.helpers.dashboard.coach_home import (
+    build_needs_you_block,
+    build_next_class_block,
+    build_schedule_block,
+    build_week_pulse_block,
+)
 
-from padel_app.helpers.dashboard.events import build_dashboard_event_lists
-from padel_app.helpers.dashboard.kpis import compute_coach_kpis
-from padel_app.helpers.dashboard.pending import count_pending_confirmations
-from padel_app.services.notification_service import get_notification_activity
 
-
-def build_coach_dashboard_blocks(*, coach) -> List[Dict[str, Any]]:
+def build_coach_dashboard_blocks(*, coach, user_id: int) -> List[Dict[str, Any]]:
     """
-    Build coach-specific dashboard blocks:
-      - KPI grid
-      - Pending confirmations (next-day) card + manual-notify action
-      - Upcoming classes list
-      - Needs players list
+    Build coach-specific dashboard blocks, in the order the screen renders them:
+      - Next class hero (omitted entirely when nothing is scheduled)
+      - "Needs you" queue
+      - Next 7 days
+      - This week
+
+    The old ``kpi_grid`` / ``pending_confirmations`` / ``notification_activity``
+    blocks are gone. Players and Upcoming-classes were bare counts with nothing
+    to act on and now live in ``week_pulse`` with a denominator; pending
+    validation became a queue item that carries its own button and can reach
+    zero. See helpers/dashboard/coach_home.py for the reasoning.
     """
-    range_start, range_end = _parse_range_or_default()
+    blocks: List[Dict[str, Any]] = []
 
-    scheduled_count, upcoming_items, needs_items = build_dashboard_event_lists(
-        coach_id=coach.id,
-        range_start=range_start,
-        range_end=range_end,
-    )
+    # Omitted rather than emptied: an empty hero would be the biggest element on
+    # the screen saying nothing.
+    hero = build_next_class_block(coach_id=coach.id)
+    if hero is not None:
+        blocks.append(hero)
 
-    kpis = compute_coach_kpis(coach_id=coach.id, scheduled_count=scheduled_count)
+    blocks.append(build_needs_you_block(coach_id=coach.id, user_id=user_id))
+    blocks.append(build_schedule_block(coach_id=coach.id))
+    blocks.append(build_week_pulse_block(coach_id=coach.id))
 
-    # PAD-78: replaces the old "Revenue (est.)" KPI. Students invited/notified
-    # for tomorrow's classes who have neither confirmed nor declined.
-    pending_count = count_pending_confirmations(coach_id=coach.id)
-
-    return [
-        {
-            "id": "kpis",
-            "type": "kpi_grid",
-            "data": {
-                "items": [
-                    {
-                        "label": "Players",
-                        "value": int(kpis.total_players),
-                        "icon": "users",
-                        "href": "/players",
-                    },
-                    {
-                        "label": "Upcoming classes",
-                        "value": int(kpis.scheduled_count),
-                        "icon": "calendar",
-                        "href": "/calendar",
-                    },
-                    {
-                        "label": "Pending validation",
-                        "value": int(kpis.pending_validations),
-                        "icon": "clipboard_check",
-                        "href": "/validations",
-                    },
-                ]
-            },
-        },
-        {
-            # PAD-78: replaces the removed "Revenue (est.)" KPI. Shows how many
-            # students are still pending confirmation for tomorrow's classes and
-            # lets the coach fire an extra manual reminder to just those students.
-            "id": "pending_confirmations",
-            "type": "pending_confirmations",
-            "data": {
-                "count": int(pending_count),
-                "canNotify": pending_count > 0,
-            },
-        },
-        {
-            "id": "lists",
-            "type": "grid",
-            "data": {
-                "cols": {"base": 1, "lg": 2},
-                "children": [
-                    {
-                        "id": "upcoming_classes",
-                        "type": "class_list",
-                        "data": {
-                            "title": "Upcoming classes",
-                            "items": upcoming_items,
-                        },
-                    },
-                    {
-                        "id": "needs_players",
-                        "type": "class_list",
-                        "data": {
-                            "title": "Needs players",
-                            "icon": "user_plus",
-                            "emptyText": "All scheduled classes are full",
-                            "items": needs_items,
-                        },
-                    },
-                ],
-            },
-        },
-        {
-            "id": "notification_activity",
-            "type": "notification_activity",
-            "data": {
-                "title": "Notification activity",
-                "items": get_notification_activity(coach_id=coach.id, limit=8),
-            },
-        },
-    ]
+    return blocks

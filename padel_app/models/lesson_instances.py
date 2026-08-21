@@ -91,6 +91,20 @@ class LessonInstance(db.Model, model.Model):
         declined = sum(1 for p in self.presences if p.status == "absent")
         return max(0, enrolled - declined)
 
+    @property
+    def confirmed_spots(self) -> int:
+        """Players who have actively CONFIRMED they are coming.
+
+        ``Presence.status`` is "present" / "absent" / NULL. Only "present" is a
+        confirmation; NULL means the player has not answered yet and still
+        holds their spot. So this is always <= ``effective_filled_spots``, and
+        the difference between the two is "enrolled but unanswered".
+
+        Consumed by the calendar event payload (``confirmedCount``) so a block
+        can show confirmed / awaiting / free without a per-class round trip.
+        """
+        return sum(1 for p in self.presences if p.status == "present")
+
     def __repr__(self):
         return f"<LessonInstance {self.id} {self.title} {self.start_datetime.strftime('%Y-%m-%d %H:%M')}>"
 
