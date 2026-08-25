@@ -235,17 +235,25 @@ def build_presence_trend(
 
 
 def _response_state(presence: Presence) -> str:
-    """How the player answered before the class — the reference's RSVP tri-state.
+    """How the player answered before the class — the RSVP tri-state.
 
     ``declined`` is a real answer (the student said they weren't coming), so it
     does not block validation; only ``none`` does.
+
+    The ``validated`` guard matters. A coach marking someone absent from the
+    class-detail sheet writes exactly the same columns a student decline does
+    (``status='absent'``, ``confirmed=False``) — the difference is that
+    ``add_presences`` also stamps ``validated=True``. Without the guard this
+    would report the coach's own decision back to them as "the student said they
+    couldn't make it", which is a claim the student never made. When the record
+    is already the coach's, fall back to what ``confirmed`` alone can support.
     """
-    if presence.status == "absent" and not presence.confirmed:
-        return "declined"
     if presence.confirmed:
         return "confirmed"
-    if presence.status is not None:
-        return "confirmed"
+    if presence.validated:
+        return "none"
+    if presence.status == "absent":
+        return "declined"
     return "none"
 
 

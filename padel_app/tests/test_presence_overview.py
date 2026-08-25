@@ -357,3 +357,39 @@ def test_another_coachs_classes_are_invisible(app, coach_world):
 
     assert stats["players"] == []
     assert pending["pendingCount"] == 0
+
+
+def test_coach_marked_absence_is_not_reported_as_a_student_decline(app, coach_world):
+    """A validated absence is the coach's record, not something the student said.
+
+    Both paths write status='absent', confirmed=False; only `add_presences`
+    also sets validated=True. Without that guard the UI would tell the coach
+    "said they couldn't make it" about a decision the coach made themselves.
+    """
+    from padel_app.models.presences import Presence
+    from padel_app.services.presence_overview_service import list_pending_validation
+
+    instance_id = coach_world["private_instance_id"]
+    with app.app_context():
+        # Coach marks the silent player absent and validates the class.
+        presence = Presence.query.filter_by(
+            lesson_instance_id=instance_id, player_id=coach_world["bruno_id"]
+        ).first()
+        presence.status = "absent"
+        presence.justification = "unjustified"
+        presence.validated = True
+        db.session.commit()
+
+    start, end = _window()
+    with app.app_context():
+        payload = list_pending_validation(
+            coach_id=coach_world["coach_id"], range_start=start, range_end=end
+        )
+
+    klass = next(
+        c for c in payload["pending"] + payload["validated"]
+        if c["lessonInstanceId"] == instance_id
+    )
+    bruno = next(p for p in klass["players"] if p["playerId"] == coach_world["bruno_id"])
+    assert bruno["response"] == "none", "must not attribute this to the student"
+    assert bruno["status"] == "absent", "the coach's record itself is untouched"
