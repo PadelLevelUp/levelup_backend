@@ -34,7 +34,7 @@ Handles reminders, vacancy-based invitations, waiting list, and manual notificat
 from __future__ import annotations
 
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from padel_app.sql_db import db
 from padel_app.utils.dates import utcnow_naive
@@ -840,8 +840,20 @@ def _check_restrictions(
     now = now or utcnow_naive()
 
     if restrictions.get("quietHours", {}).get("enabled"):
-        hour = now.hour
-        if hour >= 22 or hour < 7:
+        # PAD-136: `now` is a naive UTC instant, but 22/7 are a CLUB-LOCAL wall
+        # clock ("don't message students late at night") — notifications.config
+        # rule 6a. Comparing the UTC hour directly drifted the window to
+        # 23:00–08:00 local through Portuguese summer time (WEST = UTC+1) while
+        # reading correctly in winter (WET = UTC+0), so it looked intermittent:
+        # a 22:30-local invite was sent, a 07:30-local one suppressed.
+        #
+        # Imported inside the function because scheduler and this module import
+        # each other lazily (see reschedule_all_future_jobs below); a top-level
+        # import would close that cycle.
+        from padel_app.scheduler import CLUB_TZ
+
+        local_hour = now.replace(tzinfo=timezone.utc).astimezone(CLUB_TZ).hour
+        if local_hour >= 22 or local_hour < 7:
             return False
 
     min_time = restrictions.get("minTimeBeforeClass", {})

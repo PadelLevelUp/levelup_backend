@@ -170,36 +170,83 @@ class TestCheckRestrictions:
             return _check_restrictions(instance, coach_id=1, restrictions=restrictions, now=now)
 
     # ── quiet hours ──────────────────────────────────────────────────────────
+    #
+    # PAD-136: `now` is a naive UTC instant, but the 22:00–07:00 bounds are a
+    # CLUB-LOCAL wall clock (notifications.config rule 6a). Every boundary case
+    # below therefore names the UTC instant AND the club-local time it maps to.
+    # June/August are WEST (UTC+1); January is WET (UTC+0).
+    #
+    # Two of these previously asserted the bug — they passed a UTC hour and
+    # expected it to be compared as if it were local. They now pin the local
+    # boundary instead, which is why their `now` values changed by an hour.
 
     def test_quiet_hours_disabled_allows_night(self):
         r = _restrictions(quietHours={"enabled": False})
-        now = datetime(2025, 6, 10, 23, 0)   # 11 PM
+        now = datetime(2025, 6, 10, 23, 0)   # 00:00 Lisbon
         assert self._call(now, r) is True
 
-    def test_quiet_hours_blocks_at_22(self):
+    def test_quiet_hours_blocks_at_22_local(self):
+        """21:00 UTC in June == 22:00 Lisbon — the first suppressed minute."""
         r = _restrictions(quietHours={"enabled": True})
-        now = datetime(2025, 6, 10, 22, 0)
+        now = datetime(2025, 6, 10, 21, 0)
         assert self._call(now, r) is False
 
-    def test_quiet_hours_blocks_before_7(self):
+    def test_quiet_hours_blocks_before_7_local(self):
+        """05:59 UTC in June == 06:59 Lisbon — still inside the window."""
         r = _restrictions(quietHours={"enabled": True})
-        now = datetime(2025, 6, 10, 6, 59)
+        now = datetime(2025, 6, 10, 5, 59)
         assert self._call(now, r) is False
 
-    def test_quiet_hours_allows_at_7(self):
+    def test_quiet_hours_allows_at_7_local(self):
+        """06:00 UTC in June == 07:00 Lisbon — the first allowed minute."""
         r = _restrictions(quietHours={"enabled": True})
-        now = datetime(2025, 6, 10, 7, 0)
+        now = datetime(2025, 6, 10, 6, 0)
         assert self._call(now, r) is True
 
     def test_quiet_hours_allows_at_noon(self):
         r = _restrictions(quietHours={"enabled": True})
-        now = datetime(2025, 6, 10, 12, 0)
+        now = datetime(2025, 6, 10, 12, 0)   # 13:00 Lisbon
         assert self._call(now, r) is True
 
-    def test_quiet_hours_allows_at_2159(self):
+    def test_quiet_hours_allows_at_2159_local(self):
+        """20:59 UTC in June == 21:59 Lisbon — the last allowed minute."""
         r = _restrictions(quietHours={"enabled": True})
-        now = datetime(2025, 6, 10, 21, 59)
+        now = datetime(2025, 6, 10, 20, 59)
         assert self._call(now, r) is True
+
+    # -- PAD-136: the reported window drift ----------------------------------
+    #
+    # Before the fix the naive-UTC hour was compared straight against 22/7, so
+    # through Portuguese summer time the effective window was 23:00–08:00
+    # local. These two cases are exactly the consequences the ticket names.
+
+    def test_reported_case_2230_local_in_summer_is_suppressed(self):
+        """21:30 UTC == 22:30 WEST. Pre-fix this was SENT (UTC hour 21 < 22)."""
+        r = _restrictions(quietHours={"enabled": True})
+        assert self._call(datetime(2025, 8, 14, 21, 30), r) is False
+
+    def test_reported_case_0730_local_in_summer_is_allowed(self):
+        """06:30 UTC == 07:30 WEST. Pre-fix this was SUPPRESSED (UTC hour 6 < 7)."""
+        r = _restrictions(quietHours={"enabled": True})
+        assert self._call(datetime(2025, 8, 14, 6, 30), r) is True
+
+    def test_same_utc_instant_differs_between_summer_and_winter(self):
+        """The discriminating test — a constant offset cannot produce this.
+
+        21:30 UTC is 22:30 local in summer (WEST, inside quiet hours) and
+        21:30 local in winter (WET, outside them). A regression to a naive-UTC
+        comparison makes both answers identical and fails here, which is what
+        stops this bug from being "fixed" with a hardcoded -1h.
+        """
+        r = _restrictions(quietHours={"enabled": True})
+        assert self._call(datetime(2025, 8, 14, 21, 30), r) is False   # 22:30 WEST
+        assert self._call(datetime(2025, 1, 14, 21, 30), r) is True    # 21:30 WET
+
+    def test_winter_boundary_matches_utc_because_wet_is_utc(self):
+        """In January the local clock IS UTC, so 22:00 UTC is 22:00 local."""
+        r = _restrictions(quietHours={"enabled": True})
+        assert self._call(datetime(2025, 1, 14, 22, 0), r) is False
+        assert self._call(datetime(2025, 1, 14, 21, 59), r) is True
 
     # ── min time before class ─────────────────────────────────────────────────
 
@@ -234,13 +281,19 @@ class TestCheckRestrictions:
 
     def test_midnight_blocked_by_quiet_hours(self):
         r = _restrictions(quietHours={"enabled": True})
-        now = datetime(2025, 6, 10, 0, 0)
+        now = datetime(2025, 6, 10, 0, 0)   # 01:00 Lisbon — inside either way
         assert self._call(now, r) is False
 
     def test_midnight_allowed_without_quiet_hours(self):
         r = _restrictions(quietHours={"enabled": False})
         now = datetime(2025, 6, 10, 0, 0)
         assert self._call(now, r) is True
+
+    def test_utc_midnight_in_summer_is_1am_local_and_still_blocked(self):
+        """23:30 UTC is 00:30 the NEXT local day — the window spans midnight,
+        so the local-day rollover must not open a gap in it."""
+        r = _restrictions(quietHours={"enabled": True})
+        assert self._call(datetime(2025, 8, 14, 23, 30), r) is False
 
 
 # ===========================================================================
