@@ -393,3 +393,65 @@ def test_coach_marked_absence_is_not_reported_as_a_student_decline(app, coach_wo
     bruno = next(p for p in klass["players"] if p["playerId"] == coach_world["bruno_id"])
     assert bruno["response"] == "none", "must not attribute this to the student"
     assert bruno["status"] == "absent", "the coach's record itself is untouched"
+
+
+def test_walk_in_occupies_a_spot_in_effective_filled_spots(app, coach_world):
+    """A walk-in added from the Presences tab must count toward capacity.
+
+    `effective_filled_spots` counts `players_relations` (the instance
+    association), NOT presences — so creating only a Presence row would leave
+    the walk-in invisible to the calendar badge, the class-detail capacity
+    field and the invitation engine, all of which read that one property
+    (`calendar.view` rule 9).
+    """
+    from padel_app.models import User
+    from padel_app.models.players import Player
+    from padel_app.models.lesson_instances import LessonInstance
+    from padel_app.models.presences import Presence
+    from padel_app.services.lesson_service import add_presences
+
+    instance_id = coach_world["private_instance_id"]
+
+    with app.app_context():
+        before = LessonInstance.query.get(instance_id).effective_filled_spots
+
+        user = User(name="Walk In", username="po_walkin", password="x")
+        db.session.add(user)
+        db.session.flush()
+        walk_in = Player(user_id=user.id)
+        db.session.add(walk_in)
+        db.session.commit()
+        walk_in_id = walk_in.id
+
+        instance = LessonInstance.query.get(instance_id)
+        add_presences(instance, [{"playerId": walk_in_id, "status": "present"}])
+
+    with app.app_context():
+        instance = LessonInstance.query.get(instance_id)
+        assert instance.effective_filled_spots == before + 1, (
+            "walk-in must occupy a spot"
+        )
+        presence = Presence.query.filter_by(
+            lesson_instance_id=instance_id, player_id=walk_in_id
+        ).first()
+        assert presence is not None and presence.status == "present"
+        assert presence.validated is True
+
+
+def test_marking_an_existing_player_does_not_double_count(app, coach_world):
+    """Re-marking someone already on the roster must not add a second spot."""
+    from padel_app.models.lesson_instances import LessonInstance
+    from padel_app.services.lesson_service import add_presences
+
+    instance_id = coach_world["private_instance_id"]
+    with app.app_context():
+        before = LessonInstance.query.get(instance_id).effective_filled_spots
+        instance = LessonInstance.query.get(instance_id)
+        add_presences(
+            instance, [{"playerId": coach_world["ana_id"], "status": "present"}]
+        )
+
+    with app.app_context():
+        assert (
+            LessonInstance.query.get(instance_id).effective_filled_spots == before
+        )

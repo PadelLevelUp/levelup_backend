@@ -339,6 +339,26 @@ def add_presences(lesson_instance, payload):
             presence_obj = existing
             form = presence_obj.get_edit_form()
         else:
+            # No presence row yet means this player was not on the instance's
+            # roster — a walk-in the coach is adding after the fact (PAD-140).
+            # They also need the instance association, because
+            # `effective_filled_spots` counts `players_relations`, not
+            # presences: without it the walk-in occupies a spot that the
+            # calendar badge, the class-detail capacity field and the
+            # invitation engine all fail to see (`calendar.view` rule 9 makes
+            # that field the single source of truth, so it cannot be patched
+            # per-surface). This mirrors what the vacancy-fill path already
+            # does in `notification_service._add_player_to_instance`.
+            assoc_exists = Association_PlayerLessonInstance.query.filter_by(
+                player_id=player_id,
+                lesson_instance_id=lesson_instance_id,
+            ).first()
+            if not assoc_exists:
+                Association_PlayerLessonInstance(
+                    player_id=player_id,
+                    lesson_instance_id=lesson_instance_id,
+                ).create()
+
             presence_obj = Presence(
                 player_id=player_id,
                 lesson_instance_id=lesson_instance_id,
