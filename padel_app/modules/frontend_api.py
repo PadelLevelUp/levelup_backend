@@ -63,6 +63,13 @@ from padel_app.services.attendance_history_service import (
     build_attendance_history,
     default_range as default_attendance_range,
 )
+from padel_app.services.presence_overview_service import (
+    build_presence_stats,
+    build_presence_trend,
+    default_overview_range,
+    list_pending_validation,
+    unvalidate_instance,
+)
 from padel_app.services.club_service import (
     create_coach_invitation_service,
     get_coach_invitation_service,
@@ -905,6 +912,105 @@ def attendance_history():
     )
     payload["playerName"] = subject.user.name if subject.user else None
     return jsonify(payload)
+
+
+def _presence_overview_range():
+    """Shared `from`/`to` parsing for the three Presences-tab reads (PAD-140).
+
+    Falls back to the trailing-90-day default when either bound is missing, so a
+    caller can omit both and still get a sensible window.
+    """
+    raw_from = request.args.get("from")
+    raw_to = request.args.get("to")
+    if raw_from and raw_to:
+        try:
+            return (
+                _parse_attendance_bound(raw_from, end_of_day=False),
+                _parse_attendance_bound(raw_to, end_of_day=True),
+            )
+        except (ValueError, OverflowError):
+            abort(400, "from/to must be ISO-8601 datetimes")
+    return default_overview_range()
+
+
+@bp.get("/presence_stats")
+@jwt_required()
+def presence_stats():
+    """Per-player presence metrics across the calling coach's roster (PAD-140).
+
+    Coach-only, and roster-wide rather than class-scoped — so there is no class
+    id to own-check here; the service scopes every row to this coach through
+    `Association_CoachLesson`. `classes.detail-visibility` keeps this off-limits
+    to students: it exposes every roster player's attendance to the caller.
+    """
+    coach = require_coach()
+    range_start, range_end = _presence_overview_range()
+    return jsonify(
+        build_presence_stats(
+            coach_id=coach.id,
+            range_start=range_start,
+            range_end=range_end,
+        )
+    )
+
+
+@bp.get("/presence_trend")
+@jwt_required()
+def presence_trend():
+    """Roster-wide attended-class counts over time (PAD-140).
+
+    Echoes the granularity actually used, exactly as `/attendance_history` does,
+    so the chart labels its axis from the payload instead of re-deriving the rule.
+    """
+    coach = require_coach()
+    range_start, range_end = _presence_overview_range()
+    return jsonify(
+        build_presence_trend(
+            coach_id=coach.id,
+            range_start=range_start,
+            range_end=range_end,
+            granularity=request.args.get("granularity"),
+        )
+    )
+
+
+@bp.get("/class_instances/pending_validation")
+@jwt_required()
+def class_instances_pending_validation():
+    """Already-run classes split into pending vs validated (PAD-140).
+
+    The listing behind the dashboard's `pending_validations` count, which today
+    only exposes a number and a deep link.
+    """
+    coach = require_coach()
+    range_start, range_end = _presence_overview_range()
+    return jsonify(
+        list_pending_validation(
+            coach_id=coach.id,
+            range_start=range_start,
+            range_end=range_end,
+        )
+    )
+
+
+@bp.post("/class_instance/<int:instance_id>/presences/unvalidate")
+@jwt_required()
+def class_instance_unvalidate(instance_id):
+    """Reopen a validated class for editing (PAD-140).
+
+    The one new write this feature needs. Marking attendance already stamps
+    `validated=True` via `add_presences`; nothing anywhere sets it back, which
+    is what the Undo action requires.
+    """
+    coach = require_coach()
+    instance = require_owned_class(coach, "lessoninstance", instance_id)
+    presences = unvalidate_instance(instance)
+    return jsonify(
+        {
+            "lessonInstanceId": instance.id,
+            "presences": [serialize_presence(p) for p in presences],
+        }
+    )
 
 
 # -------------------------------------------------------------------
