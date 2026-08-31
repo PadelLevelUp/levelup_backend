@@ -1,16 +1,32 @@
-"""Attendance history for one player (PAD-114 / spec `attendance.history`).
+"""Presence history for one player.
 
-The "Presenças" page shows a player the classes they actually ATTENDED — a chart
-of counts per period plus the underlying list of classes. It is deliberately not
-a present-vs-absent comparison and not a missed-classes page.
+Two pages are built from this module, and they differ **only** in which
+`Presence.status` they select:
+
+* "Presenças" (PAD-114, spec `attendance.history`) — classes ATTENDED,
+  `status == "present"`.
+* "Faltas" (PAD-141, spec `attendance.absences`) — classes MISSED,
+  `status == "absent"`.
+
+PAD-114's docstring used to say this was "not a missed-classes page". That
+described what did not exist yet rather than a design constraint; PAD-141 adds
+the counterpart. The constraint that DOES survive is that each page charts a
+single predicate — neither is a present-vs-absent comparison view.
 
 Two facts shape everything here:
 
 * `presences` has no date column of its own. Every timestamp comes from the
   joined `lesson_instances.start_datetime`, which is stored naive-UTC.
-* "attended" is `Presence.status == "present"` — the same predicate as
-  `helpers.dashboard.kpis.compute_player_kpis().lessons_attended`, so this page
-  and the dashboard "Attended" KPI can never disagree.
+* Each page's predicate is the same one its dashboard KPI counts —
+  `helpers.dashboard.kpis.compute_player_kpis()` uses `status == "present"` for
+  `lessons_attended` and `status == "absent"` for `lessons_missed` — so a page
+  and the KPI that links to it can never disagree.
+
+  In particular `lessons_missed` does NOT filter on `justification`, so neither
+  does the absence history: a page that hid justified absences would show a
+  smaller number than the KPI the student clicked to reach it. The
+  justification is carried per session so the UI can label each row, which is
+  presentational and never narrows the set (spec `attendance.absences` rule 3).
 """
 
 from __future__ import annotations
@@ -115,26 +131,38 @@ def _calendar_href(instance_id: int, day: date) -> str:
     return f"/calendar?{urlencode(params)}"
 
 
-def build_attendance_history(
+def build_presence_history(
     *,
     player_id: int,
     range_start: datetime,
     range_end: datetime,
     granularity: Optional[str] = None,
+    status: str = "present",
+    include_justification: bool = False,
 ) -> Dict[str, Any]:
-    """Build the attendance-history payload for one player.
+    """Build a presence-history payload for one player.
+
+    Shared by "Presenças" (`status="present"`) and "Faltas" (`status="absent"`).
+    Everything except the status predicate — bucketing, gap-filling, ordering,
+    the deep-link contract, the payload shape — is deliberately identical, so
+    the two pages cannot drift apart.
 
     Args:
-        player_id: The player whose attendance is being read. Authorization is
+        player_id: The player whose history is being read. Authorization is
             the caller's job — this service trusts the id it is handed.
         range_start: Inclusive start of the window.
         range_end: Inclusive end of the window.
         granularity: Optional pin (``day`` | ``month`` | ``year``). When absent
             (or unrecognized) it is derived from the span.
+        status: The `Presence.status` selected. Must match the predicate of the
+            dashboard KPI that links to the page (see module docstring).
+        include_justification: When true, each session carries its
+            ``justification``. Used by the absence page to label a row
+            justified/unjustified; it never filters the set.
 
     Returns:
-        dict with ``playerId``, ``from``, ``to``, ``granularity``, a gap-filled
-        ``buckets`` series and the ``sessions`` list of attended classes.
+        dict with ``playerId``, ``from``, ``to``, ``granularity``, ``total``, a
+        gap-filled ``buckets`` series and the ``sessions`` list.
     """
     start = _as_naive_utc(range_start)
     end = _as_naive_utc(range_end)
@@ -144,12 +172,15 @@ def build_attendance_history(
     if granularity not in GRANULARITIES:
         granularity = pick_granularity(start, end)
 
-    rows: List[LessonInstance] = (
-        db.session.query(LessonInstance)
+    # Selecting the Presence alongside the instance (rather than only the
+    # instance) so the justification travels with the row; a second lookup per
+    # session would reopen the N+1 this join exists to avoid.
+    rows: List[Tuple[LessonInstance, Presence]] = (
+        db.session.query(LessonInstance, Presence)
         .join(Presence, Presence.lesson_instance_id == LessonInstance.id)
         .options(joinedload(LessonInstance.lesson))
         .filter(Presence.player_id == player_id)
-        .filter(Presence.status == "present")
+        .filter(Presence.status == status)
         .filter(LessonInstance.start_datetime >= start)
         .filter(LessonInstance.start_datetime <= end)
         .order_by(LessonInstance.start_datetime.desc())
@@ -158,22 +189,25 @@ def build_attendance_history(
 
     counts: Dict[date, int] = {}
     sessions: List[Dict[str, Any]] = []
-    for instance in rows:
+    for instance, presence in rows:
         started = instance.start_datetime
         day = started.date()
         bucket = _bucket_start(day, granularity)
         counts[bucket] = counts.get(bucket, 0) + 1
-        sessions.append(
-            {
-                "lessonInstanceId": instance.id,
-                "calendarEventId": f"lessoninstance-{instance.id}",
-                "title": instance.title,
-                "startDatetime": started.isoformat(),
-                "date": day.isoformat(),
-                "color": getattr(instance.lesson, "color", None),
-                "href": _calendar_href(instance.id, day),
-            }
-        )
+        session: Dict[str, Any] = {
+            "lessonInstanceId": instance.id,
+            "calendarEventId": f"lessoninstance-{instance.id}",
+            "title": instance.title,
+            "startDatetime": started.isoformat(),
+            "date": day.isoformat(),
+            "color": getattr(instance.lesson, "color", None),
+            "href": _calendar_href(instance.id, day),
+        }
+        if include_justification:
+            # Normalised to the two spec values or None; the column is nullable
+            # and an absence recorded by a coach may carry no justification yet.
+            session["justification"] = presence.justification
+        sessions.append(session)
 
     buckets = [
         {"start": bucket.isoformat(), "count": counts.get(bucket, 0)}
@@ -189,3 +223,24 @@ def build_attendance_history(
         "buckets": buckets,
         "sessions": sessions,
     }
+
+
+def build_attendance_history(**kwargs) -> Dict[str, Any]:
+    """Attended classes — `status == "present"` (PAD-114).
+
+    Kept as a named wrapper rather than making callers pass the status: the
+    predicate is a spec guarantee tied to the dashboard KPI, not a knob for
+    call sites to choose.
+    """
+    return build_presence_history(**kwargs, status="present")
+
+
+def build_absence_history(**kwargs) -> Dict[str, Any]:
+    """Missed classes — `status == "absent"` (PAD-141).
+
+    Justified and unjustified alike, matching `lessons_missed`; see the module
+    docstring for why filtering here would desync the page from its KPI.
+    """
+    return build_presence_history(
+        **kwargs, status="absent", include_justification=True
+    )

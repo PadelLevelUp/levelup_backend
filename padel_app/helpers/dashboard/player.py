@@ -48,13 +48,20 @@ def build_player_dashboard_blocks(*, player) -> List[Dict[str, Any]]:
                         "icon": "check_circle",
                         "href": "/attendance",
                     },
-                    # "Missed" stays inert: the attendance page shows attendance
-                    # only and is explicitly NOT a missed-classes page, so PAD-76
-                    # still applies here.
+                    # PAD-141 gave "Missed" a destination. It was inert only
+                    # because no missed-classes page existed — that is PAD-76
+                    # rule 6 ("never link to a route that 404s"), not a claim
+                    # that this KPI should be unclickable. `/absences` now
+                    # exists, so rule 6 is satisfied rather than waived.
+                    #
+                    # Counts the same `status == "absent"` presences the page
+                    # charts — justified ones included, exactly as
+                    # `lessons_missed` does — so the two can never disagree.
                     {
                         "label": "Missed",
                         "value": int(kpis.lessons_missed),
                         "icon": "x_circle",
+                        "href": "/absences",
                     },
                     {
                         "label": "Upcoming lessons",
