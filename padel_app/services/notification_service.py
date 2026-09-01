@@ -37,7 +37,7 @@ import re
 from datetime import datetime, timedelta, timezone
 
 from padel_app.sql_db import db
-from padel_app.utils.dates import utcnow_naive
+from padel_app.utils.dates import to_utc_iso, utcnow_naive
 from padel_app.models import (
     Association_CoachLessonInstance,
     Association_CoachPlayer,
@@ -287,6 +287,153 @@ def passes_eligibility(
     return _passes_group_rules(rules, cp, None, coach_id, instance)
 
 
+def eligibility_failures(
+    cp: Association_CoachPlayer,
+    instance,
+    coach_id: int,
+    rules,
+) -> list:
+    """EVERY eligibility rule ``cp`` fails, structured — PAD-133.
+
+    The sibling of :func:`passes_eligibility`, and the reason-reporting call
+    that eligibility.enforcement rule 7 needs: a warning must name what failed
+    ("2 levels below this class"), one line per failed rule, so a bare "this
+    student is not eligible" is explicitly not sufficient. That means
+    evaluating every rule rather than stopping at the first, which is why this
+    passes ``short_circuit=False``.
+
+    Both functions run the SAME evaluator, so the answer and the explanation
+    cannot disagree: an empty list here always means
+    :func:`passes_eligibility` is True.
+
+    Returns ``[]`` for an unset or empty bar, which admits everyone
+    (eligibility.rules rule 1). Each record is
+    ``{attribute, operation, actual, threshold, ladder_distance, reason}`` —
+    structured data, never prose: the client renders it in the coach's locale.
+    """
+    if not rules:
+        return []
+    return _group_rule_failures(
+        rules, cp, None, coach_id, instance, short_circuit=False
+    )
+
+
+def eligibility_failures_for_players(
+    instance,
+    coach_id: int,
+    player_ids: list,
+    config: NotificationConfig | None = None,
+) -> list:
+    """Which of ``player_ids`` fail the bar for ``instance``, and why — PAD-133.
+
+    Powers the manual-add warning, eligibility.enforcement rules 6 and 7: adding
+    an ineligible student by hand WARNS and names each failed rule, then
+    proceeds once the coach confirms. Enrolment is the coach's decision (the
+    calendar.student-blockers rule 4 precedent), so this only ever reports —
+    it never blocks, and callers must not treat a non-empty result as an error.
+
+    Students who clear the bar are omitted entirely, so an empty list means
+    "nothing to warn about" and the client can skip the confirmation.
+
+    Resolves the bar through :func:`effective_eligibility`, the single resolver
+    (eligibility.cascade rule 3) — so when PAD-129 adds the per-class tiers,
+    this surface inherits them without changing.
+    """
+    rules = effective_eligibility(instance, coach_id, config)
+    if not rules:
+        return []
+
+    out = []
+    for player_id in player_ids or []:
+        try:
+            pid = int(player_id)
+        except (TypeError, ValueError):
+            continue
+        cp = Association_CoachPlayer.query.filter_by(
+            coach_id=coach_id, player_id=pid
+        ).first()
+        if cp is None:
+            # Not on this coach's roster — eligibility has nothing to say, and
+            # inventing a failure here would warn about the wrong thing.
+            continue
+        failures = eligibility_failures(cp, instance, coach_id, rules)
+        if failures:
+            out.append({
+                "playerId": pid,
+                "name": (cp.player.user.name if cp.player and cp.player.user else ""),
+                "failures": failures,
+            })
+    return out
+
+
+def students_failing_eligibility_bar(
+    coach_id: int,
+    rules,
+    *,
+    now: datetime | None = None,
+) -> list:
+    """Already-enrolled students who would not meet ``rules`` — PAD-133.
+
+    eligibility.enforcement rule 9: saving a stricter bar reports who it *would*
+    have excluded, names them, offers no bulk action and does not block the
+    save. Rule 8 still holds — tightening never removes anyone, and nobody is
+    notified. Eligibility governs joining, never staying, so this is purely
+    informational.
+
+    Scoped to FUTURE classes: a bar cannot retroactively un-enrol someone from a
+    class that already happened, so reporting past ones would be noise. The
+    answer is per-class because eligibility is relative to the class's level —
+    the same student can clear the bar for one class and fail another — so a
+    student appears once per class they would fail, with that class named.
+    """
+    if not rules:
+        return []
+
+    _now = now or utcnow_naive()
+    coach_instance_ids = {
+        rel.lesson_instance_id
+        for rel in Association_CoachLessonInstance.query.filter_by(
+            coach_id=coach_id
+        ).all()
+    }
+    if not coach_instance_ids:
+        return []
+
+    instances = (
+        LessonInstance.query
+        .filter(
+            LessonInstance.id.in_(coach_instance_ids),
+            LessonInstance.start_datetime >= _now,
+        )
+        .order_by(LessonInstance.start_datetime)
+        .all()
+    )
+
+    out = []
+    for instance in instances:
+        for rel in list(getattr(instance, "players_relations", []) or []):
+            cp = Association_CoachPlayer.query.filter_by(
+                coach_id=coach_id, player_id=rel.player_id
+            ).first()
+            if cp is None:
+                continue
+            failures = eligibility_failures(cp, instance, coach_id, rules)
+            if failures:
+                out.append({
+                    "playerId": int(rel.player_id),
+                    "name": (cp.player.user.name if cp.player and cp.player.user else ""),
+                    "instanceId": int(instance.id),
+                    "classTitle": (
+                        getattr(instance, "overwrite_title", None)
+                        or getattr(instance.lesson, "title", "")
+                        or ""
+                    ),
+                    "startDatetime": to_utc_iso(instance.start_datetime),
+                    "failures": failures,
+                })
+    return out
+
+
 def effective_level_code(obj) -> str:
     """The ``{level}`` message placeholder — empty string when there is no level.
 
@@ -504,14 +651,22 @@ def _ladder_distance(coach_id: int, level_id_a, level_id_b) -> int | None:
     return abs(index_a - index_b)
 
 
-def _passes_group_rules(
+def _group_rule_failures(
     rules: list,
     cp: Association_CoachPlayer,
     vacancy: Vacancy | None,
     coach_id: int,
     instance: LessonInstance | None = None,
-) -> bool:
-    """Apply all rules in a rule set with AND logic.
+    *,
+    short_circuit: bool = True,
+) -> list:
+    """Every rule in ``rules`` that ``cp`` fails, as structured records.
+
+    PAD-133. This is the ONE evaluator behind both :func:`_passes_group_rules`
+    (a bare bool, used by the invitation engine) and
+    :func:`eligibility_failures` (the coach-facing reasons). Forking it would
+    let "may this student join?" drift from "why not?" — the same hazard this
+    module already avoids for invitation groups vs eligibility.
 
     Shared by two callers with two different rule vocabularies
     (eligibility.rules rule 7 — two evaluators would drift):
@@ -524,7 +679,35 @@ def _passes_group_rules(
     ``instance`` (PAD-86) lets the level rules fall back to the class's
     effective level when the vacancy carries no snapshot of its own — which is
     also what makes the ``vacancy=None`` path resolve a level at all.
+
+    ``short_circuit`` preserves the invitation engine's behaviour AND its cost:
+    it stops at the first failure, so the hot matching loop never runs the extra
+    absence/attendance queries that a full explanation needs. Only the
+    coach-facing path pays for evaluating every rule.
+
+    Records carry STRUCTURED data only — never pre-formatted prose, because the
+    locale belongs to the client (eligibility.enforcement rule 7):
+    ``{attribute, operation, actual, threshold, ladder_distance, reason}``.
+    ``ladder_distance`` is signed: negative = the student is STRONGER than the
+    class (a lower ladder index), positive = weaker. ``reason`` names the
+    fail-closed cases, where ``actual``/``threshold`` cannot be meaningful.
     """
+    failures: list = []
+
+    def fail(
+        attr, op, *, actual=None, threshold=None, ladder_distance=None, reason=None
+    ) -> bool:
+        """Record a failed rule. Returns True when the caller should stop."""
+        failures.append({
+            "attribute": attr,
+            "operation": op,
+            "actual": actual,
+            "threshold": threshold,
+            "ladder_distance": ladder_distance,
+            "reason": reason,
+        })
+        return short_circuit
+
     # PAD-128: `_vacancy_level(None, instance)` degrades cleanly to the class's
     # effective level, so this one call serves both anchors.
     vacancy_level_id, vacancy_level = _vacancy_level(vacancy, instance)
@@ -535,24 +718,35 @@ def _passes_group_rules(
         val = rule.get("value")
 
         if attr == "level":
+            class_code = getattr(vacancy_level, "code", None)
+            student_code = getattr(cp.level, "code", None)
+
             if vacancy_level_id is None or vacancy_level is None:
                 # PAD-86: fail CLOSED. A vacancy with no level anywhere (not on
                 # the vacancy, not on the class, not on the parent lesson)
                 # cannot satisfy a level rule, so nobody passes. Skipping the
                 # filter here (the old behaviour) turned a level-only group
                 # into "invite the coach's whole roster".
-                return False
+                if fail(attr, op, actual=student_code, reason="class_has_no_level"):
+                    return failures
+                continue
             if cp.level is None:
-                return False
+                if fail(attr, op, threshold=class_code, reason="student_has_no_level"):
+                    return failures
+                continue
+
             if op == "same_as_vacancy":
                 if cp.level_id != vacancy_level_id:
-                    return False
+                    if fail(attr, op, actual=student_code, threshold=class_code):
+                        return failures
             elif op == "one_above_vacancy":
                 if cp.level_id not in _level_ids_one_above(vacancy_level, coach_id):
-                    return False
+                    if fail(attr, op, actual=student_code, threshold=class_code):
+                        return failures
             elif op == "one_below_vacancy":
                 if cp.level_id not in _level_ids_one_below(vacancy_level, coach_id):
-                    return False
+                    if fail(attr, op, actual=student_code, threshold=class_code):
+                        return failures
             elif op in ("all_above_vacancy", "all_below_vacancy"):
                 # PAD-70: compare ladder POSITIONS (0 = strongest), never the raw
                 # display_order values — see level_ladder.py.
@@ -560,17 +754,33 @@ def _passes_group_rules(
                 vd = ladder_index(ladder, vacancy_level_id)
                 cd = ladder_index(ladder, cp.level_id)
                 if vd is None or cd is None:
-                    return False
-                if op == "all_above_vacancy" and cd >= vd:
-                    return False
-                if op == "all_below_vacancy" and cd <= vd:
-                    return False
+                    if fail(
+                        attr, op, actual=student_code, threshold=class_code,
+                        reason="level_not_in_ladder",
+                    ):
+                        return failures
+                    continue
+                if (op == "all_above_vacancy" and cd >= vd) or (
+                    op == "all_below_vacancy" and cd <= vd
+                ):
+                    if fail(
+                        attr, op, actual=student_code, threshold=class_code,
+                        ladder_distance=cd - vd,
+                    ):
+                        return failures
 
             # PAD-128 — eligibility's class-anchored vocabulary. Same ladder
             # positions as above; "above" means STRONGER, i.e. a LOWER index.
             elif op == "same_as_class":
                 if cp.level_id != vacancy_level_id:
-                    return False
+                    ladder = get_level_ladder(coach_id)
+                    vd = ladder_index(ladder, vacancy_level_id)
+                    cd = ladder_index(ladder, cp.level_id)
+                    if fail(
+                        attr, op, actual=student_code, threshold=class_code,
+                        ladder_distance=(cd - vd) if (vd is not None and cd is not None) else None,
+                    ):
+                        return failures
             elif op in (
                 "equal_or_above_class",
                 "equal_or_below_class",
@@ -583,22 +793,39 @@ def _passes_group_rules(
                 if vd is None or cd is None:
                     # A student whose level is not in the coach's ladder never
                     # passes a level rule (eligibility.rules rule 6).
-                    return False
-                if op == "equal_or_above_class" and cd > vd:
-                    return False
-                if op == "equal_or_below_class" and cd < vd:
-                    return False
-                if op == "one_below_or_above_class" and abs(cd - vd) > 1:
-                    return False
-                if op == "within_n_of_class":
+                    if fail(
+                        attr, op, actual=student_code, threshold=class_code,
+                        reason="level_not_in_ladder",
+                    ):
+                        return failures
+                    continue
+
+                distance = cd - vd
+                breached = False
+                limit = None
+                if op == "equal_or_above_class":
+                    breached = cd > vd
+                elif op == "equal_or_below_class":
+                    breached = cd < vd
+                elif op == "one_below_or_above_class":
+                    limit = 1
+                    breached = abs(distance) > 1
+                elif op == "within_n_of_class":
                     try:
                         allowed = int(val)
                     except (TypeError, ValueError):
                         # A malformed `value` must not silently widen the bar
                         # into "any level"; treat it as the strictest reading.
                         allowed = 0
-                    if abs(cd - vd) > max(0, allowed):
-                        return False
+                    limit = max(0, allowed)
+                    breached = abs(distance) > limit
+                if breached:
+                    if fail(
+                        attr, op, actual=student_code,
+                        threshold=class_code if limit is None else limit,
+                        ladder_distance=distance,
+                    ):
+                        return failures
 
         elif attr == "side":
             # PAD-128: side is a WAVE criterion only, never an eligibility one
@@ -610,35 +837,62 @@ def _passes_group_rules(
             # Inclusive of "both": a "both" player (or a "both" vacancy) is eligible
             # for any side. Exact-side is preferred via the sort key, not required.
             if op == "same_as_vacancy" and not _side_eligible(cp.side, vacancy.side):
-                return False
+                if fail(attr, op, actual=cp.side, threshold=vacancy.side):
+                    return failures
 
         elif attr == "has_makeups":
             if op == "is_true" and not _has_makeups(cp.player_id, coach_id):
-                return False
+                if fail(attr, op, actual=False, threshold=True):
+                    return failures
 
         elif attr == "unjustified_absences":
             count = _unjustified_absence_count(cp.player_id, coach_id)
             if not _compare(count, op, val):
-                return False
+                # `actual` is the student's real count, not a bool — rule 7's
+                # "over the unjustified-absence limit (4, limit is 2)" cannot be
+                # rendered without it.
+                if fail(attr, op, actual=count, threshold=val):
+                    return failures
 
         elif attr == "justified_absences":
             _, just_rate = _attendance_stats(cp.player_id)
             total_presences = Presence.query.filter_by(player_id=cp.player_id).count()
             just_count = round(just_rate * total_presences)
             if not _compare(just_count, op, val):
-                return False
+                if fail(attr, op, actual=just_count, threshold=val):
+                    return failures
 
         elif attr == "attendance_rate":
             att_rate, _ = _attendance_stats(cp.player_id)
             if not _compare(att_rate * 100, op, val):
-                return False
+                if fail(attr, op, actual=round(att_rate * 100, 1), threshold=val):
+                    return failures
 
         elif attr == "subscription_status":
             status = cp.player.user.status if cp.player and cp.player.user else None
             if op == "equals" and status != val:
-                return False
+                if fail(attr, op, actual=status, threshold=val):
+                    return failures
 
-    return True
+    return failures
+
+
+def _passes_group_rules(
+    rules: list,
+    cp: Association_CoachPlayer,
+    vacancy: Vacancy | None,
+    coach_id: int,
+    instance: LessonInstance | None = None,
+) -> bool:
+    """Apply all rules in a rule set with AND logic.
+
+    Thin bool wrapper over :func:`_group_rule_failures`. Keeps short-circuiting,
+    so the invitation engine's behaviour and query cost are exactly as before
+    PAD-133.
+    """
+    return not _group_rule_failures(
+        rules, cp, vacancy, coach_id, instance, short_circuit=True
+    )
 
 
 def _get_eligible_students_for_group(
