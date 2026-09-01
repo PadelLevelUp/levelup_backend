@@ -60,6 +60,7 @@ from padel_app.services.user_service import (
     activate_user_service,
 )
 from padel_app.services.attendance_history_service import (
+    build_absence_history,
     build_attendance_history,
     default_range as default_attendance_range,
 )
@@ -914,11 +915,51 @@ def attendance_history():
     return jsonify(payload)
 
 
+@bp.get("/absence_history")
+@jwt_required()
+def absence_history():
+    """Missed-class history for one player (PAD-141, spec `attendance.absences`).
+
+    The counterpart of `/attendance_history`: identical query params, identical
+    payload shape, identical authorization. It deliberately shares
+    `_resolve_attendance_subject` and `_parse_attendance_bound` rather than
+    reimplementing them — the 401/200/403/403 matrix PAD-114 pinned is the
+    contract here too, and a parallel copy is how the two would drift.
+
+    Sessions additionally carry `justification`, which labels each row
+    justified/unjustified without narrowing the set (spec rule 3).
+    """
+    subject = _resolve_attendance_subject(request.args.get("playerId"))
+
+    raw_from = request.args.get("from")
+    raw_to = request.args.get("to")
+    if raw_from and raw_to:
+        try:
+            range_start = _parse_attendance_bound(raw_from, end_of_day=False)
+            range_end = _parse_attendance_bound(raw_to, end_of_day=True)
+        except (ValueError, OverflowError):
+            abort(400, "from/to must be ISO-8601 datetimes")
+    else:
+        range_start, range_end = default_attendance_range()
+
+    payload = build_absence_history(
+        player_id=subject.id,
+        range_start=range_start,
+        range_end=range_end,
+        granularity=request.args.get("granularity"),
+    )
+    payload["playerName"] = subject.user.name if subject.user else None
+    return jsonify(payload)
+
+
 def _presence_overview_range():
     """Shared `from`/`to` parsing for the three Presences-tab reads (PAD-140).
 
     Falls back to the trailing-90-day default when either bound is missing, so a
-    caller can omit both and still get a sensible window.
+    caller can omit both and still get a sensible window. Distinct from
+    `/attendance_history` and `/absence_history`, which default to the current
+    month — this tab is roster-wide and a single month is often too sparse to
+    read a trend from.
     """
     raw_from = request.args.get("from")
     raw_to = request.args.get("to")
