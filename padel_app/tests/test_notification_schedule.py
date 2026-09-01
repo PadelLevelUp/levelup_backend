@@ -341,6 +341,74 @@ class TestDailyLimit:
             player_id=1, coach_id=1, restrictions=restrictions, now=datetime(2025, 6, 10, 14, 0)
         ) is True
 
+    # -- PAD-144: the counting window is the CLUB-LOCAL day ------------------
+    #
+    # `maxInvitesPerStudentPerDay` is read by a coach as "their" calendar day
+    # (notifications.config rule 6b). The bug: the boundary was derived with a
+    # bare `.replace(hour=0, ...)` on a naive-UTC instant, pinning the window to
+    # UTC midnight — 01:00 local through Portuguese summer time.
+
+    def _captured_day_start(self, app, now: datetime) -> datetime:
+        """The `created_at >= X` bound the limit query actually filters on.
+
+        Asserting on the bound rather than on the boolean result is what makes
+        this a test of the *boundary derivation*; a count-based assertion would
+        pass for any window that happens to contain the same events.
+        """
+        from padel_app.services.notification_service import _check_per_student_daily_limit
+        from padel_app.models import NotificationEvent
+
+        restrictions = {"maxInvitesPerStudentPerDay": {"enabled": True, "value": 3}}
+        with app.app_context():
+            mock_query = MagicMock()
+            mock_query.filter.return_value.count.return_value = 0
+            with patch.object(NotificationEvent, "query", mock_query):
+                _check_per_student_daily_limit(
+                    player_id=1, coach_id=1, restrictions=restrictions, now=now
+                )
+            (bounds,) = [
+                expr.right.value
+                for expr in mock_query.filter.call_args[0]
+                if getattr(expr.left, "key", None) == "created_at"
+            ]
+            return bounds
+
+    def test_window_starts_at_club_local_midnight_in_summer(self, app):
+        """August is WEST: the local day starts at 23:00 UTC the day before."""
+        assert self._captured_day_start(
+            app, datetime(2025, 8, 14, 10, 0)
+        ) == datetime(2025, 8, 13, 23, 0)
+
+    def test_window_starts_at_utc_midnight_in_winter(self, app):
+        """January is WET (UTC+0), so local midnight and UTC midnight agree."""
+        assert self._captured_day_start(
+            app, datetime(2025, 1, 14, 10, 0)
+        ) == datetime(2025, 1, 14, 0, 0)
+
+    def test_first_local_hour_of_the_day_counts_against_the_new_day(self, app):
+        """23:30 UTC in summer is 00:30 local the NEXT day.
+
+        This is the reported defect: such an invitation was counted against the
+        previous day's quota, letting a student exceed the configured limit
+        within one local day.
+        """
+        assert self._captured_day_start(
+            app, datetime(2025, 8, 14, 23, 30)
+        ) == datetime(2025, 8, 14, 23, 0)
+
+    def test_same_utc_instant_yields_different_windows_across_dst(self, app):
+        """Discriminating evidence of a real timezone conversion.
+
+        A regression to a naive-UTC boundary makes both of these equal midnight
+        of their own UTC date, so the asymmetry disappears and this fails.
+        """
+        summer = self._captured_day_start(app, datetime(2025, 8, 14, 23, 30))
+        winter = self._captured_day_start(app, datetime(2025, 1, 14, 23, 30))
+
+        assert summer == datetime(2025, 8, 14, 23, 0)   # 00:00 local on the 15th
+        assert winter == datetime(2025, 1, 14, 0, 0)    # 00:00 local on the 14th
+        assert summer != datetime(2025, 8, 14, 0, 0)    # not naive-UTC midnight
+
 
 # ===========================================================================
 # send_class_reminders — past-class guard

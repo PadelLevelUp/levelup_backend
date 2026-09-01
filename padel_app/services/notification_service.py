@@ -37,7 +37,7 @@ import re
 from datetime import datetime, timedelta, timezone
 
 from padel_app.sql_db import db
-from padel_app.utils.dates import utcnow_naive
+from padel_app.utils.dates import CLUB_TZ, club_day_start_utc, utcnow_naive
 from padel_app.models import (
     Association_CoachLessonInstance,
     Association_CoachPlayer,
@@ -847,11 +847,11 @@ def _check_restrictions(
         # reading correctly in winter (WET = UTC+0), so it looked intermittent:
         # a 22:30-local invite was sent, a 07:30-local one suppressed.
         #
-        # Imported inside the function because scheduler and this module import
-        # each other lazily (see reschedule_all_future_jobs below); a top-level
-        # import would close that cycle.
-        from padel_app.scheduler import CLUB_TZ
-
+        # PAD-144: CLUB_TZ now comes from `utils.dates`, which imports nothing
+        # from the app. The lazy `from padel_app.scheduler import CLUB_TZ` this
+        # replaces existed only to avoid closing the scheduler <-> service
+        # import cycle; sourcing the constant from a leaf module removes the
+        # cycle rather than working around it.
         local_hour = now.replace(tzinfo=timezone.utc).astimezone(CLUB_TZ).hour
         if local_hour >= 22 or local_hour < 7:
             return False
@@ -884,7 +884,14 @@ def _check_per_student_daily_limit(
     if not limit.get("enabled"):
         return True
     _now = now or utcnow_naive()
-    today_start = _now.replace(hour=0, minute=0, second=0, microsecond=0)
+    # PAD-144: "per day" is the coach's CLUB-LOCAL calendar day
+    # (notifications.config rule 6b), not the UTC one. `created_at` is stored
+    # naive UTC, so the boundary is derived in club-local time and converted
+    # back. The previous `.replace(hour=0, ...)` pinned it to UTC midnight,
+    # running the window 01:00 local -> 01:00 local all summer: invitations
+    # sent in the first local hour of a day counted against the PREVIOUS day's
+    # quota, so a student could exceed the configured limit within one day.
+    today_start = club_day_start_utc(_now)
     count = NotificationEvent.query.filter(
         NotificationEvent.player_id == player_id,
         NotificationEvent.coach_id == coach_id,

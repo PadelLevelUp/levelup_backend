@@ -139,3 +139,58 @@ def test_notify_pending_only_targets_pending_students(app, monkeypatch):
     assert instance_id == tomo_inst_id
     assert cid == coach_id
     assert len(player_ids) == 2
+
+
+# ===========================================================================
+# PAD-144: "tomorrow" is the next CLUB-LOCAL calendar day
+#
+# `dashboard.blocks` rule 6. The window does not merely feed a count — it also
+# selects the targets of `notify_pending_confirmations`, which really sends
+# messages, so a misaligned boundary nudges the wrong students (rule 7).
+# ===========================================================================
+
+
+def test_tomorrow_window_is_utc_midnight_in_winter():
+    """January is WET (UTC+0), so local and UTC day boundaries agree."""
+    from padel_app.helpers.dashboard.pending import _tomorrow_window
+
+    start, end = _tomorrow_window(datetime(2025, 1, 14, 10, 0))
+
+    assert start == datetime(2025, 1, 15, 0, 0)
+    assert end == datetime(2025, 1, 16, 0, 0)
+
+
+def test_tomorrow_window_is_shifted_an_hour_in_summer():
+    """August is WEST (UTC+1): 00:00 local == 23:00 UTC the previous day."""
+    from padel_app.helpers.dashboard.pending import _tomorrow_window
+
+    start, end = _tomorrow_window(datetime(2025, 8, 14, 10, 0))
+
+    # 11:00 local on the 14th -> tomorrow is the 15th local, 23:00 UTC 14th.
+    assert start == datetime(2025, 8, 14, 23, 0)
+    assert end == datetime(2025, 8, 15, 23, 0)
+
+
+def test_tomorrow_window_follows_the_local_day_past_utc_midnight():
+    """23:30 UTC in summer is already 00:30 local on the 15th.
+
+    "Tomorrow" for the coach is therefore the 16th, not the 15th — a naive-UTC
+    window would still be pointing at the 15th.
+    """
+    from padel_app.helpers.dashboard.pending import _tomorrow_window
+
+    start, end = _tomorrow_window(datetime(2025, 8, 14, 23, 30))
+
+    assert start == datetime(2025, 8, 15, 23, 0)   # 00:00 local on the 16th
+    assert end == datetime(2025, 8, 16, 23, 0)
+    assert start != datetime(2025, 8, 15, 0, 0)    # not the naive-UTC answer
+
+
+def test_tomorrow_window_is_always_exactly_one_calendar_day():
+    """The window stays half-open and one local day wide on both sides of DST."""
+    from padel_app.helpers.dashboard.pending import _tomorrow_window
+
+    for instant in (datetime(2025, 1, 14, 10, 0), datetime(2025, 8, 14, 10, 0)):
+        start, end = _tomorrow_window(instant)
+        assert end > start
+        assert start.tzinfo is None and end.tzinfo is None
