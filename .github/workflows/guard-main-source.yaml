@@ -1,0 +1,21 @@
+name: Guard main source branch
+
+# GitHub cannot natively restrict which branch a pull request comes FROM, so
+# this check enforces it. Make it a required status check on main, alongside a
+# ruleset that blocks direct pushes; together they mean main only ever advances
+# via a pull request from `staging`.
+on:
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  check-source-branch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Only `staging` may open pull requests into main
+        if: github.head_ref != 'staging'
+        run: |
+          echo "::error::main only accepts pull requests from 'staging' (this PR is from '${{ github.head_ref }}'). Merge your work into staging first, then promote staging into main."
+          exit 1
+      - name: Source branch OK
+        run: echo "PR is from staging — allowed."
