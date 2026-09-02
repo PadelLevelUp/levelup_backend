@@ -24,6 +24,8 @@ from padel_app.services.notification_service import (
     get_standing_waiting_list,
     add_standing_waiting_list_entry,
     remove_standing_waiting_list_entry,
+    eligibility_failures_for_players,
+    students_failing_eligibility_bar,
 )
 from padel_app.services.player_service import search_coach_players
 from padel_app.services.student_availability_service import (
@@ -82,7 +84,55 @@ def save_config():
     coach = _current_coach()
     data = request.get_json() or {}
     update_config(coach.id, data)
-    return jsonify(get_config_dict(coach.id))
+
+    payload = get_config_dict(coach.id)
+
+    # PAD-133 / eligibility.enforcement rule 9: when the coach saves an
+    # eligibility bar, report which already-enrolled students would not meet it.
+    # Informational only — rule 8 still holds, so the save is never blocked, no
+    # one is un-enrolled and no one is notified. Computed only when the request
+    # actually touched the bar, so an unrelated config save costs nothing.
+    if "eligibilityRules" in data:
+        payload["eligibilityImpact"] = {
+            "affected": students_failing_eligibility_bar(
+                coach.id, data["eligibilityRules"]
+            )
+        }
+    return jsonify(payload)
+
+
+@bp.post("/eligibility_check")
+@jwt_required()
+def eligibility_check():
+    """Which of these students would fail the bar for this class, and why.
+
+    PAD-133 / eligibility.enforcement rules 6 and 7. The coach's client calls
+    this BEFORE adding students by hand, so it can name every failed rule in the
+    coach's locale and ask for confirmation. Deliberately a separate read-only
+    endpoint rather than a hook inside the class-edit save: enrolment is the
+    coach's decision (rule 6 warns, it never blocks), so the save path keeps
+    working exactly as before and a client that ignores this cannot be
+    prevented from enrolling anyone.
+
+    Returns only the students who FAIL — an empty list means "no warning
+    needed". Reasons are structured, never prose; the locale belongs to the
+    client (rule 7).
+    """
+    coach = _current_coach()
+    data = request.get_json() or {}
+    instance = _resolve_instance(
+        data.get("model", "LessonInstance"),
+        int(data.get("originalId")),
+        data.get("date"),
+    )
+    player_ids = data.get("playerIds") or []
+    if not isinstance(player_ids, list):
+        abort(400, "playerIds must be a list")
+    return jsonify({
+        "ineligible": eligibility_failures_for_players(
+            instance, coach.id, player_ids
+        )
+    })
 
 
 @bp.post("/toggle_class")
