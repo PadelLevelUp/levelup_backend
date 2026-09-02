@@ -18,7 +18,6 @@ clock, not UTC.
 """
 
 from datetime import timedelta, datetime, timezone
-from zoneinfo import ZoneInfo
 
 from padel_app.models import CalendarBlock
 from padel_app.tools.calendar_tools import expand_occurrences, ensure_utc
@@ -28,8 +27,8 @@ from padel_app.services.calendar_service import (
     remove_block_service,
 )
 
-
-CLUB_TZ = ZoneInfo("Europe/Lisbon")
+# PAD-144: single shared definition (was one of three identical copies).
+from padel_app.utils.dates import CLUB_TZ
 
 # Marker values that identify a student availability blocker.
 BLOCKER_TYPE = "unavailable"

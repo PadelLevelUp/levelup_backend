@@ -1,21 +1,31 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
 from padel_app.sql_db import db
 from padel_app.models import NotificationEvent, LessonInstance
+from padel_app.utils.dates import club_day_start_utc, utcnow_naive
 
 
 def _tomorrow_window(now: Optional[datetime] = None) -> Tuple[datetime, datetime]:
     """
     Half-open [start, end) range covering the *next* calendar day.
 
-    Naive UTC to match how ``LessonInstance.start_datetime`` is stored.
+    Returned as naive UTC to match how ``LessonInstance.start_datetime`` is
+    stored, but the day itself is the coach's CLUB-LOCAL one — `dashboard.blocks`
+    rules 6 and 7.
+
+    PAD-144: this previously did `.replace(hour=0, ...)` on a naive-UTC instant,
+    which pins the window to UTC midnight. In Portuguese summer time that shifts
+    it an hour, so a 00:30-local class tomorrow fell outside the window while a
+    00:30-local class *today* fell inside it. That matters beyond a wrong count:
+    the same window picks the targets of ``notify_pending_confirmations``, which
+    actually sends messages, so the coach nudged the wrong students.
     """
-    base = now or datetime.utcnow()
-    start = (base + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-    end = start + timedelta(days=1)
+    base = now or utcnow_naive()
+    start = club_day_start_utc(base, days_offset=1)
+    end = club_day_start_utc(base, days_offset=2)
     return start, end
 
 
