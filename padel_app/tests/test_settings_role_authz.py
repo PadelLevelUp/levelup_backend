@@ -285,6 +285,14 @@ NOTIFY_ROUTES = [
     ("post", "/api/app/notify/standing_waiting_list", {"playerId": 1}),
     ("post", "/api/app/notify/config", {"mode": "automatic"}),
     ("get", "/api/app/notify/activity", None),
+    # PAD-133: the manual-add eligibility check reports one student's standing
+    # to whoever asks, so it must fail closed for a student exactly like the
+    # rest of the tab.
+    (
+        "post",
+        "/api/app/notify/eligibility_check",
+        {"model": "LessonInstance", "originalId": 1, "playerIds": [1]},
+    ),
 ]
 
 

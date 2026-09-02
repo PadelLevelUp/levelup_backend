@@ -40,15 +40,12 @@ import os
 import sys
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
-
-from padel_app.utils.dates import utcnow_naive
 
 # PAD-134: wall-clock times a coach types into Settings ("send at 18:00") are
-# CLUB-LOCAL, not UTC. Same constant and rationale as
-# student_availability_service.CLUB_TZ, which already evaluates recurring
-# "every Monday 18:00" occurrences against the Lisbon wall clock.
-CLUB_TZ = ZoneInfo("Europe/Lisbon")
+# CLUB-LOCAL, not UTC. PAD-144 moved the constant itself into `utils.dates` so
+# scheduler, student_availability_service and notification_service share ONE
+# definition instead of three drifting copies.
+from padel_app.utils.dates import CLUB_TZ, utcnow_naive
 
 # ---------------------------------------------------------------------------
 # Module-level singletons

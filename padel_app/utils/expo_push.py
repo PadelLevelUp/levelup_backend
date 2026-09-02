@@ -27,12 +27,20 @@ def _chunks(items, size):
         yield items[i : i + size]
 
 
-def send_expo_push(tokens: list[str], title, body, data: dict | None = None) -> bool:
+def send_expo_push(
+    tokens: list[str], title, body, data: dict | None = None, badge: int | None = None
+) -> bool:
     """Best-effort Expo push send to one or more Expo push tokens.
 
     Never raises — logs and returns False on any failure so callers can treat
     this exactly like the existing web-push helper (fire-and-forget).
     Deletes DeviceToken rows for tokens Expo reports as no longer registered.
+
+    `badge` sets the iOS home-screen icon badge. It is omitted from the
+    payload when None, which leaves whatever the device already shows
+    untouched — so callers that do not own a count must not pass 0 to "mean"
+    unknown. Pass the recipient's real unread total; 0 clears the badge
+    (PAD-153).
     """
     tokens = [t for t in (tokens or []) if t]
     if not tokens:
@@ -48,6 +56,8 @@ def send_expo_push(tokens: list[str], title, body, data: dict | None = None) -> 
                 "title": title,
                 "body": body,
                 "data": data,
+                # Only sent when the caller knows the count; see the docstring.
+                **({"badge": badge} if badge is not None else {}),
             }
             for token in batch
         ]
@@ -81,7 +91,11 @@ def send_expo_push(tokens: list[str], title, body, data: dict | None = None) -> 
 
             error_type = (receipt.get("details") or {}).get("error") if isinstance(receipt, dict) else None
             if error_type == "DeviceNotRegistered":
-                logger.info(
+                # WARNING, not INFO: the app configures no logging, so the
+                # root logger sits at the default WARNING and INFO never
+                # reaches stderr. Losing a device token silently is exactly
+                # what made PAD-118 ("no push arrived") undiagnosable.
+                logger.warning(
                     "Deleting stale Expo device token (DeviceNotRegistered): %s", token
                 )
                 stale = DeviceToken.query.filter_by(token=token).first()
@@ -96,7 +110,9 @@ def send_expo_push(tokens: list[str], title, body, data: dict | None = None) -> 
     return any_success
 
 
-def send_expo_push_to_user(user_id, title, body, data: dict | None = None) -> bool:
+def send_expo_push_to_user(
+    user_id, title, body, data: dict | None = None, badge: int | None = None
+) -> bool:
     """Convenience wrapper: look up the user's registered device tokens and
     send. Best-effort — no-ops (and never raises) when the user has no
     registered devices, mirroring the semantics of send_push_notification's
@@ -110,4 +126,4 @@ def send_expo_push_to_user(user_id, title, body, data: dict | None = None) -> bo
     ]
     if not tokens:
         return False
-    return send_expo_push(tokens, title, body, data)
+    return send_expo_push(tokens, title, body, data, badge=badge)
