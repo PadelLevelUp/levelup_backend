@@ -199,6 +199,12 @@ def create_message_service(data, user_id):
             title=sender_name,
             body=body,
             data={"type": "message", "conversationId": message.conversation_id},
+            # The iOS home-screen badge. message.create() has already
+            # committed above, so this count includes the message we are
+            # notifying about. Sending the recipient's real total (rather
+            # than incrementing) means the badge self-corrects even if an
+            # earlier push was never delivered (PAD-153).
+            badge=get_unread_count(participant.user_id),
         )
 
     publish({

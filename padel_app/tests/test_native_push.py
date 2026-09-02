@@ -364,3 +364,83 @@ def test_direct_message_pushes_expo_with_message_payload(app):
         args, kwargs = mock_send.call_args
         assert args[0] == recipient.id
         assert kwargs["data"] == {"type": "message", "conversationId": conversation_id}
+
+
+# ---------------------------------------------------------------------------
+# PAD-153 — iOS home-screen badge carries the recipient's unread count
+# ---------------------------------------------------------------------------
+
+def test_send_expo_push_includes_badge_only_when_provided(app):
+    """`badge` reaches the Expo payload when set, and is omitted entirely when
+    None so the device keeps whatever it already shows. Omission matters: a
+    payload with no badge key leaves the icon untouched, which is what every
+    non-message notification wants."""
+    from padel_app.utils.expo_push import send_expo_push
+
+    with app.app_context():
+        with patch("padel_app.utils.expo_push.requests.post") as mock_post:
+            mock_post.return_value = _mock_response({"data": [{"status": "ok"}]})
+            send_expo_push(["ExponentPushToken[a]"], "Hello", "World", {}, badge=3)
+        _, kwargs = mock_post.call_args
+        assert kwargs["json"][0]["badge"] == 3
+
+        with patch("padel_app.utils.expo_push.requests.post") as mock_post:
+            mock_post.return_value = _mock_response({"data": [{"status": "ok"}]})
+            send_expo_push(["ExponentPushToken[a]"], "Hello", "World", {})
+        _, kwargs = mock_post.call_args
+        assert "badge" not in kwargs["json"][0]
+
+
+def test_send_expo_push_badge_zero_is_sent_to_clear_the_icon(app):
+    """0 is a real value, not "unknown" — it is how a read-everything state
+    clears the badge. It must survive the None check (PAD-147)."""
+    from padel_app.utils.expo_push import send_expo_push
+
+    with app.app_context():
+        with patch("padel_app.utils.expo_push.requests.post") as mock_post:
+            mock_post.return_value = _mock_response({"data": [{"status": "ok"}]})
+            send_expo_push(["ExponentPushToken[a]"], "Hello", "World", {}, badge=0)
+        _, kwargs = mock_post.call_args
+        assert kwargs["json"][0]["badge"] == 0
+
+
+def test_direct_message_push_carries_recipient_unread_count_as_badge(app):
+    """The badge is the recipient's real unread total, including the message
+    being notified about (create() commits before the push loop runs)."""
+    from padel_app.models import DeviceToken, Conversation, ConversationParticipant
+
+    with app.app_context():
+        sender = _create_user("Badge Sender", "badge-sender")
+        recipient = _create_user("Badge Recipient", "badge-recipient")
+        db.session.commit()
+
+        conversation = Conversation(
+            participant_key=Conversation.build_participant_key([sender.id, recipient.id]),
+        )
+        db.session.add(conversation)
+        db.session.flush()
+        db.session.add_all([
+            ConversationParticipant(conversation_id=conversation.id, user_id=sender.id),
+            ConversationParticipant(conversation_id=conversation.id, user_id=recipient.id),
+        ])
+        db.session.commit()
+
+        DeviceToken(user_id=recipient.id, token="ExponentPushToken[badge]", platform="ios").create()
+
+        conversation_id = conversation.id
+        sender_id = sender.id
+
+        from padel_app.services.messaging_service import create_message_service
+
+        with patch("padel_app.services.messaging_service.publish"), \
+             patch("padel_app.services.messaging_service.send_push_notification"), \
+             patch("padel_app.services.messaging_service.send_expo_push_to_user") as mock_send:
+            # Never read, so each send raises the recipient's unread total.
+            create_message_service({"conversationId": conversation_id, "text": "first"}, sender_id)
+            create_message_service({"conversationId": conversation_id, "text": "second"}, sender_id)
+
+        assert mock_send.call_count == 2
+        first_badge = mock_send.call_args_list[0].kwargs["badge"]
+        second_badge = mock_send.call_args_list[1].kwargs["badge"]
+        assert first_badge == 1
+        assert second_badge == 2
